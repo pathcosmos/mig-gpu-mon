@@ -187,7 +187,26 @@ mig-gpu-mon --nvml-path /custom/path/libnvidia-ml.so.1
 
 ## Quick Start (처음부터 끝까지)
 
-새 서버에서 Rust 설치부터 실행까지 한번에:
+새 서버에서 Rust 설치부터 실행까지 **자동 설치 스크립트** 한 번이면 끝:
+
+```bash
+git clone https://github.com/pathcosmos/mig-gpu-mon.git
+cd mig-gpu-mon
+./install.sh
+```
+
+`install.sh`가 자동으로 처리하는 것:
+1. Rust 미설치 시 → rustup으로 자동 설치
+2. git 미설치 시 → apt/yum/dnf로 자동 설치
+3. `cargo build --release` → 최적화 빌드 (LTO + strip, ~1.5MB)
+4. `~/.cargo/bin/mig-gpu-mon`에 바이너리 복사 + PATH 등록 확인
+
+설치 완료 후 바로 실행:
+```bash
+mig-gpu-mon
+```
+
+### 수동 설치 (단계별)
 
 ```bash
 # 1. Rust 설치 (이미 설치되어 있으면 생략)

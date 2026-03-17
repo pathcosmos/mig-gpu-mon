@@ -187,7 +187,26 @@ mig-gpu-mon --nvml-path /custom/path/libnvidia-ml.so.1
 
 ## Quick Start (From Scratch)
 
-From a fresh server — Rust installation to running, all at once:
+From a fresh server — just run the **install script** and everything is handled automatically:
+
+```bash
+git clone https://github.com/pathcosmos/mig-gpu-mon.git
+cd mig-gpu-mon
+./install.sh
+```
+
+What `install.sh` handles automatically:
+1. Rust not installed → auto-installs via rustup
+2. git not installed → auto-installs via apt/yum/dnf
+3. `cargo build --release` → optimized build (LTO + strip, ~1.5MB)
+4. Copies binary to `~/.cargo/bin/mig-gpu-mon` + verifies PATH registration
+
+After installation, run immediately:
+```bash
+mig-gpu-mon
+```
+
+### Manual Installation (Step by Step)
 
 ```bash
 # 1. Install Rust (skip if already installed)
