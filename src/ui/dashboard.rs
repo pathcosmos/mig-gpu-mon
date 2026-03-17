@@ -136,11 +136,13 @@ fn draw_cpu_cores(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     sorted_cores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Dynamic column count: minimum column width ~12 chars (3 idx + bar + 5 pct)
+    // Dynamic column count: each column = 3(idx) + 1(space) + bar + 5(pct) = 9 + bar
+    // Non-first columns add 1-char separator, so usable = width - (cols-1)
     let min_col_width: u16 = 12;
     let num_cols = (inner.width / min_col_width).max(1) as usize;
-    let col_width = inner.width / num_cols as u16;
-    let bar_width = col_width.saturating_sub(9) as usize;
+    let usable_width = inner.width.saturating_sub((num_cols - 1) as u16);
+    let col_width = usable_width / num_cols as u16;
+    let bar_width = col_width.saturating_sub(8) as usize;
 
     let max_rows = inner.height as usize;
     let max_visible = max_rows * num_cols;

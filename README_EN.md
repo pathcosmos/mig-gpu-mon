@@ -16,9 +16,9 @@ Displays real-time graphs and gauges in btop/nvtop style, along with per-core CP
 ┌─ mig-gpu-mon ──────────────────────────────────────────────────────────┐
 │ MIG GPU Monitor | Driver: 535.129.03 | CUDA: 12.2 | GPUs: 3           │ ← Header
 ├─ CPU (64 cores) 23.4% ─────────┬─ Devices ────────────────────────────┤
-│  0 ▮▮▯▯▯▯▯  12%  32 ▮▯▯▯▯  3% │ > MIG 0 (GPU 0: A100) GPU:45% MEM:… │ ↑ 25%
-│  1 ▮▮▮▯▯▯▯  34%  33 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% MEM:… │ ↓
-│  2 ▮▮▮▮▯▯▯  52%  34 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
+│ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% MEM:… │ ↑ 25%
+│  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% MEM:… │ ↓
+│  0 ▮▮▮▮▯▯▯  52%  33 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
 │  ...                            │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
 ├─ Memory ────────────────────────┤ UUID: MIG-a1b2c3d4e5f6...           │ │
 │ RAM ▮▮▮▮▮▯▯ 89.2/256.0 GiB … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │ 40%
