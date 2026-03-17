@@ -16,20 +16,20 @@ Displays real-time graphs and gauges in btop/nvtop style, along with per-core CP
 ┌─ mig-gpu-mon ──────────────────────────────────────────────────────────┐
 │ MIG GPU Monitor | Driver: 535.129.03 | CUDA: 12.2 | GPUs: 3           │ ← Header
 ├─ CPU (64 cores) 23.4% ─────────┬─ Devices ────────────────────────────┤
-│  0 ▮▮▯▯▯▯▯  12%  32 ▮▯▯▯▯  3% │ > MIG 0 (GPU 0: A100) GPU:45% MEM:… │ ↑
-│  1 ▮▮▮▯▯▯▯  34%  33 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% MEM:… │ │ 35%
-│  2 ▮▮▮▮▯▯▯  52%  34 ▮▯▯▯▯  5% │   GPU 0: A100-SXM4-80GB             │ ↓
-│  ...                            ├─ Detail ─────────────────────────────┤    ← Top 45%
-├─ Memory ────────────────────────┤ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
-│ RAM ▮▮▮▮▮▯▯ 89.2/256.0 GiB … │ UUID: MIG-a1b2c3d4e5f6...           │ │
-│ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │                                      │ │ 65%
-│                                 │ VRAM: 12288 / 20480 MB (60.0%)      │ │
-│                                 │ GPU Util: 45%                        │ │
-│                                 │ Mem Util: 38%                        │ │
-│                                 │ SM Util:  45%                        │ │
-│                                 │ Temp: 62°C                           │ │
-│                                 │ Power: 127.3W / 300.0W               │ │
+│  0 ▮▮▯▯▯▯▯  12%  32 ▮▯▯▯▯  3% │ > MIG 0 (GPU 0: A100) GPU:45% MEM:… │ ↑ 25%
+│  1 ▮▮▮▯▯▯▯  34%  33 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% MEM:… │ ↓
+│  2 ▮▮▮▮▯▯▯  52%  34 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
+│  ...                            │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
+├─ Memory ────────────────────────┤ UUID: MIG-a1b2c3d4e5f6...           │ │
+│ RAM ▮▮▮▮▮▯▯ 89.2/256.0 GiB … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │ 40%
+│ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU Util: 45%  Mem Util: 38%        │ │
+│                                 │ Temp: 62°C  Power: 127.3W / 300.0W  │ │
 │                                 │ Processes: 2                         │ ↓
+│                                 ├─ VRAM Top 5 Processes ───────────────┤
+│                                 │ PID     Process         VRAM        │ ↑
+│                                 │ 12345   python3          8192 MB    │ │ 35%
+│                                 │ 12400   pt_main_thread   4096 MB    │ │
+│                                 │   No more processes                  │ ↓
 ├─ GPU Utilization % ─────────────┬─ CPU Total 23.4% ───────────────────┤
 │ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 30%
 ├─ Memory Utilization % ──────────┼─ RAM 89.2/256.0 GiB (34.8%) ────────┤    ← Bottom 55%
@@ -57,18 +57,21 @@ draw()
 │   │   │       ├── RAM line                 "RAM ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   │       └── SWP line                 "SWP ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   └── GPU Panel     50%
-│   │       ├── Device List        35%       " Devices "
+│   │       ├── Device List        25%       " Devices "
 │   │       │   └── "{>} {MIG|GPU} {idx}: {name} | GPU:{pct}% MEM:{pct}%"
-│   │       └── GPU Detail         65%       " Detail "
-│   │           ├── Name:     {name}
-│   │           ├── UUID:     {uuid (max 20 chars)}
-│   │           ├── VRAM:     {used} / {total} MB ({pct}%)
-│   │           ├── GPU Util: {pct}%
-│   │           ├── Mem Util: {pct}%
-│   │           ├── SM Util:  {pct}%          (MIG only)
-│   │           ├── Temp:     {val}°C         (if available)
-│   │           ├── Power:    {usage}W / {limit}W  (if available)
-│   │           └── Processes: {count}
+│   │       ├── GPU Detail         40%       " Detail "
+│   │       │   ├── Name:     {name}
+│   │       │   ├── UUID:     {uuid (max 20 chars)}
+│   │       │   ├── VRAM     {used} MB / {total} MB ({pct}%)
+│   │       │   ├── GPU Util: {pct}%
+│   │       │   ├── Mem Util: {pct}%
+│   │       │   ├── SM Util:  {pct}%          (MIG only)
+│   │       │   ├── Temp:     {val}°C         (if available)
+│   │       │   ├── Power:    {usage}W / {limit}W  (if available)
+│   │       │   └── Processes: {count}
+│   │       └── VRAM Top 5 Procs   35%       " VRAM Top 5 Processes "
+│   │           ├── Header: PID / Process / VRAM
+│   │           └── {pid} {name (max 15)} {vram} MB  (top 5 by VRAM desc)
 │   └── [Bottom 55%] ─── Horizontal ────────────────────────
 │       ├── GPU Charts    50%
 │       │   ├── GPU Utilization %   sparkline   30%
@@ -96,6 +99,7 @@ draw()
 | RAM sparkline | Yellow | — |
 | GPU % gauge | Green | — |
 | VRAM gauge | Magenta | — |
+| VRAM % (Detail) | Green / Yellow / Red | 0-70% / 70-90% / 90%+ |
 | RAM gauge | Yellow | — |
 | Temp | Green / Yellow / Red | 0-60°C / 60-80°C / 80°C+ |
 | Selected GPU | Green + Bold | — |
@@ -115,6 +119,7 @@ This tool bypasses that limitation by calling the NVML C API directly:
 ## Features
 
 - Real-time per-MIG-instance GPU Util, Memory Util, SM Util, and VRAM usage
+- **VRAM Top 5 Processes** — displays top 5 processes by VRAM usage (PID, process name, MB)
 - Parent GPU metrics (temperature, power, process count) displayed simultaneously
 - Per-core CPU usage (btop-style 2-column bar graph)
 - System RAM / Swap usage

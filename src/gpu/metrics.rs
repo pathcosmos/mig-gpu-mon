@@ -1,6 +1,20 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+/// Per-process GPU memory usage
+#[derive(Debug, Clone)]
+pub struct GpuProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub vram_used: u64, // bytes
+}
+
+impl GpuProcessInfo {
+    pub fn vram_used_mb(&self) -> u64 {
+        self.vram_used / (1024 * 1024)
+    }
+}
+
 /// Single GPU or MIG instance metrics snapshot
 #[derive(Debug, Clone)]
 pub struct GpuMetrics {
@@ -26,6 +40,8 @@ pub struct GpuMetrics {
 
     // Processes
     pub process_count: u32,
+    /// Top processes by VRAM usage (sorted descending, max 5)
+    pub top_processes: Vec<GpuProcessInfo>,
 
     pub timestamp: Instant,
 }

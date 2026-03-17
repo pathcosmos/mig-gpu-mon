@@ -46,7 +46,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header
+            Constraint::Length(3), // Header
             Constraint::Min(10),   // Main content
             Constraint::Length(3), // Footer
         ])
@@ -65,26 +65,28 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         app.metrics.len()
     );
     let header = Paragraph::new(header_text)
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::ALL).title(" mig-gpu-mon "));
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" mig-gpu-mon "),
+        );
     f.render_widget(header, area);
 }
 
 fn draw_main(f: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(45),
-            Constraint::Percentage(55),
-        ])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[0]);
 
     draw_system_panel(f, app, top_cols[0]);
@@ -95,10 +97,7 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
 fn draw_system_panel(f: &mut Frame, app: &App, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(4),
-            Constraint::Length(5),
-        ])
+        .constraints([Constraint::Min(4), Constraint::Length(5)])
         .split(area);
 
     draw_cpu_cores(f, app, sections[0]);
@@ -230,7 +229,11 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(inner);
 
     let ram_pct = sys.ram_percent();
@@ -243,10 +246,23 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
     };
     let ram_bar_width = rows[0].width.saturating_sub(30) as usize;
     let ram_line = Line::from(vec![
-        Span::styled("RAM", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(make_bar(ram_pct as f32, ram_bar_width), Style::default().fg(ram_color)),
         Span::styled(
-            format!(" {:.1}/{:.1} GiB ({:.1}%)", sys.ram_used_gb(), sys.ram_total_gb(), ram_pct),
+            "RAM",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            make_bar(ram_pct as f32, ram_bar_width),
+            Style::default().fg(ram_color),
+        ),
+        Span::styled(
+            format!(
+                " {:.1}/{:.1} GiB ({:.1}%)",
+                sys.ram_used_gb(),
+                sys.ram_total_gb(),
+                ram_pct
+            ),
             Style::default().fg(Color::White),
         ),
     ]);
@@ -262,10 +278,23 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
             Color::DarkGray
         };
         let swap_line = Line::from(vec![
-            Span::styled("SWP", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
-            Span::styled(make_bar(swap_pct as f32, ram_bar_width), Style::default().fg(swap_color)),
             Span::styled(
-                format!(" {:.1}/{:.1} GiB ({:.1}%)", sys.swap_used_gb(), sys.swap_total_gb(), swap_pct),
+                "SWP",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                make_bar(swap_pct as f32, ram_bar_width),
+                Style::default().fg(swap_color),
+            ),
+            Span::styled(
+                format!(
+                    " {:.1}/{:.1} GiB ({:.1}%)",
+                    sys.swap_used_gb(),
+                    sys.swap_total_gb(),
+                    swap_pct
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -285,13 +314,15 @@ fn draw_gpu_panel(f: &mut Frame, app: &App, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Percentage(25),
+            Constraint::Percentage(40),
             Constraint::Percentage(35),
-            Constraint::Percentage(65),
         ])
         .split(area);
 
     draw_gpu_list(f, app, sections[0]);
     draw_gpu_detail(f, app, sections[1]);
+    draw_vram_top_processes(f, app, sections[2]);
 }
 
 fn draw_gpu_list(f: &mut Frame, app: &App, area: Rect) {
@@ -317,8 +348,7 @@ fn draw_gpu_list(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Devices "));
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Devices "));
     f.render_widget(list, area);
 }
 
@@ -342,24 +372,40 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("VRAM: ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                format!(
-                    "{} / {} MB ({:.1}%)",
-                    m.memory_used_mb(),
-                    m.memory_total_mb(),
-                    m.memory_percent()
-                ),
-                Style::default().fg(Color::White),
+                "VRAM ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} MB", m.memory_used_mb()),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" / {} MB ", m.memory_total_mb()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("({:.1}%)", m.memory_percent()),
+                Style::default().fg(vram_pct_color(m.memory_percent())),
             ),
         ]),
         Line::from(vec![
             Span::styled("GPU Util: ", Style::default().fg(Color::Green)),
-            Span::styled(format!("{}%", m.gpu_util), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{}%", m.gpu_util),
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Mem Util: ", Style::default().fg(Color::Blue)),
-            Span::styled(format!("{}%", m.memory_util), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{}%", m.memory_util),
+                Style::default().fg(Color::White),
+            ),
         ]),
     ];
 
@@ -396,21 +442,21 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
 
     lines.push(Line::from(vec![
         Span::styled("Processes: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", m.process_count), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{}", m.process_count),
+            Style::default().fg(Color::White),
+        ),
     ]));
 
-    let detail = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Detail "));
+    let detail =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Detail "));
     f.render_widget(detail, area);
 }
 
 fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
     draw_gpu_charts(f, app, cols[0]);
@@ -480,13 +526,14 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
 
         let vram_pct = m.memory_percent().min(100.0) as u16;
         let vram_gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" VRAM "))
+            .block(Block::default().borders(Borders::ALL).title(" VRAM Usage "))
             .gauge_style(Style::default().fg(Color::Magenta))
             .percent(vram_pct)
             .label(format!(
-                "{}/{} MB",
+                "VRAM {} / {} MB ({:.1}%)",
                 m.memory_used_mb(),
-                m.memory_total_mb()
+                m.memory_total_mb(),
+                m.memory_percent()
             ));
         f.render_widget(vram_gauge, gauge_cols[1]);
     }
@@ -510,7 +557,11 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_else(|| " CPU Total ".to_string());
     with_spark_data_f32(&app.system_history.cpu_total, |data| {
         let sparkline = Sparkline::default()
-            .block(Block::default().borders(Borders::ALL).title(cpu_label.as_str()))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(cpu_label.as_str()),
+            )
             .data(data)
             .max(100)
             .style(Style::default().fg(Color::Cyan));
@@ -532,7 +583,11 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_else(|| " RAM ".to_string());
     with_spark_data_f64(&app.system_history.ram_percent, |data| {
         let sparkline = Sparkline::default()
-            .block(Block::default().borders(Borders::ALL).title(ram_label.as_str()))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(ram_label.as_str()),
+            )
             .data(data)
             .max(100)
             .style(Style::default().fg(Color::Yellow));
@@ -553,6 +608,74 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
             ));
         f.render_widget(ram_gauge, rows[2]);
     }
+}
+
+fn vram_pct_color(pct: f64) -> Color {
+    if pct > 90.0 {
+        Color::Red
+    } else if pct > 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
+    let m = match app.selected_metrics() {
+        Some(m) => m,
+        None => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" VRAM Top Processes ");
+            f.render_widget(block, area);
+            return;
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" VRAM Top 5 Processes ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(6);
+
+    // Header row
+    lines.push(Line::from(vec![Span::styled(
+        format!("{:<7} {:<15} {:>10}", "PID", "Process", "VRAM"),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    if m.top_processes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No compute processes",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for proc in m.top_processes.iter().take(5) {
+            let name: String = proc.name.chars().take(15).collect();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<7}", proc.pid),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(format!("{:<15}", name), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:>7} MB", proc.vram_used_mb()),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
+    }
+
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {

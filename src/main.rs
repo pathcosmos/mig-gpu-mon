@@ -20,7 +20,10 @@ use gpu::metrics::SystemMetrics;
 use gpu::nvml::NvmlCollector;
 
 #[derive(Parser)]
-#[command(name = "mig-gpu-mon", about = "Real-time GPU monitor for MIG environments")]
+#[command(
+    name = "mig-gpu-mon",
+    about = "Real-time GPU monitor for MIG environments"
+)]
 struct Cli {
     /// Polling interval in milliseconds
     #[arg(short, long, default_value_t = 1000)]
@@ -53,7 +56,9 @@ fn main() -> Result<()> {
             eprintln!("  2. libnvidia-ml.so is not in the library path");
             eprintln!("     → Ubuntu: sudo ldconfig /usr/lib/x86_64-linux-gnu/");
             eprintln!("     → RHEL/Rocky: sudo ldconfig /usr/lib64/");
-            eprintln!("     → Or specify manually: mig-gpu-mon --nvml-path /path/to/libnvidia-ml.so.1");
+            eprintln!(
+                "     → Or specify manually: mig-gpu-mon --nvml-path /path/to/libnvidia-ml.so.1"
+            );
             eprintln!("  3. Running inside a container without GPU access");
             eprintln!("     → Use: docker run --gpus all ...");
             eprintln!("     → Or:  docker run --runtime=nvidia -e NVIDIA_DRIVER_CAPABILITIES=compute,utility ...");

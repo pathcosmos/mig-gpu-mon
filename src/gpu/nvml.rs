@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::Device;
 use nvml_wrapper::Nvml;
 use nvml_wrapper_sys::bindings::{nvmlDevice_t, nvmlProcessUtilizationSample_t, NvmlLib};
@@ -9,7 +10,7 @@ use std::ffi::OsStr;
 use std::os::raw::c_uint;
 use std::time::Instant;
 
-use super::metrics::GpuMetrics;
+use super::metrics::{GpuMetrics, GpuProcessInfo};
 
 /// Cached static device info that never changes at runtime
 struct DeviceInfo {
@@ -91,8 +92,8 @@ impl NvmlCollector {
 
         let raw_lib = unsafe {
             #[cfg(target_os = "linux")]
-            let lib = Self::load_raw_lib(nvml_lib_path)
-                .context("Failed to load NVML shared library")?;
+            let lib =
+                Self::load_raw_lib(nvml_lib_path).context("Failed to load NVML shared library")?;
             #[cfg(target_os = "windows")]
             let lib = NvmlLib::new("nvml.dll").context("Failed to load NVML DLL")?;
             lib
@@ -130,8 +131,7 @@ impl NvmlCollector {
                 return Ok(lib);
             }
         }
-        NvmlLib::new("libnvidia-ml.so.1")
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        NvmlLib::new("libnvidia-ml.so.1").map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Collect metrics from all GPUs and MIG instances
@@ -161,9 +161,9 @@ impl NvmlCollector {
             let handle = device.handle();
             let mut current_mode: c_uint = 0;
             let mut pending_mode: c_uint = 0;
-            let ret = self
-                .raw_lib
-                .nvmlDeviceGetMigMode(handle, &mut current_mode, &mut pending_mode);
+            let ret =
+                self.raw_lib
+                    .nvmlDeviceGetMigMode(handle, &mut current_mode, &mut pending_mode);
             ret == 0 && current_mode == 1
         }
     }
@@ -209,8 +209,7 @@ impl NvmlCollector {
                         metrics.sm_util = Some(sm);
                     }
 
-                    metrics.name =
-                        format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name);
+                    metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name);
                     mig_metrics.push(metrics);
                 }
             }
@@ -309,10 +308,29 @@ impl NvmlCollector {
         let power_usage = device.power_usage().ok();
         let power_limit = device.power_management_limit().ok();
 
-        let process_count = device
-            .running_compute_processes()
-            .map(|p| p.len() as u32)
-            .unwrap_or(0);
+        let (process_count, top_processes) = match device.running_compute_processes() {
+            Ok(procs) => {
+                let count = procs.len() as u32;
+                let mut proc_infos: Vec<GpuProcessInfo> = procs
+                    .iter()
+                    .filter_map(|p| {
+                        let vram = match p.used_gpu_memory {
+                            UsedGpuMemory::Used(bytes) => bytes,
+                            UsedGpuMemory::Unavailable => return None,
+                        };
+                        Some(GpuProcessInfo {
+                            pid: p.pid,
+                            name: Self::process_name(p.pid),
+                            vram_used: vram,
+                        })
+                    })
+                    .collect();
+                proc_infos.sort_by(|a, b| b.vram_used.cmp(&a.vram_used));
+                proc_infos.truncate(5);
+                (count, proc_infos)
+            }
+            Err(_) => (0, Vec::new()),
+        };
 
         Ok(GpuMetrics {
             index,
@@ -329,8 +347,23 @@ impl NvmlCollector {
             power_usage,
             power_limit,
             process_count,
+            top_processes,
             timestamp: Instant::now(),
         })
+    }
+
+    /// Read process name from /proc/{pid}/comm (Linux) or fallback
+    fn process_name(pid: u32) -> String {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(name) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+        format!("pid:{pid}")
     }
 
     pub fn driver_version(&self) -> String {
