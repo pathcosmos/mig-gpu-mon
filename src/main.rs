@@ -25,13 +25,23 @@ struct Cli {
     /// Polling interval in milliseconds
     #[arg(short, long, default_value_t = 1000)]
     interval: u64,
+
+    /// Custom path to libnvidia-ml.so (override automatic detection)
+    #[arg(long, value_name = "PATH")]
+    nvml_path: Option<String>,
+}
+
+fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/version")
+        .map(|v| v.to_lowercase().contains("microsoft"))
+        .unwrap_or(false)
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize NVML
-    let collector = match NvmlCollector::new() {
+    let collector = match NvmlCollector::new(cli.nvml_path.as_deref()) {
         Ok(c) => c,
         Err(_) => {
             eprintln!("Error: Failed to initialize NVML.\n");
@@ -41,9 +51,25 @@ fn main() -> Result<()> {
             eprintln!("       or check https://www.nvidia.com/drivers");
             eprintln!("  2. libnvidia-ml.so is not in the library path");
             eprintln!("     → Try: sudo ldconfig /usr/lib/x86_64-linux-gnu/");
+            eprintln!("     → Or specify manually: mig-gpu-mon --nvml-path /path/to/libnvidia-ml.so.1");
             eprintln!("  3. Running inside a container without GPU access");
             eprintln!("     → Use: docker run --gpus all ...");
-            eprintln!("           or nvidia-docker");
+            eprintln!("     → Or:  docker run --runtime=nvidia -e NVIDIA_DRIVER_CAPABILITIES=compute,utility ...");
+            eprintln!("  4. Cloud GPU instance (AWS, GCP, vast.io, RunPod)");
+            eprintln!("     → Ensure nvidia-container-toolkit is installed on the host");
+            eprintln!("     → Check: nvidia-smi  (should show GPU info)");
+            eprintln!("     → If nvidia-smi works but this tool fails, try:");
+            eprintln!("       mig-gpu-mon --nvml-path $(ldconfig -p | grep libnvidia-ml | awk '{{print $NF}}' | head -1)");
+            if is_wsl() {
+                eprintln!();
+                eprintln!("  ** WSL 환경이 감지되었습니다 **");
+                eprintln!("  5. WSL2를 사용 중인지 확인: wsl -l -v (VERSION이 2여야 함)");
+                eprintln!("  6. Windows용 NVIDIA 드라이버를 최신 버전으로 설치/업데이트하세요");
+                eprintln!("     → https://www.nvidia.com/drivers (Linux용이 아닌 Windows용)");
+                eprintln!("  7. WSL 내에서 nvidia-smi가 동작하는지 확인하세요");
+                eprintln!("  8. WSL1은 GPU 패스스루를 지원하지 않습니다");
+                eprintln!("     → WSL1 → WSL2 변환: wsl --set-version <distro> 2");
+            }
             std::process::exit(1);
         }
     };

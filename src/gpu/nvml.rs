@@ -29,17 +29,69 @@ pub struct NvmlCollector {
 }
 
 impl NvmlCollector {
-    pub fn new() -> Result<Self> {
-        let nvml = Nvml::builder()
-            .lib_path(OsStr::new("libnvidia-ml.so.1"))
-            .init()
-            .or_else(|_| Nvml::init())
+    /// Well-known paths where libnvidia-ml.so may be found on Linux systems.
+    /// Order: dynamic linker names first, then distro-specific, container, cloud, WSL.
+    #[cfg(target_os = "linux")]
+    const NVML_LIB_PATHS: &[&str] = &[
+        // Dynamic linker — works when LD_LIBRARY_PATH or ldconfig is configured
+        "libnvidia-ml.so.1",
+        "libnvidia-ml.so",
+        // Debian / Ubuntu (x86_64)
+        "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+        // RHEL / CentOS / Rocky / Amazon Linux
+        "/usr/lib64/libnvidia-ml.so.1",
+        // Debian / Ubuntu (ARM64 — e.g. AWS Graviton GPU instances)
+        "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1",
+        // NVIDIA Container Toolkit (vast.io, RunPod, AWS EKS/ECS, GCP GKE, Azure AKS)
+        "/usr/local/nvidia/lib64/libnvidia-ml.so.1",
+        "/usr/local/nvidia/lib/libnvidia-ml.so.1",
+        // NVIDIA GPU Operator / driver container (Kubernetes)
+        "/run/nvidia/driver/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+        "/run/nvidia/driver/usr/lib64/libnvidia-ml.so.1",
+        // CUDA stubs (build-only — no runtime metrics, but allows init check)
+        "/usr/local/cuda/lib64/stubs/libnvidia-ml.so",
+        // WSL2
+        "/usr/lib/wsl/lib/libnvidia-ml.so.1",
+    ];
+
+    /// Build the list of candidate library paths: user override + LD_LIBRARY_PATH + built-in.
+    #[cfg(target_os = "linux")]
+    fn lib_search_paths(user_path: Option<&str>) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::with_capacity(16);
+
+        // 1. User-specified path takes highest priority
+        if let Some(p) = user_path {
+            paths.push(p.to_string());
+        }
+
+        // 2. Paths derived from LD_LIBRARY_PATH (may contain cloud-specific entries)
+        if let Ok(ld_path) = std::env::var("LD_LIBRARY_PATH") {
+            for dir in ld_path.split(':').filter(|s| !s.is_empty()) {
+                let candidate = format!("{dir}/libnvidia-ml.so.1");
+                if !paths.contains(&candidate) {
+                    paths.push(candidate);
+                }
+            }
+        }
+
+        // 3. Built-in well-known paths
+        for &p in Self::NVML_LIB_PATHS {
+            let s = p.to_string();
+            if !paths.contains(&s) {
+                paths.push(s);
+            }
+        }
+
+        paths
+    }
+
+    pub fn new(nvml_lib_path: Option<&str>) -> Result<Self> {
+        let nvml = Self::init_nvml(nvml_lib_path)
             .context("Failed to initialize NVML. Is the NVIDIA driver installed?")?;
 
         let raw_lib = unsafe {
             #[cfg(target_os = "linux")]
-            let lib = NvmlLib::new("libnvidia-ml.so.1")
-                .or_else(|_| NvmlLib::new("libnvidia-ml.so"))
+            let lib = Self::load_raw_lib(nvml_lib_path)
                 .context("Failed to load NVML shared library")?;
             #[cfg(target_os = "windows")]
             let lib = NvmlLib::new("nvml.dll").context("Failed to load NVML DLL")?;
@@ -52,6 +104,34 @@ impl NvmlCollector {
             device_cache: RefCell::new(HashMap::new()),
             proc_sample_buf: RefCell::new(Vec::with_capacity(32)),
         })
+    }
+
+    fn init_nvml(user_path: Option<&str>) -> Result<Nvml, nvml_wrapper::error::NvmlError> {
+        #[cfg(target_os = "linux")]
+        {
+            for path in Self::lib_search_paths(user_path) {
+                if let Ok(nvml) = Nvml::builder().lib_path(OsStr::new(&path)).init() {
+                    return Ok(nvml);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = user_path;
+        }
+        // Final attempt — default search
+        Nvml::init()
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn load_raw_lib(user_path: Option<&str>) -> Result<NvmlLib> {
+        for path in Self::lib_search_paths(user_path) {
+            if let Ok(lib) = NvmlLib::new(&path) {
+                return Ok(lib);
+            }
+        }
+        NvmlLib::new("libnvidia-ml.so.1")
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Collect metrics from all GPUs and MIG instances

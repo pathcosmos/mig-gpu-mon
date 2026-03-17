@@ -1,8 +1,12 @@
 # mig-gpu-mon
 
+**한국어** | [English](README_EN.md)
+
 NVIDIA MIG(Multi-Instance GPU) 환경에서 `nvidia-smi`가 제공하지 못하는 GPU 메트릭을 실시간 모니터링하는 터미널 TUI 프로그램.
 
 btop/nvtop 스타일의 실시간 그래프와 게이지를 터미널에서 표시하며, CPU 코어별 사용률과 시스템 RAM도 함께 모니터링한다.
+
+> **Ubuntu 특화:** 개발 및 테스트가 Ubuntu 환경에서 이루어졌으며, 라이브러리 탐색 경로·에러 메시지·문서 모두 Ubuntu를 1차 대상으로 작성되었습니다. RHEL 계열, 컨테이너, WSL2 등 다른 환경에서도 동작하지만, Ubuntu에서 가장 매끄럽게 동작합니다.
 
 ## Screen Layout
 
@@ -125,6 +129,62 @@ MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 
 - `libnvidia-ml.so.1` 접근 가능 (드라이버 설치 시 포함)
 - 컨테이너 환경: `--gpus all` 또는 nvidia-docker 사용
 
+### NVML 라이브러리 탐색 경로
+
+프로그램 시작 시 다음 경로를 순서대로 탐색하여 NVML 라이브러리를 로딩한다.
+`LD_LIBRARY_PATH`에 등록되지 않은 환경(컨테이너, WSL, 비표준 설치 경로)에서도 자동으로 라이브러리를 찾는다.
+
+| 순서 | 경로 | 대상 환경 |
+|------|------|-----------|
+| 0 | `--nvml-path` 인자 | 사용자 지정 (최우선) |
+| 0+ | `LD_LIBRARY_PATH` 내 경로 | 환경변수 기반 (클라우드 커스텀 설정) |
+| 1 | `libnvidia-ml.so.1` | 동적 링커 (표준) |
+| 2 | `libnvidia-ml.so` | 기본 (심볼릭 링크) |
+| 3 | `/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1` | Debian / Ubuntu (x86_64) |
+| 4 | `/usr/lib64/libnvidia-ml.so.1` | RHEL / CentOS / Rocky / Amazon Linux |
+| 5 | `/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1` | Debian / Ubuntu (ARM64, Graviton) |
+| 6 | `/usr/local/nvidia/lib64/libnvidia-ml.so.1` | NVIDIA Container Toolkit (vast.io, RunPod, EKS, GKE, AKS) |
+| 7 | `/usr/local/nvidia/lib/libnvidia-ml.so.1` | NVIDIA Container Toolkit (대체 경로) |
+| 8 | `/run/nvidia/driver/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1` | NVIDIA GPU Operator (Kubernetes) |
+| 9 | `/run/nvidia/driver/usr/lib64/libnvidia-ml.so.1` | NVIDIA GPU Operator (Kubernetes, RHEL) |
+| 10 | `/usr/local/cuda/lib64/stubs/libnvidia-ml.so` | CUDA stubs (빌드 전용) |
+| 11 | `/usr/lib/wsl/lib/libnvidia-ml.so.1` | WSL2 |
+
+### 환경별 실행 가이드
+
+| 환경 | 실행 방법 |
+|------|-----------|
+| **Native (Ubuntu/RHEL)** | `mig-gpu-mon` (드라이버 설치 시 즉시 동작) |
+| **Docker** | `docker run --gpus all ...` 또는 `--runtime=nvidia -e NVIDIA_DRIVER_CAPABILITIES=compute,utility` |
+| **AWS (EC2 p4d/p5, EKS)** | Deep Learning AMI: 즉시 동작. EKS: nvidia-device-plugin 설치 필요 |
+| **GCP (a2/a3 VM, GKE)** | GPU VM: 즉시 동작. GKE: nvidia-driver-installer DaemonSet 필요 |
+| **vast.io** | 컨테이너에 자동 마운트, 즉시 동작 |
+| **RunPod** | 컨테이너에 자동 마운트, 즉시 동작 |
+| **Lambda Labs** | 즉시 동작 (네이티브 드라이버 설치) |
+| **WSL2** | `wsl --install` 후 Windows NVIDIA 드라이버 설치 필요 |
+
+### WSL2 설정 가이드
+
+**전제 조건:**
+- Windows 11 (또는 Windows 10 21H2+)
+- WSL2 (WSL1은 GPU 미지원)
+- Windows용 NVIDIA 드라이버 (Linux용 아님)
+
+**설치 확인:**
+1. PowerShell에서: `wsl -l -v` → VERSION이 2인지 확인
+2. WSL 내에서: `nvidia-smi` → GPU 정보 표시되는지 확인
+3. WSL 내에서: `ls /usr/lib/wsl/lib/libnvidia-ml.so.1` → 파일 존재 확인
+
+**트러블슈팅:**
+- `nvidia-smi` 안 됨 → Windows NVIDIA 드라이버 업데이트
+- WSL1 사용 중 → `wsl --set-version <distro> 2`로 변환
+- 라이브러리 없음 → Windows NVIDIA 드라이버 재설치
+
+자동 탐지가 실패할 경우 수동 지정:
+```bash
+mig-gpu-mon --nvml-path /custom/path/libnvidia-ml.so.1
+```
+
 ## Build & Install
 
 ```bash
@@ -150,6 +210,9 @@ mig-gpu-mon
 # 폴링 간격 조정 (밀리초)
 mig-gpu-mon --interval 2000    # 2초 간격 (리소스 절약)
 mig-gpu-mon -i 500             # 0.5초 간격 (빠른 반응)
+
+# NVML 라이브러리 경로 수동 지정 (자동 탐지 실패 시)
+mig-gpu-mon --nvml-path /usr/local/nvidia/lib64/libnvidia-ml.so.1
 
 # 도움말
 mig-gpu-mon --help
