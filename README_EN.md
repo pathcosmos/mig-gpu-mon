@@ -121,7 +121,7 @@ This tool bypasses that limitation by calling the NVML C API directly:
 - Time-series sparkline graphs for GPU Util / Memory Util / CPU Total / RAM
 - GPU Util / VRAM / RAM gauges
 - Switch between GPU/MIG instances with Tab/arrow keys
-- Single binary deployment (1.4MB, no dependencies)
+- Single binary deployment (~1.5MB, dynamically links libc — no separate runtime install needed)
 
 ## Requirements
 
@@ -190,18 +190,20 @@ mig-gpu-mon --nvml-path /custom/path/libnvidia-ml.so.1
 From a fresh server — just run the **install script** and everything is handled automatically:
 
 ```bash
+# Install git first if not present (Ubuntu: sudo apt install git / Rocky: sudo dnf install git)
 git clone https://github.com/pathcosmos/mig-gpu-mon.git
 cd mig-gpu-mon
 ./install.sh
 ```
 
 What `install.sh` handles automatically:
-1. `curl` not installed → auto-installs (auto-detects apt/dnf/yum)
-2. `gcc` (C linker) not installed → auto-installs `build-essential` (Ubuntu) or `gcc` (Rocky/RHEL)
-3. `git` not installed → auto-installs
-4. Rust not installed → auto-installs via rustup
-5. `cargo build --release` → optimized build (LTO + strip, ~1.5MB)
-6. Copies binary to `~/.cargo/bin/mig-gpu-mon` + verifies PATH registration
+1. Checks `sudo` availability (exits with clear message if non-root without sudo)
+2. `curl` not installed → auto-installs (auto-detects apt/dnf/yum)
+3. `gcc` (C linker) not installed → auto-installs `build-essential` (Ubuntu) or `gcc` (Rocky/RHEL)
+4. `git` not installed → auto-installs
+5. Rust not installed → auto-installs via rustup
+6. `cargo build --release` → optimized build (LTO + strip, ~1.5MB)
+7. Copies binary (`~/.cargo/bin` → `/usr/local/bin` → `~/.local/bin` fallback order) + verifies PATH
 
 > Supports Ubuntu, Rocky Linux, CentOS, RHEL, and Amazon Linux. Package manager (apt/dnf/yum) is auto-detected.
 
@@ -213,6 +215,11 @@ mig-gpu-mon
 ### Manual Installation (Step by Step)
 
 ```bash
+# 0. Build dependencies (Ubuntu)
+sudo apt install -y curl git build-essential
+# 0. Build dependencies (Rocky/RHEL)
+# sudo dnf install -y curl git gcc
+
 # 1. Install Rust (skip if already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -233,13 +240,16 @@ Since `~/.cargo/bin` is in `PATH`, you can run `mig-gpu-mon` from anywhere.
 
 ### One-Liner Install (Copy-Paste)
 
+> **Prerequisite:** `curl`, `git`, and `gcc` must be installed. If not, run step 0 from Manual Installation above first.
+
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env" && git clone https://github.com/pathcosmos/mig-gpu-mon.git /tmp/mig-gpu-mon && cargo install --path /tmp/mig-gpu-mon && mig-gpu-mon --help
 ```
 
 ### Copy Binary to Other Servers (No Rust Needed)
 
-For other servers with the same architecture (x86_64 Linux), just copy the built binary:
+Copy the built binary to other servers with the same architecture (x86_64 Linux).
+The target server's glibc version must be equal to or newer than the build server's (`ldd --version` to check).
 
 ```bash
 # From the build server
@@ -252,9 +262,10 @@ mig-gpu-mon
 ### Uninstall
 
 ```bash
-cargo uninstall mig-gpu-mon    # If installed via cargo
+cargo uninstall mig-gpu-mon      # If installed via cargo install
 # or
-rm /usr/local/bin/mig-gpu-mon  # If manually copied
+rm ~/.cargo/bin/mig-gpu-mon      # If installed via install.sh
+rm /usr/local/bin/mig-gpu-mon    # If manually copied
 ```
 
 ## Build & Install (Detailed)
@@ -465,7 +476,7 @@ Total RSS ~4-8 MB
 | `lto` | true | Link-Time Optimization, dead code elimination |
 | `strip` | true | Complete debug symbol removal |
 | `tokio` removal | — | No async needed, synchronous event loop suffices — saves ~200KB |
-| Final size | **~1.4MB** | Single static binary |
+| Final size | **~1.5MB** | Single binary (dynamically links libc) |
 
 ## Why Rust
 

@@ -121,7 +121,7 @@ MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 
 - GPU Util / Memory Util / CPU Total / RAM 시계열 sparkline 그래프
 - GPU Util / VRAM / RAM 게이지
 - Tab/방향키로 GPU/MIG 인스턴스 전환
-- 단일 바이너리 배포 (1.4MB, 의존성 없음)
+- 단일 바이너리 배포 (~1.5MB, libc 동적 링크 — 별도 런타임 설치 불필요)
 
 ## Requirements
 
@@ -190,18 +190,20 @@ mig-gpu-mon --nvml-path /custom/path/libnvidia-ml.so.1
 새 서버에서 Rust 설치부터 실행까지 **자동 설치 스크립트** 한 번이면 끝:
 
 ```bash
+# git이 없으면 먼저 설치 (Ubuntu: sudo apt install git / Rocky: sudo dnf install git)
 git clone https://github.com/pathcosmos/mig-gpu-mon.git
 cd mig-gpu-mon
 ./install.sh
 ```
 
 `install.sh`가 자동으로 처리하는 것:
-1. `curl` 미설치 시 → 자동 설치 (apt/dnf/yum 자동 판별)
-2. `gcc` (C 링커) 미설치 시 → `build-essential`(Ubuntu) 또는 `gcc`(Rocky/RHEL) 자동 설치
-3. `git` 미설치 시 → 자동 설치
-4. Rust 미설치 시 → rustup으로 자동 설치
-5. `cargo build --release` → 최적화 빌드 (LTO + strip, ~1.5MB)
-6. `~/.cargo/bin/mig-gpu-mon`에 바이너리 복사 + PATH 등록 확인
+1. `sudo` 사용 가능 여부 확인 (root가 아니고 sudo 없으면 안내 후 중단)
+2. `curl` 미설치 시 → 자동 설치 (apt/dnf/yum 자동 판별)
+3. `gcc` (C 링커) 미설치 시 → `build-essential`(Ubuntu) 또는 `gcc`(Rocky/RHEL) 자동 설치
+4. `git` 미설치 시 → 자동 설치
+5. Rust 미설치 시 → rustup으로 자동 설치
+6. `cargo build --release` → 최적화 빌드 (LTO + strip, ~1.5MB)
+7. 바이너리 복사 (`~/.cargo/bin` → `/usr/local/bin` → `~/.local/bin` 순으로 탐색) + PATH 확인
 
 > Ubuntu, Rocky Linux, CentOS, RHEL, Amazon Linux 모두 대응. 패키지 매니저(apt/dnf/yum)를 자동 감지한다.
 
@@ -213,6 +215,11 @@ mig-gpu-mon
 ### 수동 설치 (단계별)
 
 ```bash
+# 0. 빌드 의존성 (Ubuntu)
+sudo apt install -y curl git build-essential
+# 0. 빌드 의존성 (Rocky/RHEL)
+# sudo dnf install -y curl git gcc
+
 # 1. Rust 설치 (이미 설치되어 있으면 생략)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -233,13 +240,16 @@ mig-gpu-mon
 
 ### 원라인 설치 (복사-붙여넣기용)
 
+> **전제:** `curl`, `git`, `gcc`가 설치되어 있어야 한다. 없으면 위의 수동 설치 0번 단계를 먼저 실행.
+
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env" && git clone https://github.com/pathcosmos/mig-gpu-mon.git /tmp/mig-gpu-mon && cargo install --path /tmp/mig-gpu-mon && mig-gpu-mon --help
 ```
 
 ### 다른 서버에 바이너리만 복사 (Rust 없이)
 
-같은 아키텍처(x86_64 Linux)의 다른 서버에는 빌드된 바이너리만 복사하면 된다:
+같은 아키텍처(x86_64 Linux)의 다른 서버에 빌드된 바이너리만 복사하면 된다.
+대상 서버의 glibc 버전이 빌드 서버와 같거나 높아야 한다 (`ldd --version`으로 확인).
 
 ```bash
 # 빌드 서버에서
@@ -252,9 +262,10 @@ mig-gpu-mon
 ### 제거
 
 ```bash
-cargo uninstall mig-gpu-mon   # cargo로 설치한 경우
+cargo uninstall mig-gpu-mon      # cargo install로 설치한 경우
 # 또는
-rm /usr/local/bin/mig-gpu-mon  # 수동 복사한 경우
+rm ~/.cargo/bin/mig-gpu-mon      # install.sh로 설치한 경우
+rm /usr/local/bin/mig-gpu-mon    # 수동 복사한 경우
 ```
 
 ## Build & Install (상세)
@@ -465,7 +476,7 @@ nvmlDeviceGetUtilizationRates(mig_handle)
 | `lto` | true | Link-Time Optimization, 미사용 코드 제거 |
 | `strip` | true | 디버그 심볼 완전 제거 |
 | `tokio` 제거 | — | async 미사용, 동기 이벤트 루프로 충분 — 바이너리 ~200KB 절약 |
-| 최종 크기 | **~1.4MB** | 단일 static 바이너리 |
+| 최종 크기 | **~1.5MB** | 단일 바이너리 (libc 동적 링크) |
 
 ## Why Rust
 

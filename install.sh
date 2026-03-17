@@ -20,15 +20,36 @@ if [[ "$(uname -s)" != "Linux" ]]; then
     error "This tool only supports Linux (detected: $(uname -s))"
 fi
 
-# ── 2. Install build dependencies ────────────────────────────────────
+# ── 2. Check sudo / root ────────────────────────────────────────────
+need_install=false
+for cmd in curl cc gcc git; do
+    if [[ "$cmd" == "cc" || "$cmd" == "gcc" ]]; then
+        command -v cc &>/dev/null || command -v gcc &>/dev/null || need_install=true
+    else
+        command -v "$cmd" &>/dev/null || need_install=true
+    fi
+done
+
+if $need_install; then
+    if [[ "$(id -u)" -ne 0 ]] && ! command -v sudo &>/dev/null; then
+        error "Missing packages (curl/gcc/git) and no sudo available.\n  Run as root or install sudo first: su -c 'apt install sudo' (Ubuntu) / su -c 'dnf install sudo' (Rocky)"
+    fi
+fi
+
+# ── 3. Install build dependencies ───────────────────────────────────
 install_pkg() {
     local pkg_apt="$1" pkg_rpm="$2"
+    local SUDO=""
+    if [[ "$(id -u)" -ne 0 ]]; then
+        SUDO="sudo"
+    fi
+
     if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq $pkg_apt
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq $pkg_apt
     elif command -v dnf &>/dev/null; then
-        sudo dnf install -y -q $pkg_rpm
+        $SUDO dnf install -y -q $pkg_rpm
     elif command -v yum &>/dev/null; then
-        sudo yum install -y -q $pkg_rpm
+        $SUDO yum install -y -q $pkg_rpm
     else
         error "Could not determine package manager (apt/dnf/yum). Install manually: $pkg_apt (Debian) or $pkg_rpm (RHEL)"
     fi
@@ -37,7 +58,7 @@ install_pkg() {
 # curl — required for rustup
 if ! command -v curl &>/dev/null; then
     warn "curl not found. Installing..."
-    install_pkg "curl" "curl"
+    install_pkg "curl ca-certificates" "curl"
 fi
 
 # gcc/cc — required as C linker for cargo build
@@ -52,7 +73,7 @@ if ! command -v git &>/dev/null; then
     install_pkg "git" "git"
 fi
 
-# ── 3. Install Rust if not present ───────────────────────────────────
+# ── 4. Install Rust if not present ───────────────────────────────────
 if command -v cargo &>/dev/null; then
     info "Rust already installed: $(rustc --version)"
 else
@@ -62,7 +83,7 @@ else
     info "Rust installed: $(rustc --version)"
 fi
 
-# ── 4. Build ─────────────────────────────────────────────────────────
+# ── 5. Build ─────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -f "$SCRIPT_DIR/Cargo.toml" ]]; then
@@ -73,7 +94,7 @@ else
     error "Cargo.toml not found in $SCRIPT_DIR. Run this script from the project root."
 fi
 
-# ── 5. Install ───────────────────────────────────────────────────────
+# ── 6. Install ───────────────────────────────────────────────────────
 BINARY="$SCRIPT_DIR/target/release/mig-gpu-mon"
 if [[ ! -f "$BINARY" ]]; then
     error "Build succeeded but binary not found at $BINARY"
@@ -82,7 +103,7 @@ fi
 INSTALL_DIR=""
 if [[ -d "$HOME/.cargo/bin" ]]; then
     INSTALL_DIR="$HOME/.cargo/bin"
-elif [[ -w "/usr/local/bin" ]]; then
+elif [[ -w "/usr/local/bin" ]] || [[ "$(id -u)" -eq 0 ]]; then
     INSTALL_DIR="/usr/local/bin"
 else
     INSTALL_DIR="$HOME/.local/bin"
@@ -92,19 +113,20 @@ fi
 cp "$BINARY" "$INSTALL_DIR/mig-gpu-mon"
 chmod +x "$INSTALL_DIR/mig-gpu-mon"
 
-# ── 6. Verify ────────────────────────────────────────────────────────
+# ── 7. Verify ────────────────────────────────────────────────────────
+info "Installation complete!"
+echo ""
+echo -e "  ${BOLD}Binary:${RESET}    $INSTALL_DIR/mig-gpu-mon"
+echo -e "  ${BOLD}Size:${RESET}      $(du -h "$INSTALL_DIR/mig-gpu-mon" | cut -f1)"
+echo -e "  ${BOLD}Uninstall:${RESET} rm $INSTALL_DIR/mig-gpu-mon"
+echo ""
+
 if command -v mig-gpu-mon &>/dev/null; then
-    info "Installation complete!"
-    echo ""
-    echo -e "  ${BOLD}Binary:${RESET}   $INSTALL_DIR/mig-gpu-mon"
-    echo -e "  ${BOLD}Size:${RESET}     $(du -h "$INSTALL_DIR/mig-gpu-mon" | cut -f1)"
-    echo -e "  ${BOLD}Run:${RESET}      mig-gpu-mon"
-    echo -e "  ${BOLD}Help:${RESET}     mig-gpu-mon --help"
-    echo ""
+    echo -e "  ${BOLD}Run:${RESET}       mig-gpu-mon"
+    echo -e "  ${BOLD}Help:${RESET}      mig-gpu-mon --help"
 else
-    warn "Binary installed to $INSTALL_DIR/mig-gpu-mon"
-    warn "but it is not in PATH. Add this to your shell profile:"
+    warn "'mig-gpu-mon' is not in PATH. Add this to your shell profile:"
     echo ""
     echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
-    echo ""
 fi
+echo ""
