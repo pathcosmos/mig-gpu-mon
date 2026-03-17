@@ -12,6 +12,7 @@ crossterm = "0.28"
 anyhow = "1"
 sysinfo = "0.32"
 clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
 
 [profile.release]
 opt-level = 3

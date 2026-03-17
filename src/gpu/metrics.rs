@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::time::Instant;
 
 /// Per-process GPU memory usage
 #[derive(Debug, Clone)]
@@ -43,7 +42,27 @@ pub struct GpuMetrics {
     /// Top processes by VRAM usage (sorted descending, max 5)
     pub top_processes: Vec<GpuProcessInfo>,
 
-    pub timestamp: Instant,
+    // --- Static info (cached, collected once) ---
+    pub architecture: Option<String>, // "Ampere", "Hopper" etc.
+    pub compute_capability: Option<String>, // "8.0", "9.0" etc.
+    pub ecc_enabled: Option<bool>,
+    pub temp_shutdown: Option<u32>, // shutdown threshold °C
+    pub temp_slowdown: Option<u32>, // slowdown threshold °C
+
+    // --- Dynamic extended metrics (per tick) ---
+    pub clock_graphics_mhz: Option<u32>,
+    pub clock_sm_mhz: Option<u32>,
+    pub clock_memory_mhz: Option<u32>,
+    pub pcie_tx_kbps: Option<u32>,
+    pub pcie_rx_kbps: Option<u32>,
+    pub pcie_gen: Option<u32>,
+    pub pcie_width: Option<u32>,
+    pub performance_state: Option<String>, // "P0"~"P15"
+    pub throttle_reasons: Option<String>,  // "None" or "SwPwrCap, HW-Therm"
+    pub encoder_util: Option<u32>,         // 0-100%
+    pub decoder_util: Option<u32>,         // 0-100%
+    pub ecc_errors_corrected: Option<u64>,
+    pub ecc_errors_uncorrected: Option<u64>,
 }
 
 impl GpuMetrics {
@@ -69,6 +88,14 @@ impl GpuMetrics {
     pub fn power_limit_w(&self) -> Option<f64> {
         self.power_limit.map(|p| p as f64 / 1000.0)
     }
+
+    pub fn pcie_tx_mbps(&self) -> Option<f64> {
+        self.pcie_tx_kbps.map(|k| k as f64 / 1024.0)
+    }
+
+    pub fn pcie_rx_mbps(&self) -> Option<f64> {
+        self.pcie_rx_kbps.map(|k| k as f64 / 1024.0)
+    }
 }
 
 /// Time-series history for a single GPU/MIG instance.
@@ -81,6 +108,9 @@ pub struct MetricsHistory {
     pub sm_util: VecDeque<u32>,
     pub temperature: VecDeque<u32>,
     pub power_usage_w: VecDeque<f64>,
+    pub clock_graphics_mhz: VecDeque<u32>,
+    pub pcie_tx_kbps: VecDeque<u32>,
+    pub pcie_rx_kbps: VecDeque<u32>,
     max_entries: usize,
 }
 
@@ -93,6 +123,9 @@ impl MetricsHistory {
             sm_util: VecDeque::with_capacity(max_entries),
             temperature: VecDeque::with_capacity(max_entries),
             power_usage_w: VecDeque::with_capacity(max_entries),
+            clock_graphics_mhz: VecDeque::with_capacity(max_entries),
+            pcie_tx_kbps: VecDeque::with_capacity(max_entries),
+            pcie_rx_kbps: VecDeque::with_capacity(max_entries),
             max_entries,
         }
     }
@@ -113,6 +146,15 @@ impl MetricsHistory {
         }
         if let Some(power) = metrics.power_usage_w() {
             Self::push_ring(&mut self.power_usage_w, power, self.max_entries);
+        }
+        if let Some(clk) = metrics.clock_graphics_mhz {
+            Self::push_ring(&mut self.clock_graphics_mhz, clk, self.max_entries);
+        }
+        if let Some(tx) = metrics.pcie_tx_kbps {
+            Self::push_ring(&mut self.pcie_tx_kbps, tx, self.max_entries);
+        }
+        if let Some(rx) = metrics.pcie_rx_kbps {
+            Self::push_ring(&mut self.pcie_rx_kbps, rx, self.max_entries);
         }
     }
 

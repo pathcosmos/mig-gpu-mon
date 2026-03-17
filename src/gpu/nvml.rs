@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
-use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
-use nvml_wrapper::enums::device::UsedGpuMemory;
+use nvml_wrapper::bitmasks::device::ThrottleReasons;
+use nvml_wrapper::enum_wrappers::device::{
+    Clock, EccCounter, MemoryError, PcieUtilCounter, PerformanceState, TemperatureSensor,
+    TemperatureThreshold,
+};
+use nvml_wrapper::enums::device::{DeviceArchitecture, UsedGpuMemory};
 use nvml_wrapper::Device;
 use nvml_wrapper::Nvml;
 use nvml_wrapper_sys::bindings::{nvmlDevice_t, nvmlProcessUtilizationSample_t, NvmlLib};
@@ -8,20 +12,25 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::raw::c_uint;
-use std::time::Instant;
 
 use super::metrics::{GpuMetrics, GpuProcessInfo};
 
 /// Cached static device info that never changes at runtime
+#[derive(Clone)]
 struct DeviceInfo {
     name: String,
     uuid: String,
+    architecture: Option<String>,
+    compute_capability: Option<String>,
+    ecc_enabled: Option<bool>,
+    temp_shutdown: Option<u32>,
+    temp_slowdown: Option<u32>,
 }
 
 pub struct NvmlCollector {
     nvml: Nvml,
     raw_lib: NvmlLib,
-    /// Cache: device handle pointer → static info (name, uuid).
+    /// Cache: device handle pointer → static info.
     /// RefCell for interior mutability — cache is populated lazily while
     /// NVML device handles borrow &self.nvml.
     device_cache: RefCell<HashMap<usize, DeviceInfo>>,
@@ -264,25 +273,34 @@ impl NvmlCollector {
         (max_sm, max_mem)
     }
 
-    /// Get cached or fetch device name/uuid. These never change at runtime.
-    fn get_device_info(&self, device: &Device) -> (String, String) {
+    /// Get cached or fetch device info. Static fields never change at runtime.
+    fn get_device_info(&self, device: &Device) -> DeviceInfo {
         let key = unsafe { device.handle() } as usize;
         let cache = self.device_cache.borrow();
         if let Some(info) = cache.get(&key) {
-            return (info.name.clone(), info.uuid.clone());
+            return info.clone();
         }
         drop(cache);
 
-        let name = device.name().unwrap_or_else(|_| "Unknown GPU".to_string());
-        let uuid = device.uuid().unwrap_or_else(|_| "N/A".to_string());
-        self.device_cache.borrow_mut().insert(
-            key,
-            DeviceInfo {
-                name: name.clone(),
-                uuid: uuid.clone(),
-            },
-        );
-        (name, uuid)
+        let info = DeviceInfo {
+            name: device.name().unwrap_or_else(|_| "Unknown GPU".to_string()),
+            uuid: device.uuid().unwrap_or_else(|_| "N/A".to_string()),
+            architecture: device.architecture().ok().map(format_architecture),
+            compute_capability: device
+                .cuda_compute_capability()
+                .ok()
+                .map(|cc| format!("{}.{}", cc.major, cc.minor)),
+            ecc_enabled: device.is_ecc_enabled().ok().map(|e| e.currently_enabled),
+            temp_shutdown: device
+                .temperature_threshold(TemperatureThreshold::Shutdown)
+                .ok(),
+            temp_slowdown: device
+                .temperature_threshold(TemperatureThreshold::Slowdown)
+                .ok(),
+        };
+
+        self.device_cache.borrow_mut().insert(key, info.clone());
+        info
     }
 
     fn collect_device_metrics(
@@ -292,7 +310,7 @@ impl NvmlCollector {
         is_mig: bool,
         parent_index: Option<u32>,
     ) -> Result<GpuMetrics> {
-        let (name, uuid) = self.get_device_info(device);
+        let info = self.get_device_info(device);
 
         let (gpu_util, memory_util) = device
             .utilization_rates()
@@ -307,6 +325,28 @@ impl NvmlCollector {
         let temperature = device.temperature(TemperatureSensor::Gpu).ok();
         let power_usage = device.power_usage().ok();
         let power_limit = device.power_management_limit().ok();
+
+        // Extended dynamic metrics — all .ok() wrapped for graceful MIG/vGPU fallback
+        let clock_graphics_mhz = device.clock_info(Clock::Graphics).ok();
+        let clock_sm_mhz = device.clock_info(Clock::SM).ok();
+        let clock_memory_mhz = device.clock_info(Clock::Memory).ok();
+        let pcie_tx_kbps = device.pcie_throughput(PcieUtilCounter::Send).ok();
+        let pcie_rx_kbps = device.pcie_throughput(PcieUtilCounter::Receive).ok();
+        let pcie_gen = device.current_pcie_link_gen().ok();
+        let pcie_width = device.current_pcie_link_width().ok();
+        let performance_state = device.performance_state().ok().map(format_pstate);
+        let throttle_reasons = device
+            .current_throttle_reasons()
+            .ok()
+            .map(format_throttle_reasons);
+        let encoder_util = device.encoder_utilization().ok().map(|u| u.utilization);
+        let decoder_util = device.decoder_utilization().ok().map(|u| u.utilization);
+        let ecc_errors_corrected = device
+            .total_ecc_errors(MemoryError::Corrected, EccCounter::Volatile)
+            .ok();
+        let ecc_errors_uncorrected = device
+            .total_ecc_errors(MemoryError::Uncorrected, EccCounter::Volatile)
+            .ok();
 
         let (process_count, top_processes) = match device.running_compute_processes() {
             Ok(procs) => {
@@ -325,8 +365,14 @@ impl NvmlCollector {
                         })
                     })
                     .collect();
-                proc_infos.sort_by(|a, b| b.vram_used.cmp(&a.vram_used));
-                proc_infos.truncate(5);
+                // Partial sort optimization: O(n) select for top-5 instead of O(n log n) full sort
+                if proc_infos.len() > 5 {
+                    proc_infos.select_nth_unstable_by(4, |a, b| b.vram_used.cmp(&a.vram_used));
+                    proc_infos.truncate(5);
+                    proc_infos.sort_by(|a, b| b.vram_used.cmp(&a.vram_used));
+                } else {
+                    proc_infos.sort_by(|a, b| b.vram_used.cmp(&a.vram_used));
+                }
                 (count, proc_infos)
             }
             Err(_) => (0, Vec::new()),
@@ -334,8 +380,8 @@ impl NvmlCollector {
 
         Ok(GpuMetrics {
             index,
-            name,
-            uuid,
+            name: info.name,
+            uuid: info.uuid,
             is_mig_instance: is_mig,
             parent_gpu_index: parent_index,
             gpu_util,
@@ -348,7 +394,24 @@ impl NvmlCollector {
             power_limit,
             process_count,
             top_processes,
-            timestamp: Instant::now(),
+            architecture: info.architecture,
+            compute_capability: info.compute_capability,
+            ecc_enabled: info.ecc_enabled,
+            temp_shutdown: info.temp_shutdown,
+            temp_slowdown: info.temp_slowdown,
+            clock_graphics_mhz,
+            clock_sm_mhz,
+            clock_memory_mhz,
+            pcie_tx_kbps,
+            pcie_rx_kbps,
+            pcie_gen,
+            pcie_width,
+            performance_state,
+            throttle_reasons,
+            encoder_util,
+            decoder_util,
+            ecc_errors_corrected,
+            ecc_errors_uncorrected,
         })
     }
 
@@ -381,5 +444,82 @@ impl NvmlCollector {
                 format!("{major}.{minor}")
             })
             .unwrap_or_else(|_| "Unknown".to_string())
+    }
+}
+
+fn format_pstate(ps: PerformanceState) -> String {
+    match ps {
+        PerformanceState::Zero => "P0".to_string(),
+        PerformanceState::One => "P1".to_string(),
+        PerformanceState::Two => "P2".to_string(),
+        PerformanceState::Three => "P3".to_string(),
+        PerformanceState::Four => "P4".to_string(),
+        PerformanceState::Five => "P5".to_string(),
+        PerformanceState::Six => "P6".to_string(),
+        PerformanceState::Seven => "P7".to_string(),
+        PerformanceState::Eight => "P8".to_string(),
+        PerformanceState::Nine => "P9".to_string(),
+        PerformanceState::Ten => "P10".to_string(),
+        PerformanceState::Eleven => "P11".to_string(),
+        PerformanceState::Twelve => "P12".to_string(),
+        PerformanceState::Thirteen => "P13".to_string(),
+        PerformanceState::Fourteen => "P14".to_string(),
+        PerformanceState::Fifteen => "P15".to_string(),
+        PerformanceState::Unknown => "P?".to_string(),
+    }
+}
+
+fn format_throttle_reasons(tr: ThrottleReasons) -> String {
+    if tr.is_empty() || tr == ThrottleReasons::NONE {
+        return "None".to_string();
+    }
+
+    let mut reasons = Vec::new();
+    if tr.contains(ThrottleReasons::GPU_IDLE) {
+        reasons.push("Idle");
+    }
+    if tr.contains(ThrottleReasons::APPLICATIONS_CLOCKS_SETTING) {
+        reasons.push("AppClk");
+    }
+    if tr.contains(ThrottleReasons::SW_POWER_CAP) {
+        reasons.push("SwPwrCap");
+    }
+    if tr.contains(ThrottleReasons::HW_SLOWDOWN) {
+        reasons.push("HW-Slow");
+    }
+    if tr.contains(ThrottleReasons::SYNC_BOOST) {
+        reasons.push("SyncBoost");
+    }
+    if tr.contains(ThrottleReasons::SW_THERMAL_SLOWDOWN) {
+        reasons.push("SW-Therm");
+    }
+    if tr.contains(ThrottleReasons::HW_THERMAL_SLOWDOWN) {
+        reasons.push("HW-Therm");
+    }
+    if tr.contains(ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN) {
+        reasons.push("HW-PwrBrake");
+    }
+    if tr.contains(ThrottleReasons::DISPLAY_CLOCK_SETTING) {
+        reasons.push("DispClk");
+    }
+
+    if reasons.is_empty() {
+        "Unknown".to_string()
+    } else {
+        reasons.join(", ")
+    }
+}
+
+fn format_architecture(arch: DeviceArchitecture) -> String {
+    match arch {
+        DeviceArchitecture::Kepler => "Kepler".to_string(),
+        DeviceArchitecture::Maxwell => "Maxwell".to_string(),
+        DeviceArchitecture::Pascal => "Pascal".to_string(),
+        DeviceArchitecture::Volta => "Volta".to_string(),
+        DeviceArchitecture::Turing => "Turing".to_string(),
+        DeviceArchitecture::Ampere => "Ampere".to_string(),
+        DeviceArchitecture::Ada => "Ada".to_string(),
+        DeviceArchitecture::Hopper => "Hopper".to_string(),
+        _ => "Unknown".to_string(),
     }
 }

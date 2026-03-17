@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-NVIDIA MIG(Multi-Instance GPU) 환경에서 제한되는 GPU 메트릭(VRAM 사용량, GPU Util, Mem Ctrl, SM 활용율 등)을 실시간 모니터링하는 TUI 프로그램. btop/nvtop 수준의 실시간 sparkline 그래프와 값 변화를 터미널에서 표시한다.
+NVIDIA MIG(Multi-Instance GPU) 환경에서 제한되는 GPU 메트릭(VRAM 사용량, GPU Util, Mem Ctrl, SM 활용율, Clock, PCIe, ECC, Throttle 등)을 실시간 모니터링하는 TUI 프로그램. btop/nvtop 수준의 실시간 sparkline 그래프와 값 변화를 터미널에서 표시한다.
 
 ## Tech Stack
 
@@ -51,5 +51,7 @@ src/
 ## Key Design Decisions
 
 - MIG 환경에서 `nvidia-smi`가 제공하지 않는 메트릭은 NVML `nvmlDeviceGetMigDeviceHandleByIndex` → `nvmlDeviceGetUtilizationRates` 등으로 직접 수집
+- 모든 확장 메트릭(clock, PCIe, ECC, throttle 등)은 `.ok()`로 래핑 → MIG/vGPU에서 실패 시 `None`으로 graceful 처리
+- 정적 메트릭(architecture, CC, temp thresholds 등)은 `DeviceInfo` 캐시에 1회만 수집
 - 폴링 주기 기본 1000ms, 사용자 설정 가능 (`--interval`)
 - GPU 인스턴스가 여러 개일 때 탭/스크롤로 전환

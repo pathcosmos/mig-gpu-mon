@@ -16,26 +16,31 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 ┌─ mig-gpu-mon ──────────────────────────────────────────────────────────┐
 │ MIG GPU Monitor | Driver: 535.129.03 | CUDA: 12.2 | GPUs: 3           │ ← Header
 ├─ CPU (64 cores) 23.4% ─────────┬─ Devices ────────────────────────────┤
-│ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% Mem:… │ ↑ 25%
+│ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% Mem:… │ ↑ 20%
 │  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% Mem:… │ ↓
 │  0 ▮▮▮▮▯▯▯  52%  33 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
 │  ...                            │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
-├─ Memory ────────────────────────┤ UUID: MIG-a1b2c3d4e5f6...           │ │
-│ RAM ▮▮▮▮▮▯▯ 89.2/256.0 GiB … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │ 40%
-│ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU Util: 45%  Mem Ctrl: 38%        │ │
-│                                 │ Temp: 62°C  Power: 127.3W / 300.0W  │ │
-│                                 │ Processes: 2                         │ ↓
+├─ Memory ────────────────────────┤ UUID: MIG-a1b2...  Arch:Ampere CC:8.0│ │
+│ RAM ▮▮▮▮▮▯▯ 89.2/256.0 GiB … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │
+│ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU: 45%  Mem: 38%  SM: 45%         │ │ 50%
+│                                 │ Enc: 0%  Dec: 0%                     │ │
+│                                 │ Clk: 1410/1410/1215 MHz  P0          │ │
+│                                 │ Temp: 62°C (↓90 ✕92)  Power:127/300W│ │
+│                                 │ PCIe: Gen4 x16  TX:12.3 RX:56.7 MB/s│ │
+│                                 │ ECC: On  Corr:0  Uncorr:0            │ │
+│                                 │ Throttle: None   Processes: 2        │ ↓
 │                                 ├─ Top Processes ──────────────────────┤
 │                                 │ PID     Process         VRAM        │ ↑
-│                                 │ 12345   python3          8192 MB    │ │ 35%
-│                                 │ 12400   pt_main_thread   4096 MB    │ │
-│                                 │   No more processes                  │ ↓
+│                                 │ 12345   python3          8192 MB    │ │ 30%
+│                                 │ 12400   pt_main_thread   4096 MB    │ ↓
 ├─ GPU Util 45% ──────────────────┬─ CPU Total 23.4% ───────────────────┤
-│ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 33%
+│ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 25%
 ├─ Mem Ctrl 38% ──────────────────┼─ RAM 89.2/256.0 GiB (34.8%) ────────┤    ← Bottom 55%
-│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅                   │ ← 33%
+│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅                   │ ← 25%
 ├─ VRAM 12288/20480 MB (60.0%) ──┼──────────────────────────────────────┤
-│ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             │                                     │ ← 34% / 50%
+│ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             │                                     │ ← 25%
+├─ PCIe TX:12.3 RX:56.7 MB/s ────┼──────────────────────────────────────┤
+│ ▂▃▃▅▅▆▅▃▂▂▃▅▆▆▅▃              │                                     │ ← 25% (when PCIe available)
 ├────────────────────────────────────────────────────────────────────────┤
 │ q Quit  Tab/↑↓ Switch GPU  [1/3]                                      │ ← Footer
 └────────────────────────────────────────────────────────────────────────┘
@@ -57,26 +62,29 @@ draw()
 │   │   │       ├── RAM line                 "RAM ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   │       └── SWP line                 "SWP ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   └── GPU Panel     50%
-│   │       ├── Device List        25%       " Devices "
+│   │       ├── Device List        20%       " Devices "
 │   │       │   └── "{>} {MIG|GPU} {idx}: {name} | GPU:{pct}% Mem:{pct}%"
-│   │       ├── GPU Detail         40%       " Detail "
-│   │       │   ├── Name:      {name}
-│   │       │   ├── UUID:      {uuid (max 20 chars)}
+│   │       ├── GPU Detail         50%       " Detail "
+│   │       │   ├── Name:      {name} [Parent: GPU {n}]   (MIG only)
+│   │       │   ├── UUID:      {uuid}  Arch:{arch}  CC:{major.minor}
 │   │       │   ├── VRAM      {used} MB / {total} MB ({pct}%)
-│   │       │   ├── GPU Util:  {pct}%
-│   │       │   ├── Mem Ctrl:  {pct}%         (memory controller utilization)
-│   │       │   ├── SM Util:   {pct}%         (MIG only)
-│   │       │   ├── Temp:      {val}°C        (if available)
-│   │       │   ├── Power:     {usage}W / {limit}W  (if available)
+│   │       │   ├── GPU: {pct}%  Mem: {pct}%  SM: {pct}%  (compact)
+│   │       │   ├── Enc: {pct}%  Dec: {pct}%
+│   │       │   ├── Clk: {gfx}/{sm}/{mem} MHz  {PState}
+│   │       │   ├── Temp: {val}°C (↓{slowdown} ✕{shutdown})  Power: {u}/{l}W
+│   │       │   ├── PCIe: Gen{n} x{w}  TX:{mb} RX:{mb} MB/s
+│   │       │   ├── ECC: On/Off  Corr:{n}  Uncorr:{n}
+│   │       │   ├── Throttle: None / {reasons}
 │   │       │   └── Processes: {count}
-│   │       └── Top Processes      35%       " Top Processes "
+│   │       └── Top Processes      30%       " Top Processes "
 │   │           ├── Header: PID / Process / VRAM
 │   │           └── {pid} {name (max 15)} {vram} MB  (top 5 by VRAM desc)
 │   └── [Bottom 55%] ─── Horizontal ────────────────────────
 │       ├── GPU Charts    50%
-│       │   ├── GPU Util {pct}%        sparkline   33%
-│       │   ├── Mem Ctrl {pct}%        sparkline   33%
-│       │   └── VRAM {u}/{t} MB ({p}%) sparkline   34%
+│       │   ├── GPU Util {pct}%        sparkline   25% (w/ PCIe) / 33%
+│       │   ├── Mem Ctrl {pct}%        sparkline   25% / 33%
+│       │   ├── VRAM {u}/{t} MB ({p}%) sparkline   25% / 34%
+│       │   └── PCIe TX/RX MB/s       sparkline   25% (when PCIe data available)
 │       └── System Charts  50%
 │           ├── CPU Total {pct}%       sparkline   50%
 │           └── RAM {u}/{t} GiB ({p}%) sparkline   50%
@@ -93,10 +101,19 @@ draw()
 | GPU Util sparkline | Green | — |
 | Mem Ctrl sparkline | Blue | — |
 | VRAM sparkline | Magenta | — |
+| PCIe sparkline | LightCyan | Shown only when PCIe data available |
 | CPU sparkline | Cyan | — |
 | RAM sparkline | Yellow | — |
 | VRAM % (Detail) | Green / Yellow / Red | 0-70% / 70-90% / 90%+ |
 | Temp | Green / Yellow / Red | 0-60°C / 60-80°C / 80°C+ |
+| Clock values | Cyan | — |
+| PState | Green / Yellow / Red | P0 / P1-P4 / P5+ |
+| PCIe info | LightCyan | — |
+| Encoder/Decoder | Magenta | — |
+| Throttle "None" | Green | Normal |
+| Throttle active | Red + Bold | Warning |
+| ECC errors 0 | Green | Normal |
+| ECC uncorrected > 0 | Red + Bold | Critical |
 | Selected GPU | Green + Bold | — |
 | Header | Cyan + Bold | — |
 
@@ -116,11 +133,36 @@ This tool bypasses that limitation by calling the NVML C API directly:
 - Real-time per-MIG-instance GPU Util, Mem Ctrl (memory controller), SM Util, and VRAM usage
 - **Top Processes** — displays top 5 processes by VRAM usage (PID, process name, MB)
 - Parent GPU metrics (temperature, power, process count) displayed simultaneously
+- **Clock Speeds** — Graphics/SM/Memory clocks (MHz) + Performance State (P0~P15)
+- **PCIe Throughput** — Gen/Width + TX/RX transfer rates (MB/s), conditional sparkline graph
+- **Encoder/Decoder Utilization** — NVENC/NVDEC usage (%)
+- **ECC Status** — enabled state + Corrected/Uncorrected error counts
+- **Temperature Thresholds** — Slowdown/Shutdown threshold display
+- **Throttle Reasons** — Real-time GPU throttle cause display (PwrCap, HW-Therm, etc.)
+- **Architecture & Compute Capability** — GPU architecture (Ampere, Hopper, etc.) + CUDA CC
 - Per-core CPU usage (sorted by usage descending, dynamic multi-column bar graph adapting to terminal width)
 - System RAM / Swap usage
-- Time-series sparkline graphs for GPU Util / Mem Ctrl / **VRAM** / CPU Total / RAM (current values in title)
+- Time-series sparkline graphs for GPU Util / Mem Ctrl / **VRAM** / **PCIe** / CPU Total / RAM (current values in title)
 - Switch between GPU/MIG instances with Tab/arrow keys
 - Single binary deployment (~1.5MB, dynamically links libc — no separate runtime install needed)
+
+### MIG Environment Metric Availability
+
+Some metrics are only available from the Parent GPU in MIG mode:
+
+| Metric | MIG Instance | Parent GPU | Cloud vGPU |
+|--------|-------------|-----------|-----------|
+| GPU/Mem/SM Util | Yes (fallback) | Yes | Yes |
+| VRAM | Yes | Yes | Yes |
+| Architecture, CC | Yes | Yes | Yes |
+| Clock Speeds | N/A | Yes | Yes |
+| PCIe Throughput | N/A | Yes | Limited |
+| Performance State | N/A | Yes | Yes |
+| Temperature, Power | N/A | Yes | Yes |
+| Temp Thresholds | N/A | Yes | Yes |
+| ECC Status/Errors | N/A | Yes | Limited |
+| Throttle Reasons | N/A | Yes | Limited |
+| Encoder/Decoder | N/A | Yes | Yes |
 
 ## Requirements
 
@@ -377,7 +419,7 @@ Estimates for default settings (1-second interval), 1 GPU + 2 MIG instances:
 
 | Resource | Expected Usage | Notes |
 |----------|---------------|-------|
-| **CPU** | **0.5~2% (per core)** | ~5-18ms active time per tick, ~982-995ms sleep |
+| **CPU** | **0.5~2.5% (per core)** | ~7-20ms active time per tick, ~980-993ms sleep |
 | **RSS Memory** | **4~8 MB** | Binary + libnvidia-ml.so + history buffers + TUI buffers |
 | **GPU Compute** | **0% (unused)** | NVML is read-only driver IPC, no CUDA context created |
 | **GPU VRAM** | **0 MB (unused)** | No GPU memory allocation |
@@ -388,21 +430,28 @@ Estimates for default settings (1-second interval), 1 GPU + 2 MIG instances:
 
 ```
 1 tick = 1000ms
-├── NVML API calls        ~5-15ms   Driver IPC (5-7 queries per GPU)
+├── NVML API calls        ~7-18ms   Driver IPC (15-19 queries per GPU)
 │   ├── device_by_index        ~0.1ms
 │   ├── utilization_rates      ~0.5ms
 │   ├── memory_info            ~0.5ms
 │   ├── temperature            ~0.3ms
 │   ├── power_usage            ~0.3ms
 │   ├── power_management_limit ~0.3ms
+│   ├── clock_info (×3)        ~0.5ms   Graphics/SM/Memory
+│   ├── pcie_throughput (×2)   ~0.3ms   TX/RX
+│   ├── pcie_link_gen/width    ~0.1ms
+│   ├── performance_state      ~0.1ms
+│   ├── throttle_reasons       ~0.1ms
+│   ├── encoder/decoder_util   ~0.2ms
+│   ├── ecc_errors (×2)        ~0.2ms   Corrected/Uncorrected
 │   ├── running_compute_procs  ~0.5ms
 │   └── (MIG) process_util     ~1-3ms   Per MIG instance, fallback only
 ├── sysinfo refresh       ~0.1-0.3ms
 │   ├── refresh_cpu_usage      ~0.1ms   Reads /proc/stat
 │   └── refresh_memory         ~0.05ms  Reads /proc/meminfo
 ├── TUI rendering         ~0.5-2ms   ratatui diff buffer + ANSI output
-├── Event wait (sleep)    ~982-995ms  crossterm poll, kernel scheduling
-└── Total active time     ~5-18ms    = CPU 0.5-1.8%
+├── Event wait (sleep)    ~980-993ms  crossterm poll, kernel scheduling
+└── Total active time     ~7-20ms    = CPU 0.7-2.0%
 ```
 
 #### RSS Memory Breakdown
@@ -412,7 +461,7 @@ Total RSS ~4-8 MB
 ├── Binary code/data segments          ~1.4 MB   (mmap)
 ├── libnvidia-ml.so shared library     ~2-4 MB   (mmap, shared with system)
 ├── History ring buffers               ~80 KB
-│   ├── MetricsHistory per GPU          ~14 KB   (6 VecDeque × 300 × 4-8B)
+│   ├── MetricsHistory per GPU          ~22 KB   (9 VecDeque × 300 × 4-8B)
 │   │   (× 3 devices = ~42 KB)
 │   └── SystemHistory                   ~5 KB    (2 VecDeque × 300 × 4-8B)
 ├── ratatui Terminal double buffer     ~50-400 KB (proportional to terminal size)
@@ -429,9 +478,9 @@ Total RSS ~4-8 MB
 
 | Interval | CPU Usage | Characteristics |
 |----------|-----------|-----------------|
-| `500ms` | ~1-3.5% | Fast response, slightly increased monitoring overhead |
-| `1000ms` (default) | ~0.5-1.8% | Balanced default |
-| `2000ms` | ~0.3-0.9% | Resource saving, for large-scale clusters |
+| `500ms` | ~1.5-4% | Fast response, slightly increased monitoring overhead |
+| `1000ms` (default) | ~0.7-2.0% | Balanced default |
+| `2000ms` | ~0.4-1.0% | Resource saving, for large-scale clusters |
 | `5000ms` | ~0.1-0.4% | Minimum overhead, for long-term observation |
 
 > RSS memory is the same regardless of interval. Since the history entry count (300) is fixed,
@@ -446,6 +495,8 @@ Total RSS ~4-8 MB
 | Process sample buffer | `nvml.rs` | `vec![zeroed(); N]` alloc/dealloc per MIG call → `RefCell<Vec>` grow-only reuse |
 | CPU buffer reuse | `main.rs` | `Vec::new()` every tick → `cpu_buf.clear()` + extend (capacity retained) |
 | Sparkline conversion buffer | `dashboard.rs` | 5× `Vec<u64>` alloc per draw → `thread_local!` single scratch reuse |
+| Process partial sort | `nvml.rs` | O(n log n) full sort → O(n) `select_nth_unstable_by` (when > 5 processes) |
+| CPU cores Vec reuse | `dashboard.rs` | Vec alloc per draw → `thread_local!` buffer reuse |
 | `make_bar()` string | `dashboard.rs` | `.repeat()` 2× concatenation → `String::with_capacity` + push loop |
 | HashMap uuid clone | `app.rs` | `uuid.clone()` every tick → `contains_key` then clone only on miss |
 

@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
@@ -12,6 +12,7 @@ use crate::app::App;
 // Avoids allocation per draw call. Thread-local since draw is single-threaded.
 thread_local! {
     static SPARK_BUF: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::with_capacity(300));
+    static CORE_SORT_BUF: std::cell::RefCell<Vec<(usize, f32)>> = std::cell::RefCell::new(Vec::with_capacity(128));
 }
 
 /// Convert VecDeque<u32> to &[u64] via thread-local scratch buffer, then call f.
@@ -73,6 +74,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         app.cuda_version,
         app.metrics.len()
     );
+    let now = chrono::Local::now()
+        .format("%Y-%m-%d %I:%M:%S %p")
+        .to_string();
     let header = Paragraph::new(header_text)
         .style(
             Style::default()
@@ -82,7 +86,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" mig-gpu-mon "),
+                .title(" mig-gpu-mon ")
+                .title(Line::from(format!(" {} ", now)).alignment(Alignment::Right)),
         );
     f.render_widget(header, area);
 }
@@ -136,63 +141,62 @@ fn draw_cpu_cores(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Sort cores by usage descending (keep original core index)
-    let mut sorted_cores: Vec<(usize, f32)> = sys
-        .cpu_usage
-        .iter()
-        .enumerate()
-        .map(|(i, &u)| (i, u))
-        .collect();
-    sorted_cores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort cores by usage descending (keep original core index) — reuse thread-local buffer
+    CORE_SORT_BUF.with(|buf| {
+        let mut sorted_cores = buf.borrow_mut();
+        sorted_cores.clear();
+        sorted_cores.extend(sys.cpu_usage.iter().enumerate().map(|(i, &u)| (i, u)));
+        sorted_cores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Dynamic column count: each column = 3(idx) + 1(space) + bar + 5(pct) = 9 + bar
-    // Non-first columns add 1-char separator, so usable = width - (cols-1)
-    let min_col_width: u16 = 12;
-    let num_cols = (inner.width / min_col_width).max(1) as usize;
-    let usable_width = inner.width.saturating_sub((num_cols - 1) as u16);
-    let col_width = usable_width / num_cols as u16;
-    let bar_width = col_width.saturating_sub(8) as usize;
+        // Dynamic column count: each column = 3(idx) + 1(space) + bar + 5(pct) = 9 + bar
+        // Non-first columns add 1-char separator, so usable = width - (cols-1)
+        let min_col_width: u16 = 12;
+        let num_cols = (inner.width / min_col_width).max(1) as usize;
+        let usable_width = inner.width.saturating_sub((num_cols - 1) as u16);
+        let col_width = usable_width / num_cols as u16;
+        let bar_width = col_width.saturating_sub(8) as usize;
 
-    let max_rows = inner.height as usize;
-    let max_visible = max_rows * num_cols;
-    let visible_count = sorted_cores.len().min(max_visible);
+        let max_rows = inner.height as usize;
+        let max_visible = max_rows * num_cols;
+        let visible_count = sorted_cores.len().min(max_visible);
 
-    let rows_needed = visible_count.div_ceil(num_cols);
-    let mut lines: Vec<Line> = Vec::with_capacity(rows_needed);
+        let rows_needed = visible_count.div_ceil(num_cols);
+        let mut lines: Vec<Line> = Vec::with_capacity(rows_needed);
 
-    for row in 0..rows_needed {
-        let mut spans = Vec::with_capacity(num_cols * 4);
+        for row in 0..rows_needed {
+            let mut spans = Vec::with_capacity(num_cols * 4);
 
-        for col in 0..num_cols {
-            let idx = col * rows_needed + row;
-            if idx >= visible_count {
-                break;
+            for col in 0..num_cols {
+                let idx = col * rows_needed + row;
+                if idx >= visible_count {
+                    break;
+                }
+                let (core_idx, usage) = sorted_cores[idx];
+                let color = cpu_color(usage);
+
+                if col > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    format!("{:>3}", core_idx),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                spans.push(Span::styled(
+                    make_bar(usage, bar_width),
+                    Style::default().fg(color),
+                ));
+                spans.push(Span::styled(
+                    format!("{:>4.0}%", usage),
+                    Style::default().fg(color),
+                ));
             }
-            let (core_idx, usage) = sorted_cores[idx];
-            let color = cpu_color(usage);
 
-            if col > 0 {
-                spans.push(Span::raw(" "));
-            }
-            spans.push(Span::styled(
-                format!("{:>3}", core_idx),
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                make_bar(usage, bar_width),
-                Style::default().fg(color),
-            ));
-            spans.push(Span::styled(
-                format!("{:>4.0}%", usage),
-                Style::default().fg(color),
-            ));
+            lines.push(Line::from(spans));
         }
 
-        lines.push(Line::from(spans));
-    }
-
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
+        let para = Paragraph::new(lines);
+        f.render_widget(para, inner);
+    });
 }
 
 fn cpu_color(usage: f32) -> Color {
@@ -321,9 +325,9 @@ fn draw_gpu_panel(f: &mut Frame, app: &App, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(40),
-            Constraint::Percentage(35),
+            Constraint::Percentage(20),
+            Constraint::Percentage(50),
+            Constraint::Percentage(30),
         ])
         .split(area);
 
@@ -365,88 +369,264 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
         None => return,
     };
 
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&m.name, Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("UUID: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                &m.uuid[..m.uuid.len().min(20)],
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "VRAM ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{} MB", m.memory_used_mb()),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" / {} MB ", m.memory_total_mb()),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                format!("({:.1}%)", m.memory_percent()),
-                Style::default().fg(vram_pct_color(m.memory_percent())),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("GPU Util: ", Style::default().fg(Color::Green)),
-            Span::styled(
-                format!("{}%", m.gpu_util),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Mem Ctrl: ", Style::default().fg(Color::Blue)),
-            Span::styled(
-                format!("{}%", m.memory_util),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-    ];
+    let mut lines = Vec::with_capacity(14);
 
+    // Line 1: Name (with parent GPU index for MIG)
+    let name_display = if m.is_mig_instance {
+        if let Some(parent) = m.parent_gpu_index {
+            format!("{} [Parent: GPU {}]", m.name, parent)
+        } else {
+            m.name.clone()
+        }
+    } else {
+        m.name.clone()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(name_display, Style::default().fg(Color::White)),
+    ]));
+
+    // Line 2: UUID + static info (Arch, CC)
+    let mut uuid_spans = vec![
+        Span::styled("UUID: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            &m.uuid[..m.uuid.len().min(20)],
+            Style::default().fg(Color::White),
+        ),
+    ];
+    if let Some(ref arch) = m.architecture {
+        uuid_spans.push(Span::styled(
+            "  Arch: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        uuid_spans.push(Span::styled(
+            arch.as_str(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if let Some(ref cc) = m.compute_capability {
+        uuid_spans.push(Span::styled("  CC: ", Style::default().fg(Color::DarkGray)));
+        uuid_spans.push(Span::styled(cc.as_str(), Style::default().fg(Color::Cyan)));
+    }
+    lines.push(Line::from(uuid_spans));
+
+    // Line 3: blank
+    lines.push(Line::from(""));
+
+    // Line 4: VRAM
+    lines.push(Line::from(vec![
+        Span::styled(
+            "VRAM ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} MB", m.memory_used_mb()),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" / {} MB ", m.memory_total_mb()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("({:.1}%)", m.memory_percent()),
+            Style::default().fg(vram_pct_color(m.memory_percent())),
+        ),
+    ]));
+
+    // Line 5: GPU / Mem / SM util (compact horizontal)
+    let mut util_spans = vec![
+        Span::styled("GPU: ", Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("{}%", m.gpu_util),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("  Mem: ", Style::default().fg(Color::Blue)),
+        Span::styled(
+            format!("{}%", m.memory_util),
+            Style::default().fg(Color::White),
+        ),
+    ];
     if let Some(sm) = m.sm_util {
-        lines.push(Line::from(vec![
-            Span::styled("SM Util:  ", Style::default().fg(Color::Magenta)),
-            Span::styled(format!("{}%", sm), Style::default().fg(Color::White)),
-        ]));
+        util_spans.push(Span::styled("  SM: ", Style::default().fg(Color::Magenta)));
+        util_spans.push(Span::styled(
+            format!("{}%", sm),
+            Style::default().fg(Color::White),
+        ));
+    }
+    lines.push(Line::from(util_spans));
+
+    // Line 6: Encoder / Decoder
+    if m.encoder_util.is_some() || m.decoder_util.is_some() {
+        let mut enc_spans = Vec::new();
+        if let Some(enc) = m.encoder_util {
+            enc_spans.push(Span::styled("Enc: ", Style::default().fg(Color::Magenta)));
+            enc_spans.push(Span::styled(
+                format!("{}%", enc),
+                Style::default().fg(Color::White),
+            ));
+        }
+        if let Some(dec) = m.decoder_util {
+            if !enc_spans.is_empty() {
+                enc_spans.push(Span::raw("  "));
+            }
+            enc_spans.push(Span::styled("Dec: ", Style::default().fg(Color::Magenta)));
+            enc_spans.push(Span::styled(
+                format!("{}%", dec),
+                Style::default().fg(Color::White),
+            ));
+        }
+        lines.push(Line::from(enc_spans));
     }
 
-    if let Some(temp) = m.temperature {
-        let temp_color = if temp > 80 {
-            Color::Red
-        } else if temp > 60 {
-            Color::Yellow
+    // Line 7: Clock speeds + PState
+    if m.clock_graphics_mhz.is_some() || m.performance_state.is_some() {
+        let mut clk_spans = Vec::new();
+        if let (Some(gfx), Some(sm), Some(mem)) =
+            (m.clock_graphics_mhz, m.clock_sm_mhz, m.clock_memory_mhz)
+        {
+            clk_spans.push(Span::styled("Clk: ", Style::default().fg(Color::DarkGray)));
+            clk_spans.push(Span::styled(
+                format!("{}/{}/{} MHz", gfx, sm, mem),
+                Style::default().fg(Color::Cyan),
+            ));
+        } else if let Some(gfx) = m.clock_graphics_mhz {
+            clk_spans.push(Span::styled("Clk: ", Style::default().fg(Color::DarkGray)));
+            clk_spans.push(Span::styled(
+                format!("{} MHz", gfx),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if let Some(ref ps) = m.performance_state {
+            if !clk_spans.is_empty() {
+                clk_spans.push(Span::raw("  "));
+            }
+            let ps_color = pstate_color(ps);
+            clk_spans.push(Span::styled(ps.as_str(), Style::default().fg(ps_color)));
+        }
+        if !clk_spans.is_empty() {
+            lines.push(Line::from(clk_spans));
+        }
+    }
+
+    // Line 8: Temp + thresholds + Power
+    if m.temperature.is_some() || m.power_usage.is_some() {
+        let mut tp_spans = Vec::new();
+        if let Some(temp) = m.temperature {
+            let temp_color = temp_color(temp);
+            tp_spans.push(Span::styled("Temp: ", Style::default().fg(Color::DarkGray)));
+            tp_spans.push(Span::styled(
+                format!("{}°C", temp),
+                Style::default().fg(temp_color),
+            ));
+            // Show thresholds inline
+            if let Some(sd) = m.temp_slowdown {
+                tp_spans.push(Span::styled(
+                    format!(" (↓{}", sd),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                if let Some(sh) = m.temp_shutdown {
+                    tp_spans.push(Span::styled(
+                        format!(" ✕{})", sh),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                } else {
+                    tp_spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
+                }
+            }
+        }
+        if let (Some(usage), Some(limit)) = (m.power_usage_w(), m.power_limit_w()) {
+            if !tp_spans.is_empty() {
+                tp_spans.push(Span::raw("  "));
+            }
+            tp_spans.push(Span::styled(
+                "Power: ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            tp_spans.push(Span::styled(
+                format!("{:.1}/{:.1}W", usage, limit),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        if !tp_spans.is_empty() {
+            lines.push(Line::from(tp_spans));
+        }
+    }
+
+    // Line 9: PCIe
+    if m.pcie_gen.is_some() || m.pcie_tx_kbps.is_some() {
+        let mut pcie_spans = vec![Span::styled("PCIe: ", Style::default().fg(Color::DarkGray))];
+        if let (Some(gen), Some(width)) = (m.pcie_gen, m.pcie_width) {
+            pcie_spans.push(Span::styled(
+                format!("Gen{} x{}", gen, width),
+                Style::default().fg(Color::LightCyan),
+            ));
+        }
+        if let (Some(tx), Some(rx)) = (m.pcie_tx_mbps(), m.pcie_rx_mbps()) {
+            if pcie_spans.len() > 1 {
+                pcie_spans.push(Span::raw("  "));
+            }
+            pcie_spans.push(Span::styled(
+                format!("TX:{:.1} RX:{:.1} MB/s", tx, rx),
+                Style::default().fg(Color::LightCyan),
+            ));
+        }
+        if pcie_spans.len() > 1 {
+            lines.push(Line::from(pcie_spans));
+        }
+    }
+
+    // Line 10: ECC
+    if let Some(ecc_on) = m.ecc_enabled {
+        let mut ecc_spans = vec![
+            Span::styled("ECC: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if ecc_on { "On" } else { "Off" },
+                Style::default().fg(if ecc_on {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+        ];
+        if let Some(corr) = m.ecc_errors_corrected {
+            ecc_spans.push(Span::styled(
+                format!("  Corr:{}", corr),
+                Style::default().fg(if corr == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ));
+        }
+        if let Some(uncorr) = m.ecc_errors_uncorrected {
+            let uncorr_style = if uncorr > 0 {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            ecc_spans.push(Span::styled(format!("  Uncorr:{}", uncorr), uncorr_style));
+        }
+        lines.push(Line::from(ecc_spans));
+    }
+
+    // Line 11: Throttle
+    if let Some(ref throttle) = m.throttle_reasons {
+        let throttle_style = if throttle == "None" {
+            Style::default().fg(Color::Green)
         } else {
-            Color::Green
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         };
         lines.push(Line::from(vec![
-            Span::styled("Temp: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}°C", temp), Style::default().fg(temp_color)),
+            Span::styled("Throttle: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(throttle.as_str(), throttle_style),
         ]));
     }
 
-    if let (Some(usage), Some(limit)) = (m.power_usage_w(), m.power_limit_w()) {
-        lines.push(Line::from(vec![
-            Span::styled("Power: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:.1}W / {:.1}W", usage, limit),
-                Style::default().fg(Color::Magenta),
-            ),
-        ]));
-    }
-
+    // Line 12: Processes
     lines.push(Line::from(vec![
         Span::styled("Processes: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -480,14 +660,29 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-        ])
-        .split(area);
+    // Conditionally add PCIe sparkline if data is available
+    let has_pcie = !history.pcie_tx_kbps.is_empty();
+
+    let rows = if has_pcie {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+            ])
+            .split(area)
+    };
 
     // GPU Utilization sparkline
     let gpu_title = app
@@ -525,7 +720,7 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(sparkline, rows[1]);
     });
 
-    // VRAM Usage sparkline (history of actual memory consumption)
+    // VRAM Usage sparkline
     let vram_title = app
         .selected_metrics()
         .map(|m| {
@@ -553,6 +748,29 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::Magenta));
         f.render_widget(sparkline, rows[2]);
     });
+
+    // PCIe throughput sparkline (conditional)
+    if has_pcie {
+        let pcie_title = app
+            .selected_metrics()
+            .and_then(|m| {
+                let tx = m.pcie_tx_mbps()?;
+                let rx = m.pcie_rx_mbps()?;
+                Some(format!(" PCIe TX:{:.1} RX:{:.1} MB/s ", tx, rx))
+            })
+            .unwrap_or_else(|| " PCIe Throughput ".to_string());
+        with_spark_data_u32(&history.pcie_tx_kbps, |data| {
+            let sparkline = Sparkline::default()
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(pcie_title.as_str()),
+                )
+                .data(data)
+                .style(Style::default().fg(Color::LightCyan));
+            f.render_widget(sparkline, rows[3]);
+        });
+    }
 }
 
 fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
@@ -614,6 +832,24 @@ fn vram_pct_color(pct: f64) -> Color {
         Color::Yellow
     } else {
         Color::Green
+    }
+}
+
+fn temp_color(temp: u32) -> Color {
+    if temp > 80 {
+        Color::Red
+    } else if temp > 60 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn pstate_color(ps: &str) -> Color {
+    match ps {
+        "P0" => Color::Green,
+        "P1" | "P2" | "P3" | "P4" => Color::Yellow,
+        _ => Color::Red,
     }
 }
 
