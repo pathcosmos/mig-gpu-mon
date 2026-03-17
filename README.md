@@ -52,7 +52,7 @@ draw()
 │   ├── [Top 45%]  ─── Horizontal ──────────────────────────
 │   │   ├── System Panel  50%
 │   │   │   ├── CPU Cores         Min(4)    " CPU ({N} cores) {pct}% "
-│   │   │   │   └── 2-column core bars      "{idx} ▮▮▯▯ {pct}%"
+│   │   │   │   └── dynamic N-column bars   "{idx} ▮▮▯▯ {pct}%" (사용량 높은 순 정렬)
 │   │   │   └── RAM / Swap        Length(5)  " Memory "
 │   │   │       ├── RAM line                 "RAM ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   │       └── SWP line                 "SWP ▮▮▯▯ {used}/{total} GiB ({pct}%)"
@@ -121,7 +121,7 @@ MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 
 - MIG 인스턴스별 GPU Util, Memory Util, SM Util, VRAM 사용량 실시간 표시
 - **VRAM Top 5 프로세스** — PID, 프로세스명, VRAM 사용량(MB) 기준 상위 5개 표시
 - 부모 GPU 메트릭(온도, 전력, 프로세스 수) 동시 표시
-- CPU 코어별 사용률 (btop 스타일 2열 바 그래프)
+- CPU 코어별 사용률 (사용량 높은 순 정렬, 터미널 너비에 따라 동적 멀티컬럼 바 그래프)
 - 시스템 RAM / Swap 사용량
 - GPU Util / Memory Util / CPU Total / RAM 시계열 sparkline 그래프
 - GPU Util / VRAM / RAM 게이지

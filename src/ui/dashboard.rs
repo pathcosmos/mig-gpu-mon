@@ -127,44 +127,44 @@ fn draw_cpu_cores(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let cores = &sys.cpu_usage;
-    let half = (cores.len() + 1) / 2;
-    let col_width = inner.width / 2;
-    let bar_width = col_width.saturating_sub(8) as usize;
+    // Sort cores by usage descending (keep original core index)
+    let mut sorted_cores: Vec<(usize, f32)> = sys
+        .cpu_usage
+        .iter()
+        .enumerate()
+        .map(|(i, &u)| (i, u))
+        .collect();
+    sorted_cores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Dynamic column count: minimum column width ~12 chars (3 idx + bar + 5 pct)
+    let min_col_width: u16 = 12;
+    let num_cols = (inner.width / min_col_width).max(1) as usize;
+    let col_width = inner.width / num_cols as u16;
+    let bar_width = col_width.saturating_sub(9) as usize;
 
     let max_rows = inner.height as usize;
-    let mut lines: Vec<Line> = Vec::with_capacity(max_rows);
+    let max_visible = max_rows * num_cols;
+    let visible_count = sorted_cores.len().min(max_visible);
 
-    for row in 0..max_rows.min(half) {
-        let mut spans = Vec::with_capacity(7);
+    let rows_needed = visible_count.div_ceil(num_cols);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows_needed);
 
-        // Left core
-        let left_idx = row;
-        if left_idx < cores.len() {
-            let usage = cores[left_idx];
+    for row in 0..rows_needed {
+        let mut spans = Vec::with_capacity(num_cols * 4);
+
+        for col in 0..num_cols {
+            let idx = col * rows_needed + row;
+            if idx >= visible_count {
+                break;
+            }
+            let (core_idx, usage) = sorted_cores[idx];
             let color = cpu_color(usage);
-            spans.push(Span::styled(
-                format!("{:>3}", left_idx),
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                make_bar(usage, bar_width),
-                Style::default().fg(color),
-            ));
-            spans.push(Span::styled(
-                format!("{:>4.0}%", usage),
-                Style::default().fg(color),
-            ));
-        }
 
-        // Right core
-        let right_idx = row + half;
-        if right_idx < cores.len() {
-            let usage = cores[right_idx];
-            let color = cpu_color(usage);
-            spans.push(Span::raw(" "));
+            if col > 0 {
+                spans.push(Span::raw(" "));
+            }
             spans.push(Span::styled(
-                format!("{:>3}", right_idx),
+                format!("{:>3}", core_idx),
                 Style::default().fg(Color::DarkGray),
             ));
             spans.push(Span::styled(

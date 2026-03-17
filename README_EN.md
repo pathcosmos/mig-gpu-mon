@@ -52,7 +52,7 @@ draw()
 │   ├── [Top 45%]  ─── Horizontal ──────────────────────────
 │   │   ├── System Panel  50%
 │   │   │   ├── CPU Cores         Min(4)    " CPU ({N} cores) {pct}% "
-│   │   │   │   └── 2-column core bars      "{idx} ▮▮▯▯ {pct}%"
+│   │   │   │   └── dynamic N-column bars   "{idx} ▮▮▯▯ {pct}%" (sorted by usage desc)
 │   │   │   └── RAM / Swap        Length(5)  " Memory "
 │   │   │       ├── RAM line                 "RAM ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   │       └── SWP line                 "SWP ▮▮▯▯ {used}/{total} GiB ({pct}%)"
@@ -121,7 +121,7 @@ This tool bypasses that limitation by calling the NVML C API directly:
 - Real-time per-MIG-instance GPU Util, Memory Util, SM Util, and VRAM usage
 - **VRAM Top 5 Processes** — displays top 5 processes by VRAM usage (PID, process name, MB)
 - Parent GPU metrics (temperature, power, process count) displayed simultaneously
-- Per-core CPU usage (btop-style 2-column bar graph)
+- Per-core CPU usage (sorted by usage descending, dynamic multi-column bar graph adapting to terminal width)
 - System RAM / Swap usage
 - Time-series sparkline graphs for GPU Util / Memory Util / CPU Total / RAM
 - GPU Util / VRAM / RAM gauges
