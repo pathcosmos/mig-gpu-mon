@@ -1,0 +1,20 @@
+# Build artifacts
+/target
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Environment / Secrets
+.env
+.env.*

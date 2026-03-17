@@ -1,0 +1,19 @@
+[package]
+name = "mig-gpu-mon"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time GPU monitoring tool for NVIDIA MIG environments"
+
+[dependencies]
+nvml-wrapper = "0.10"
+nvml-wrapper-sys = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow = "1"
+sysinfo = "0.32"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
