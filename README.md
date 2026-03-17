@@ -185,14 +185,63 @@ MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 
 mig-gpu-mon --nvml-path /custom/path/libnvidia-ml.so.1
 ```
 
-## Build & Install
+## Quick Start (처음부터 끝까지)
+
+새 서버에서 Rust 설치부터 실행까지 한번에:
+
+```bash
+# 1. Rust 설치 (이미 설치되어 있으면 생략)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# 2. 소스 다운로드
+git clone https://github.com/pathcosmos/mig-gpu-mon.git
+cd mig-gpu-mon
+
+# 3. 빌드 + 시스템 등록 (한 줄)
+cargo install --path .
+
+# 4. 실행
+mig-gpu-mon
+```
+
+`cargo install`은 릴리즈 빌드(LTO + strip) 후 `~/.cargo/bin/mig-gpu-mon`에 자동 등록한다.
+`~/.cargo/bin`이 `PATH`에 포함되어 있으므로 어디서든 `mig-gpu-mon`으로 실행 가능.
+
+### 원라인 설치 (복사-붙여넣기용)
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env" && git clone https://github.com/pathcosmos/mig-gpu-mon.git /tmp/mig-gpu-mon && cargo install --path /tmp/mig-gpu-mon && mig-gpu-mon --help
+```
+
+### 다른 서버에 바이너리만 복사 (Rust 없이)
+
+같은 아키텍처(x86_64 Linux)의 다른 서버에는 빌드된 바이너리만 복사하면 된다:
+
+```bash
+# 빌드 서버에서
+scp target/release/mig-gpu-mon user@target-server:/usr/local/bin/
+
+# 대상 서버에서 (Rust 설치 불필요)
+mig-gpu-mon
+```
+
+### 제거
+
+```bash
+cargo uninstall mig-gpu-mon   # cargo로 설치한 경우
+# 또는
+rm /usr/local/bin/mig-gpu-mon  # 수동 복사한 경우
+```
+
+## Build & Install (상세)
 
 ```bash
 # 릴리즈 빌드 (최적화 + LTO + strip)
 cargo build --release
 
 # 바이너리 위치
-ls -lh target/release/mig-gpu-mon  # ~1.4MB
+ls -lh target/release/mig-gpu-mon  # ~1.5MB
 
 # 시스템 경로에 설치
 cp target/release/mig-gpu-mon /usr/local/bin/

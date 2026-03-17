@@ -185,14 +185,63 @@ If automatic detection fails, specify the path manually:
 mig-gpu-mon --nvml-path /custom/path/libnvidia-ml.so.1
 ```
 
-## Build & Install
+## Quick Start (From Scratch)
+
+From a fresh server — Rust installation to running, all at once:
+
+```bash
+# 1. Install Rust (skip if already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# 2. Download source
+git clone https://github.com/pathcosmos/mig-gpu-mon.git
+cd mig-gpu-mon
+
+# 3. Build + register system-wide (single command)
+cargo install --path .
+
+# 4. Run
+mig-gpu-mon
+```
+
+`cargo install` performs a release build (LTO + strip) and automatically registers the binary at `~/.cargo/bin/mig-gpu-mon`.
+Since `~/.cargo/bin` is in `PATH`, you can run `mig-gpu-mon` from anywhere.
+
+### One-Liner Install (Copy-Paste)
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env" && git clone https://github.com/pathcosmos/mig-gpu-mon.git /tmp/mig-gpu-mon && cargo install --path /tmp/mig-gpu-mon && mig-gpu-mon --help
+```
+
+### Copy Binary to Other Servers (No Rust Needed)
+
+For other servers with the same architecture (x86_64 Linux), just copy the built binary:
+
+```bash
+# From the build server
+scp target/release/mig-gpu-mon user@target-server:/usr/local/bin/
+
+# On the target server (no Rust installation required)
+mig-gpu-mon
+```
+
+### Uninstall
+
+```bash
+cargo uninstall mig-gpu-mon    # If installed via cargo
+# or
+rm /usr/local/bin/mig-gpu-mon  # If manually copied
+```
+
+## Build & Install (Detailed)
 
 ```bash
 # Release build (optimized + LTO + strip)
 cargo build --release
 
 # Binary location
-ls -lh target/release/mig-gpu-mon  # ~1.4MB
+ls -lh target/release/mig-gpu-mon  # ~1.5MB
 
 # Install to system path
 cp target/release/mig-gpu-mon /usr/local/bin/
