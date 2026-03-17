@@ -226,43 +226,111 @@ nvmlDeviceGetUtilizationRates(mig_handle)
 
 모니터링 도구 자체가 GPU 워크로드에 영향을 주지 않도록 리소스 사용을 극소화했다.
 
-### Memory
+### 예상 리소스 소모량
 
-| 최적화 | 설명 |
-|--------|------|
-| `VecDeque` 링 버퍼 | 히스토리 저장 시 `Vec::remove(0)` O(n) → `VecDeque::pop_front()` O(1) |
-| 디바이스 정보 캐시 | GPU name/uuid는 불변 — 첫 호출만 NVML API, 이후 `RefCell<HashMap>` 캐시 히트 |
-| process sample 버퍼 재사용 | MIG util 수집 시 `RefCell<Vec>` grow-only 버퍼, 매 tick 할당/해제 없음 |
-| CPU 사용률 버퍼 재사용 | `cpu_buf.clear()` + extend로 매 tick Vec 재할당 방지 |
-| sparkline 변환 버퍼 | `thread_local!` scratch `Vec<u64>` — draw마다 4개 Vec 할당 제거 |
-| `String::with_capacity` | `make_bar()` 바 문자열 pre-sized 할당, `.repeat()` 제거 |
+기본 설정(1초 간격) 기준, GPU 1대 + MIG 2인스턴스 환경에서의 예상치:
 
-### CPU
+| 리소스 | 예상 소모량 | 비고 |
+|--------|-------------|------|
+| **CPU** | **0.5~2% (1코어 기준)** | tick당 활성 시간 ~5-18ms, 나머지 ~982-995ms sleep |
+| **RSS 메모리** | **4~8 MB** | 바이너리 + libnvidia-ml.so + 히스토리 버퍼 + TUI 버퍼 |
+| **GPU 연산 자원** | **0% (사용 안 함)** | NVML은 읽기 전용 드라이버 IPC, CUDA 컨텍스트 미생성 |
+| **GPU VRAM** | **0 MB (사용 안 함)** | GPU 메모리 할당 없음 |
+| **디스크 I/O** | **0** | 파일 읽기/쓰기 없음 |
+| **네트워크** | **0** | 네트워크 통신 없음 |
 
-| 최적화 | 설명 |
-|--------|------|
-| `System::new()` | `System::new_all()` 대비 프로세스/디스크/네트워크 스캔 제거 |
-| 타겟 refresh | `refresh_cpu_usage()` + `refresh_memory()`만 호출 |
-| 기본 interval 1000ms | 500ms 대비 NVML+sysinfo 호출 횟수 절반 |
-| CPU 첫 호출 priming | `sysinfo` 첫 `refresh_cpu_usage()` 0% 반환 문제 방지 |
+#### tick당 시간 분해 (1초 interval 기준)
 
-### GPU (NVML 호출 최소화)
+```
+1 tick = 1000ms
+├── NVML API 호출         ~5-15ms   드라이버 IPC (GPU당 5-7개 쿼리)
+│   ├── device_by_index        ~0.1ms
+│   ├── utilization_rates      ~0.5ms
+│   ├── memory_info            ~0.5ms
+│   ├── temperature            ~0.3ms
+│   ├── power_usage            ~0.3ms
+│   ├── power_management_limit ~0.3ms
+│   ├── running_compute_procs  ~0.5ms
+│   └── (MIG) process_util     ~1-3ms   MIG 인스턴스당, 폴백 시에만
+├── sysinfo refresh       ~0.1-0.3ms
+│   ├── refresh_cpu_usage      ~0.1ms   /proc/stat 읽기
+│   └── refresh_memory         ~0.05ms  /proc/meminfo 읽기
+├── TUI 렌더링            ~0.5-2ms   ratatui diff buffer + ANSI 출력
+├── 이벤트 대기 (sleep)   ~982-995ms  crossterm poll, 커널 스케줄링
+└── 합계 활성 시간        ~5-18ms    = CPU 0.5-1.8%
+```
 
-| 최적화 | 설명 |
-|--------|------|
-| `utilization_rates()` 우선 | MIG에서도 일단 시도, 실패 시에만 process util 폴백 |
-| process util 2-pass | 1차로 count 확인, 2차로 데이터 수집 — 불필요한 대형 버퍼 할당 방지 |
-| `RefCell` 내부 가변성 | `&self`로 NVML 핸들 빌려온 상태에서 캐시/버퍼 수정 가능 |
+#### RSS 메모리 분해
 
-### Binary Size
+```
+총 RSS ~4-8 MB
+├── 바이너리 코드/데이터 세그먼트        ~1.4 MB   (mmap)
+├── libnvidia-ml.so 공유 라이브러리      ~2-4 MB   (mmap, 시스템 공유)
+├── 히스토리 링 버퍼                     ~80 KB
+│   ├── GPU당 MetricsHistory              ~14 KB   (6 VecDeque × 300 × 4-8B)
+│   │   (× 3 디바이스 = ~42 KB)
+│   └── SystemHistory                     ~5 KB    (2 VecDeque × 300 × 4-8B)
+├── ratatui Terminal 더블 버퍼           ~50-400 KB (터미널 크기에 비례)
+│   (80×24: ~77KB, 200×50: ~400KB)
+├── sysinfo System 구조체               ~30-50 KB  (CPU만, 프로세스 제외)
+├── 재사용 버퍼들                        ~5 KB
+│   ├── thread_local sparkline buf        ~2.4 KB
+│   ├── proc_sample_buf                   ~1 KB
+│   └── cpu_buf                           ~0.3 KB
+└── HashMap, String 캐시 등              ~5-10 KB
+```
 
-| 설정 | 값 |
-|------|-----|
-| `opt-level` | 3 |
-| `lto` | true (Link-Time Optimization) |
-| `strip` | true (디버그 심볼 제거) |
-| `tokio` 제거 | async 미사용 — 동기 이벤트 루프로 충분 |
-| 최종 크기 | **~1.4MB** |
+#### interval 별 리소스 비교
+
+| interval | CPU 사용률 | 특성 |
+|----------|-----------|------|
+| `500ms` | ~1-3.5% | 빠른 반응, 모니터링 부하 약간 증가 |
+| `1000ms` (기본) | ~0.5-1.8% | 균형잡힌 기본값 |
+| `2000ms` | ~0.3-0.9% | 리소스 절약, 대규모 클러스터용 |
+| `5000ms` | ~0.1-0.4% | 최소 부하, 장기 관찰용 |
+
+> 메모리(RSS)는 interval에 관계없이 동일. 히스토리 엔트리 수(300)가 고정이므로
+> interval이 길수록 더 긴 시간 범위를 기록한다 (1초: 5분, 2초: 10분, 5초: 25분).
+
+### 최적화 상세: Memory
+
+| 최적화 | 위치 | Before → After |
+|--------|------|----------------|
+| `VecDeque` 링 버퍼 | `metrics.rs` | `Vec::remove(0)` O(n) memmove → `VecDeque::pop_front()` O(1) |
+| 디바이스 정보 캐시 | `nvml.rs` | 매 tick NVML API + String 할당 → `RefCell<HashMap>` 첫 호출만, 이후 캐시 히트 |
+| process sample 버퍼 | `nvml.rs` | MIG 호출마다 `vec![zeroed(); N]` 할당/해제 → `RefCell<Vec>` grow-only 재사용 |
+| CPU 버퍼 재사용 | `main.rs` | 매 tick `Vec::new()` → `cpu_buf.clear()` + extend (용량 유지) |
+| sparkline 변환 버퍼 | `dashboard.rs` | draw마다 4개 `Vec<u64>` 할당 → `thread_local!` scratch 1개 재사용 |
+| `make_bar()` 문자열 | `dashboard.rs` | `.repeat()` 2회 연결 → `String::with_capacity` + push loop |
+| HashMap uuid clone | `app.rs` | 매 tick `uuid.clone()` → `contains_key` 후 miss 시에만 clone |
+
+### 최적화 상세: CPU (시스템 호출 최소화)
+
+| 최적화 | 위치 | 효과 |
+|--------|------|------|
+| `System::new()` | `main.rs` | `new_all()` 대비 프로세스/디스크/네트워크 전체 스캔 제거 |
+| 타겟 refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 — /proc/stat, /proc/meminfo 2개만 읽기 |
+| 기본 interval 1000ms | `main.rs` | 500ms 대비 모든 시스콜+NVML 호출 횟수 절반 |
+| CPU priming | `main.rs` | sysinfo 첫 `refresh_cpu_usage()` 0% 반환 방지 — 초기화 시 1회 선호출 |
+
+### 최적화 상세: GPU (NVML 호출 최소화)
+
+| 최적화 | 위치 | 효과 |
+|--------|------|------|
+| `utilization_rates()` 우선 | `nvml.rs` | MIG에서도 일단 시도, 실패 시에만 process util 폴백 (추가 IPC 2회 절약) |
+| process util 2-pass | `nvml.rs` | 1차 count=0으로 크기 확인, 2차 데이터 수집 — 과다 버퍼 할당 방지 |
+| `RefCell` 내부 가변성 | `nvml.rs` | `&self`로 NVML 핸들 빌린 상태에서 캐시/버퍼 수정 가능, borrow checker 충돌 없이 |
+| GPU 자원 0 사용 | 설계 | NVML은 읽기 전용 드라이버 쿼리 — CUDA 컨텍스트 없음, VRAM 할당 없음 |
+
+### 최적화 상세: Binary Size
+
+| 설정 | 값 | 효과 |
+|------|-----|------|
+| `opt-level` | 3 | 최대 최적화 |
+| `lto` | true | Link-Time Optimization, 미사용 코드 제거 |
+| `strip` | true | 디버그 심볼 완전 제거 |
+| `tokio` 제거 | — | async 미사용, 동기 이벤트 루프로 충분 — 바이너리 ~200KB 절약 |
+| 최종 크기 | **~1.4MB** | 단일 static 바이너리 |
 
 ## Why Rust
 

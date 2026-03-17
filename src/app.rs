@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::gpu::metrics::{GpuMetrics, MetricsHistory, SystemHistory, SystemMetrics};
 
-const MAX_HISTORY: usize = 300; // 300 ticks = ~2.5 min at 500ms
+const MAX_HISTORY: usize = 300; // 300 ticks = 5 min at 1000ms default interval
 
 pub struct App {
     pub running: bool,
@@ -31,11 +31,12 @@ impl App {
 
     pub fn update_metrics(&mut self, new_metrics: Vec<GpuMetrics>) {
         for m in &new_metrics {
-            let history = self
-                .history
-                .entry(m.uuid.clone())
-                .or_insert_with(|| MetricsHistory::new(MAX_HISTORY));
-            history.push(m);
+            // Avoid uuid.clone() on every tick — only clone on first encounter
+            if !self.history.contains_key(&m.uuid) {
+                self.history
+                    .insert(m.uuid.clone(), MetricsHistory::new(MAX_HISTORY));
+            }
+            self.history.get_mut(&m.uuid).unwrap().push(m);
         }
         self.metrics = new_metrics;
 
