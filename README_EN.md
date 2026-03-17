@@ -4,7 +4,7 @@
 
 A terminal TUI program for real-time monitoring of GPU metrics that `nvidia-smi` cannot provide in NVIDIA MIG (Multi-Instance GPU) environments.
 
-Displays real-time graphs and gauges in btop/nvtop style, along with per-core CPU usage and system RAM monitoring.
+Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU usage and system RAM monitoring.
 
 > **Ubuntu-focused:** Development and testing are done on Ubuntu. Library search paths, error messages, and documentation are all written with Ubuntu as the primary target. It also works on RHEL-based distros, containers, and WSL2, but runs most smoothly on Ubuntu.
 
@@ -16,26 +16,26 @@ Displays real-time graphs and gauges in btop/nvtop style, along with per-core CP
 ┌─ mig-gpu-mon ──────────────────────────────────────────────────────────┐
 │ MIG GPU Monitor | Driver: 535.129.03 | CUDA: 12.2 | GPUs: 3           │ ← Header
 ├─ CPU (64 cores) 23.4% ─────────┬─ Devices ────────────────────────────┤
-│ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% MEM:… │ ↑ 25%
-│  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% MEM:… │ ↓
+│ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% Mem:… │ ↑ 25%
+│  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% Mem:… │ ↓
 │  0 ▮▮▮▮▯▯▯  52%  33 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
 │  ...                            │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
 ├─ Memory ────────────────────────┤ UUID: MIG-a1b2c3d4e5f6...           │ │
 │ RAM ▮▮▮▮▮▯▯ 89.2/256.0 GiB … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │ 40%
-│ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU Util: 45%  Mem Util: 38%        │ │
+│ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU Util: 45%  Mem Ctrl: 38%        │ │
 │                                 │ Temp: 62°C  Power: 127.3W / 300.0W  │ │
 │                                 │ Processes: 2                         │ ↓
-│                                 ├─ VRAM Top 5 Processes ───────────────┤
+│                                 ├─ Top Processes ──────────────────────┤
 │                                 │ PID     Process         VRAM        │ ↑
 │                                 │ 12345   python3          8192 MB    │ │ 35%
 │                                 │ 12400   pt_main_thread   4096 MB    │ │
 │                                 │   No more processes                  │ ↓
-├─ GPU Utilization % ─────────────┬─ CPU Total 23.4% ───────────────────┤
-│ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 30%
-├─ Memory Utilization % ──────────┼─ RAM 89.2/256.0 GiB (34.8%) ────────┤    ← Bottom 55%
-│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅                   │ ← 30%
-├─ GPU % ───────┬─ VRAM ─────────┼─ RAM ────────────────────────────────┤
-│ ████████░░ 45%│ ██████████ 60% │ ████████████████░░░░ 89.2/256.0 GiB │ ← 40% / Min(3)
+├─ GPU Util 45% ──────────────────┬─ CPU Total 23.4% ───────────────────┤
+│ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 33%
+├─ Mem Ctrl 38% ──────────────────┼─ RAM 89.2/256.0 GiB (34.8%) ────────┤    ← Bottom 55%
+│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅                   │ ← 33%
+├─ VRAM 12288/20480 MB (60.0%) ──┼──────────────────────────────────────┤
+│ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             │                                     │ ← 34% / 50%
 ├────────────────────────────────────────────────────────────────────────┤
 │ q Quit  Tab/↑↓ Switch GPU  [1/3]                                      │ ← Footer
 └────────────────────────────────────────────────────────────────────────┘
@@ -53,36 +53,33 @@ draw()
 │   │   ├── System Panel  50%
 │   │   │   ├── CPU Cores         Min(4)    " CPU ({N} cores) {pct}% "
 │   │   │   │   └── dynamic N-column bars   "{idx} ▮▮▯▯ {pct}%" (sorted by usage desc)
-│   │   │   └── RAM / Swap        Length(5)  " Memory "
+│   │   │   └── RAM / Swap        Length(4)  " Memory "
 │   │   │       ├── RAM line                 "RAM ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   │       └── SWP line                 "SWP ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   └── GPU Panel     50%
 │   │       ├── Device List        25%       " Devices "
-│   │       │   └── "{>} {MIG|GPU} {idx}: {name} | GPU:{pct}% MEM:{pct}%"
+│   │       │   └── "{>} {MIG|GPU} {idx}: {name} | GPU:{pct}% Mem:{pct}%"
 │   │       ├── GPU Detail         40%       " Detail "
-│   │       │   ├── Name:     {name}
-│   │       │   ├── UUID:     {uuid (max 20 chars)}
-│   │       │   ├── VRAM     {used} MB / {total} MB ({pct}%)
-│   │       │   ├── GPU Util: {pct}%
-│   │       │   ├── Mem Util: {pct}%
-│   │       │   ├── SM Util:  {pct}%          (MIG only)
-│   │       │   ├── Temp:     {val}°C         (if available)
-│   │       │   ├── Power:    {usage}W / {limit}W  (if available)
+│   │       │   ├── Name:      {name}
+│   │       │   ├── UUID:      {uuid (max 20 chars)}
+│   │       │   ├── VRAM      {used} MB / {total} MB ({pct}%)
+│   │       │   ├── GPU Util:  {pct}%
+│   │       │   ├── Mem Ctrl:  {pct}%         (memory controller utilization)
+│   │       │   ├── SM Util:   {pct}%         (MIG only)
+│   │       │   ├── Temp:      {val}°C        (if available)
+│   │       │   ├── Power:     {usage}W / {limit}W  (if available)
 │   │       │   └── Processes: {count}
-│   │       └── VRAM Top 5 Procs   35%       " VRAM Top 5 Processes "
+│   │       └── Top Processes      35%       " Top Processes "
 │   │           ├── Header: PID / Process / VRAM
 │   │           └── {pid} {name (max 15)} {vram} MB  (top 5 by VRAM desc)
 │   └── [Bottom 55%] ─── Horizontal ────────────────────────
 │       ├── GPU Charts    50%
-│       │   ├── GPU Utilization %   sparkline   30%
-│       │   ├── Memory Utilization % sparkline  30%
-│       │   └── Gauges row                      40%
-│       │       ├── GPU %    gauge  50%
-│       │       └── VRAM     gauge  50%
+│       │   ├── GPU Util {pct}%        sparkline   33%
+│       │   ├── Mem Ctrl {pct}%        sparkline   33%
+│       │   └── VRAM {u}/{t} MB ({p}%) sparkline   34%
 │       └── System Charts  50%
-│           ├── CPU Total {pct}%   sparkline   45%
-│           ├── RAM {u}/{t} GiB    sparkline   45%
-│           └── RAM              gauge       Min(3)
+│           ├── CPU Total {pct}%       sparkline   50%
+│           └── RAM {u}/{t} GiB ({p}%) sparkline   50%
 └── Footer                          Length(3)
 ```
 
@@ -94,13 +91,11 @@ draw()
 | RAM bar | Green / Yellow / Red | 0-50% / 50-80% / 80%+ |
 | Swap bar | DarkGray / Yellow / Red | 0-20% / 20-50% / 50%+ |
 | GPU Util sparkline | Green | — |
-| Mem Util sparkline | Blue | — |
+| Mem Ctrl sparkline | Blue | — |
+| VRAM sparkline | Magenta | — |
 | CPU sparkline | Cyan | — |
 | RAM sparkline | Yellow | — |
-| GPU % gauge | Green | — |
-| VRAM gauge | Magenta | — |
 | VRAM % (Detail) | Green / Yellow / Red | 0-70% / 70-90% / 90%+ |
-| RAM gauge | Yellow | — |
 | Temp | Green / Yellow / Red | 0-60°C / 60-80°C / 80°C+ |
 | Selected GPU | Green + Bold | — |
 | Header | Cyan + Bold | — |
@@ -118,13 +113,12 @@ This tool bypasses that limitation by calling the NVML C API directly:
 
 ## Features
 
-- Real-time per-MIG-instance GPU Util, Memory Util, SM Util, and VRAM usage
-- **VRAM Top 5 Processes** — displays top 5 processes by VRAM usage (PID, process name, MB)
+- Real-time per-MIG-instance GPU Util, Mem Ctrl (memory controller), SM Util, and VRAM usage
+- **Top Processes** — displays top 5 processes by VRAM usage (PID, process name, MB)
 - Parent GPU metrics (temperature, power, process count) displayed simultaneously
 - Per-core CPU usage (sorted by usage descending, dynamic multi-column bar graph adapting to terminal width)
 - System RAM / Swap usage
-- Time-series sparkline graphs for GPU Util / Memory Util / CPU Total / RAM
-- GPU Util / VRAM / RAM gauges
+- Time-series sparkline graphs for GPU Util / Mem Ctrl / **VRAM** / CPU Total / RAM (current values in title)
 - Switch between GPU/MIG instances with Tab/arrow keys
 - Single binary deployment (~1.5MB, dynamically links libc — no separate runtime install needed)
 
@@ -451,7 +445,7 @@ Total RSS ~4-8 MB
 | Device info cache | `nvml.rs` | NVML API + String alloc every tick → `RefCell<HashMap>` first call only, cache hit thereafter |
 | Process sample buffer | `nvml.rs` | `vec![zeroed(); N]` alloc/dealloc per MIG call → `RefCell<Vec>` grow-only reuse |
 | CPU buffer reuse | `main.rs` | `Vec::new()` every tick → `cpu_buf.clear()` + extend (capacity retained) |
-| Sparkline conversion buffer | `dashboard.rs` | 4× `Vec<u64>` alloc per draw → `thread_local!` single scratch reuse |
+| Sparkline conversion buffer | `dashboard.rs` | 5× `Vec<u64>` alloc per draw → `thread_local!` single scratch reuse |
 | `make_bar()` string | `dashboard.rs` | `.repeat()` 2× concatenation → `String::with_capacity` + push loop |
 | HashMap uuid clone | `app.rs` | `uuid.clone()` every tick → `contains_key` then clone only on miss |
 

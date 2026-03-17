@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
     Frame,
 };
 
@@ -38,6 +38,15 @@ fn with_spark_data_f64(src: &std::collections::VecDeque<f64>, f: impl FnOnce(&[u
         let mut buf = buf.borrow_mut();
         buf.clear();
         buf.extend(src.iter().map(|&v| v as u64));
+        f(&buf);
+    });
+}
+
+fn with_spark_data_u64(src: &std::collections::VecDeque<u64>, f: impl FnOnce(&[u64])) {
+    SPARK_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        buf.extend(src.iter().copied());
         f(&buf);
     });
 }
@@ -97,7 +106,7 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
 fn draw_system_panel(f: &mut Frame, app: &App, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(5)])
+        .constraints([Constraint::Min(4), Constraint::Length(4)])
         .split(area);
 
     draw_cpu_cores(f, app, sections[0]);
@@ -231,11 +240,7 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
 
     let ram_pct = sys.ram_percent();
@@ -343,7 +348,7 @@ fn draw_gpu_list(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::White)
             };
             ListItem::new(format!(
-                "{} {} {}: {} | GPU:{}% MEM:{}%",
+                "{} {} {}: {} | GPU:{}% Mem:{}%",
                 indicator, prefix, m.index, m.name, m.gpu_util, m.memory_util
             ))
             .style(style)
@@ -403,7 +408,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Mem Util: ", Style::default().fg(Color::Blue)),
+            Span::styled("Mem Ctrl: ", Style::default().fg(Color::Blue)),
             Span::styled(
                 format!("{}%", m.memory_util),
                 Style::default().fg(Color::White),
@@ -478,19 +483,23 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
         ])
         .split(area);
 
     // GPU Utilization sparkline
+    let gpu_title = app
+        .selected_metrics()
+        .map(|m| format!(" GPU Util {}% ", m.gpu_util))
+        .unwrap_or_else(|| " GPU Util ".to_string());
     with_spark_data_u32(&history.gpu_util, |data| {
         let sparkline = Sparkline::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" GPU Utilization % "),
+                    .title(gpu_title.as_str()),
             )
             .data(data)
             .max(100)
@@ -498,13 +507,17 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(sparkline, rows[0]);
     });
 
-    // Memory Utilization sparkline
+    // Memory Controller Utilization sparkline
+    let mem_ctrl_title = app
+        .selected_metrics()
+        .map(|m| format!(" Mem Ctrl {}% ", m.memory_util))
+        .unwrap_or_else(|| " Mem Ctrl ".to_string());
     with_spark_data_u32(&history.memory_util, |data| {
         let sparkline = Sparkline::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Memory Utilization % "),
+                    .title(mem_ctrl_title.as_str()),
             )
             .data(data)
             .max(100)
@@ -512,43 +525,40 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(sparkline, rows[1]);
     });
 
-    // Gauges row
-    if let Some(m) = app.selected_metrics() {
-        let gauge_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[2]);
-
-        let gpu_gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" GPU % "))
-            .gauge_style(Style::default().fg(Color::Green))
-            .percent(m.gpu_util.min(100) as u16)
-            .label(format!("{}%", m.gpu_util));
-        f.render_widget(gpu_gauge, gauge_cols[0]);
-
-        let vram_pct = m.memory_percent().min(100.0) as u16;
-        let vram_gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" VRAM Usage "))
-            .gauge_style(Style::default().fg(Color::Magenta))
-            .percent(vram_pct)
-            .label(format!(
-                "VRAM {} / {} MB ({:.1}%)",
+    // VRAM Usage sparkline (history of actual memory consumption)
+    let vram_title = app
+        .selected_metrics()
+        .map(|m| {
+            format!(
+                " VRAM {}/{} MB ({:.1}%) ",
                 m.memory_used_mb(),
                 m.memory_total_mb(),
                 m.memory_percent()
-            ));
-        f.render_widget(vram_gauge, gauge_cols[1]);
-    }
+            )
+        })
+        .unwrap_or_else(|| " VRAM ".to_string());
+    let vram_max = app
+        .selected_metrics()
+        .map(|m| m.memory_total_mb())
+        .unwrap_or(1);
+    with_spark_data_u64(&history.memory_used_mb, |data| {
+        let sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(vram_title.as_str()),
+            )
+            .data(data)
+            .max(vram_max)
+            .style(Style::default().fg(Color::Magenta));
+        f.render_widget(sparkline, rows[2]);
+    });
 }
 
 fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(45),
-            Constraint::Percentage(45),
-            Constraint::Min(3),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
     // CPU total sparkline
@@ -595,21 +605,6 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(sparkline, rows[1]);
     });
-
-    // RAM gauge
-    if let Some(sys) = &app.system_metrics {
-        let ram_pct = sys.ram_percent().min(100.0) as u16;
-        let ram_gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" RAM "))
-            .gauge_style(Style::default().fg(Color::Yellow))
-            .percent(ram_pct)
-            .label(format!(
-                "{:.1}/{:.1} GiB",
-                sys.ram_used_gb(),
-                sys.ram_total_gb()
-            ));
-        f.render_widget(ram_gauge, rows[2]);
-    }
 }
 
 fn vram_pct_color(pct: f64) -> Color {
@@ -628,7 +623,7 @@ fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
         None => {
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(" VRAM Top Processes ");
+                .title(" Top Processes ");
             f.render_widget(block, area);
             return;
         }
@@ -636,7 +631,7 @@ fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" VRAM Top 5 Processes ");
+        .title(" Top Processes ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 

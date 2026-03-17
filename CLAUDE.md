@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-NVIDIA MIG(Multi-Instance GPU) 환경에서 제한되는 GPU 메트릭(VRAM 사용량, GPU Util, Memory Util, SM 활용율 등)을 실시간 모니터링하는 TUI 프로그램. btop/nvtop 수준의 실시간 그래프와 값 변화를 터미널에서 표시한다.
+NVIDIA MIG(Multi-Instance GPU) 환경에서 제한되는 GPU 메트릭(VRAM 사용량, GPU Util, Mem Ctrl, SM 활용율 등)을 실시간 모니터링하는 TUI 프로그램. btop/nvtop 수준의 실시간 sparkline 그래프와 값 변화를 터미널에서 표시한다.
 
 ## Tech Stack
 
 - **Language**: Rust
 - **GPU Metrics**: `nvml-wrapper` (NVIDIA NVML C API 바인딩) — MIG 인스턴스별 메트릭 수집
-- **TUI Rendering**: `ratatui` + `crossterm` — 실시간 그래프, gauge, sparkline 위젯
+- **TUI Rendering**: `ratatui` + `crossterm` — 실시간 sparkline 그래프 위젯
 - **System Metrics**: `sysinfo` — CPU 코어별 사용률, RAM/Swap
 
 ## Why Rust
