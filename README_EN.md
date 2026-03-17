@@ -196,10 +196,14 @@ cd mig-gpu-mon
 ```
 
 What `install.sh` handles automatically:
-1. Rust not installed → auto-installs via rustup
-2. git not installed → auto-installs via apt/yum/dnf
-3. `cargo build --release` → optimized build (LTO + strip, ~1.5MB)
-4. Copies binary to `~/.cargo/bin/mig-gpu-mon` + verifies PATH registration
+1. `curl` not installed → auto-installs (auto-detects apt/dnf/yum)
+2. `gcc` (C linker) not installed → auto-installs `build-essential` (Ubuntu) or `gcc` (Rocky/RHEL)
+3. `git` not installed → auto-installs
+4. Rust not installed → auto-installs via rustup
+5. `cargo build --release` → optimized build (LTO + strip, ~1.5MB)
+6. Copies binary to `~/.cargo/bin/mig-gpu-mon` + verifies PATH registration
+
+> Supports Ubuntu, Rocky Linux, CentOS, RHEL, and Amazon Linux. Package manager (apt/dnf/yum) is auto-detected.
 
 After installation, run immediately:
 ```bash

@@ -196,10 +196,14 @@ cd mig-gpu-mon
 ```
 
 `install.sh`가 자동으로 처리하는 것:
-1. Rust 미설치 시 → rustup으로 자동 설치
-2. git 미설치 시 → apt/yum/dnf로 자동 설치
-3. `cargo build --release` → 최적화 빌드 (LTO + strip, ~1.5MB)
-4. `~/.cargo/bin/mig-gpu-mon`에 바이너리 복사 + PATH 등록 확인
+1. `curl` 미설치 시 → 자동 설치 (apt/dnf/yum 자동 판별)
+2. `gcc` (C 링커) 미설치 시 → `build-essential`(Ubuntu) 또는 `gcc`(Rocky/RHEL) 자동 설치
+3. `git` 미설치 시 → 자동 설치
+4. Rust 미설치 시 → rustup으로 자동 설치
+5. `cargo build --release` → 최적화 빌드 (LTO + strip, ~1.5MB)
+6. `~/.cargo/bin/mig-gpu-mon`에 바이너리 복사 + PATH 등록 확인
+
+> Ubuntu, Rocky Linux, CentOS, RHEL, Amazon Linux 모두 대응. 패키지 매니저(apt/dnf/yum)를 자동 감지한다.
 
 설치 완료 후 바로 실행:
 ```bash

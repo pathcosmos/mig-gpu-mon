@@ -20,7 +20,39 @@ if [[ "$(uname -s)" != "Linux" ]]; then
     error "This tool only supports Linux (detected: $(uname -s))"
 fi
 
-# ── 2. Install Rust if not present ───────────────────────────────────
+# ── 2. Install build dependencies ────────────────────────────────────
+install_pkg() {
+    local pkg_apt="$1" pkg_rpm="$2"
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq $pkg_apt
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y -q $pkg_rpm
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y -q $pkg_rpm
+    else
+        error "Could not determine package manager (apt/dnf/yum). Install manually: $pkg_apt (Debian) or $pkg_rpm (RHEL)"
+    fi
+}
+
+# curl — required for rustup
+if ! command -v curl &>/dev/null; then
+    warn "curl not found. Installing..."
+    install_pkg "curl" "curl"
+fi
+
+# gcc/cc — required as C linker for cargo build
+if ! command -v cc &>/dev/null && ! command -v gcc &>/dev/null; then
+    warn "C compiler (gcc) not found. Installing..."
+    install_pkg "build-essential" "gcc"
+fi
+
+# git
+if ! command -v git &>/dev/null; then
+    warn "git not found. Installing..."
+    install_pkg "git" "git"
+fi
+
+# ── 3. Install Rust if not present ───────────────────────────────────
 if command -v cargo &>/dev/null; then
     info "Rust already installed: $(rustc --version)"
 else
@@ -28,20 +60,6 @@ else
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     source "$HOME/.cargo/env"
     info "Rust installed: $(rustc --version)"
-fi
-
-# ── 3. Install git if not present ────────────────────────────────────
-if ! command -v git &>/dev/null; then
-    warn "git not found. Attempting to install..."
-    if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq git
-    elif command -v yum &>/dev/null; then
-        sudo yum install -y -q git
-    elif command -v dnf &>/dev/null; then
-        sudo dnf install -y -q git
-    else
-        error "git is not installed and could not determine package manager. Please install git manually."
-    fi
 fi
 
 # ── 4. Build ─────────────────────────────────────────────────────────

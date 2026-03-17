@@ -47,10 +47,12 @@ fn main() -> Result<()> {
             eprintln!("Error: Failed to initialize NVML.\n");
             eprintln!("Possible causes:");
             eprintln!("  1. NVIDIA driver is not installed");
-            eprintln!("     → Install with: sudo apt install nvidia-driver-XXX");
+            eprintln!("     → Ubuntu/Debian: sudo apt install nvidia-driver-XXX");
+            eprintln!("     → RHEL/Rocky:    sudo dnf install nvidia-driver");
             eprintln!("       or check https://www.nvidia.com/drivers");
             eprintln!("  2. libnvidia-ml.so is not in the library path");
-            eprintln!("     → Try: sudo ldconfig /usr/lib/x86_64-linux-gnu/");
+            eprintln!("     → Ubuntu: sudo ldconfig /usr/lib/x86_64-linux-gnu/");
+            eprintln!("     → RHEL/Rocky: sudo ldconfig /usr/lib64/");
             eprintln!("     → Or specify manually: mig-gpu-mon --nvml-path /path/to/libnvidia-ml.so.1");
             eprintln!("  3. Running inside a container without GPU access");
             eprintln!("     → Use: docker run --gpus all ...");
