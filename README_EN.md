@@ -13,7 +13,7 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 ### ASCII Diagram
 
 ```
-┌─ mig-gpu-mon ──────────────────────────────────────────────────────────┐
+┌─ mig-gpu-mon ────────────────────────────────── 2026-03-17 02:15:30 PM ┐
 │ MIG GPU Monitor | Driver: 535.129.03 | CUDA: 12.2 | GPUs: 3           │ ← Header
 ├─ CPU (64 cores) 23.4% ─────────┬─ Devices ────────────────────────────┤
 │ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% Mem:… │ ↑ 20%
