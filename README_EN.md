@@ -132,7 +132,7 @@ When all utilization APIs fail (common on driver 535.x with MIG), metrics are di
 
 ## Features
 
-- Real-time per-MIG-instance GPU Util, Mem Ctrl (memory controller), SM Util, and VRAM usage
+- Real-time per-MIG-instance GPU Util, Mem Ctrl (memory controller / DRAM BW Util via GPM on Hopper+), SM Util, and VRAM usage
 - **Top Processes** — displays top 5 processes by VRAM usage (PID, process name, MB)
 - Parent GPU metrics (temperature, power, process count) displayed simultaneously
 - **Clock Speeds** — Graphics/SM/Memory clocks (MHz) + Performance State (P0~P15)
@@ -399,7 +399,7 @@ loop {
 
 ## MIG Utilization Collection Mechanism
 
-### 3-Tier Fallback Architecture
+### 4-Tier Fallback Architecture
 
 GPU/Memory utilization collection in MIG environments uses a cascading fallback strategy:
 
@@ -423,6 +423,14 @@ Tier 3: nvmlDeviceGetSamples(parent_handle, GPU_UTILIZATION_SAMPLES)
     → Scale by MIG slice ratio: mig_util = parent_util × total_slices / mig_slices
     → Example: parent=29%, MIG 3g.40gb → 29% × 7/3 ≈ 67%
     → If unavailable: display "N/A"
+
+Tier 4: nvmlGpmMigSampleGet() — memory_util only (Hopper+ only)
+    → Check GPM support from DeviceInfo cache
+    → MIG: nvmlGpmMigSampleGet(parent_handle, gpuInstanceId, sample)
+    → Regular GPU: nvmlGpmSampleGet(device, sample)
+    → Compute nvmlGpmMetricsGet() with previous tick's sample + current sample
+    → NVML_GPM_METRIC_DRAM_BW_UTIL (ID 10) → 0-100%
+    → Ampere and older: GPM not supported → "N/A" maintained
 ```
 
 ### Driver 535.x MIG Limitations (Deep Investigation)
@@ -470,9 +478,49 @@ Since per-MIG utilization is unavailable, the parent's aggregate utilization is 
 
 This is an **approximation** — it assumes all parent utilization comes from this MIG instance. Multiple active MIG instances would share the parent utilization.
 
-#### Memory Controller Utilization
+#### Memory Controller Utilization — Exhaustive Investigation
 
-No fallback path exists for memory controller utilization on MIG with driver 535.x. It is displayed as "N/A" rather than a misleading 0%.
+All possible NVML APIs were investigated to collect Memory Controller utilization in MIG environments.
+
+##### Attempted APIs and Results
+
+| # | API / Approach | Parent GPU | MIG Instance | Verdict |
+|---|---|---|---|---|
+| 1 | `nvmlDeviceGetUtilizationRates().memory` | NotSupported | NotSupported | ❌ Officially unsupported on MIG |
+| 2 | `nvmlDeviceGetProcessUtilization()` → `memUtil` | fetch fails | InvalidArg | ❌ Returns 0 or error |
+| 3 | `nvmlDeviceGetSamples(MEM_UTIL)` | **NotSupported** | InvalidArg | ❌ Blocked on parent too → no scaling source |
+| 4 | `nvmlDeviceGetFieldValues(MEM_UTIL=204)` | FAIL (ret=2) | "OK" but val=0 | ❌ Dummy data |
+| 5 | `nvidia-smi dmon` mem% | — | Not supported for MIG | ❌ nvidia-smi limitation |
+| 6 | CUDA `cudaMemGetInfo` | Capacity only | Capacity only | ❌ Not controller utilization |
+| 7 | `nvmlDeviceGetMemoryBusWidth` | Static value | Static value | ❌ Bus width (bits), not utilization |
+| 8 | Driver 545/550/555 | — | — | ❌ No standard API change |
+| 9 | **NVML GPM `DRAM_BW_UTIL`** | — | **Works on Hopper+** | ✅ Only viable path |
+
+##### Key Difference from GPU Util
+
+GPU Util has a working fallback because `nvmlDeviceGetSamples(GPU_UTIL)` **works on the parent GPU**, enabling MIG slice-ratio scaling. However, `MEM_UTIL` is **NotSupported even on the parent GPU**, so there is no source data to scale from.
+
+##### GPM (GPU Performance Monitoring) — Hopper+ Only Solution
+
+The NVML GPM API was introduced in driver 520+ for **Hopper (H100) and newer** architectures. `NVML_GPM_METRIC_DRAM_BW_UTIL` (metric ID 10) reports DRAM bandwidth utilization as a percentage of theoretical maximum (0.0–100.0%), and is collectible on MIG instances via `nvmlGpmMigSampleGet()`.
+
+```
+GPM Collection Flow:
+1. nvmlGpmQueryDeviceSupport(device) → check GPM support (cached in DeviceInfo)
+2. nvmlGpmSampleAlloc() → allocate sample buffer
+3. nvmlGpmMigSampleGet(parent, gpuInstanceId, sample) — for MIG instances
+   nvmlGpmSampleGet(device, sample) — for regular GPUs
+4. nvmlGpmMetricsGet() with previous tick's sample + current sample
+5. metrics[0].value → DRAM BW Util (0.0–100.0%)
+```
+
+| GPU Architecture | GPM Support | Mem Ctrl Display |
+|---|---|---|
+| Ampere (A100/A30) | ❌ | "N/A" maintained |
+| Hopper (H100/GH200) | ✅ | DRAM BW Util % |
+| Blackwell+ | ✅ | DRAM BW Util % |
+
+> **Implementation Status:** This tool already implements GPM DRAM BW Util collection, automatically enabled on Hopper+ GPUs. First tick collects baseline (None), actual values displayed from 2nd tick onwards.
 
 > **Note:** NVIDIA driver 550+ (CUDA 12.4+) added proper `nvmlDeviceGetUtilizationRates()` support for MIG device handles, making all 3 fallback tiers unnecessary.
 

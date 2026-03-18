@@ -132,7 +132,7 @@ MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 
 
 ## Features
 
-- MIG 인스턴스별 GPU Util, Mem Ctrl(메모리 컨트롤러), SM Util, VRAM 사용량 실시간 표시
+- MIG 인스턴스별 GPU Util, Mem Ctrl(메모리 컨트롤러 / Hopper+에서 DRAM BW Util via GPM), SM Util, VRAM 사용량 실시간 표시
 - **Top Processes** — PID, 프로세스명, VRAM 사용량(MB) 기준 상위 5개 표시
 - 부모 GPU 메트릭(온도, 전력, 프로세스 수) 동시 표시
 - **Clock Speeds** — Graphics/SM/Memory 클럭 (MHz) + Performance State (P0~P15)
@@ -399,7 +399,7 @@ loop {
 
 ## MIG Utilization 수집 메커니즘
 
-### 3단계 폴백 아키텍처
+### 4단계 폴백 아키텍처
 
 MIG 환경에서 GPU/Memory utilization 수집은 계단식 폴백 전략을 사용한다:
 
@@ -423,6 +423,14 @@ nvmlDeviceGetMigDeviceHandleByIndex(parent, idx)
     → MIG 슬라이스 비율로 스케일링: mig_util = parent_util × total_slices / mig_slices
     → 예: parent=29%, MIG 3g.40gb → 29% × 7/3 ≈ 67%
     → 불가능 시: "N/A" 표시
+
+4단계: nvmlGpmMigSampleGet() — memory_util 전용 (Hopper+ only)
+    → DeviceInfo 캐시에서 GPM 지원 여부 확인
+    → MIG: nvmlGpmMigSampleGet(parent_handle, gpuInstanceId, sample)
+    → 일반 GPU: nvmlGpmSampleGet(device, sample)
+    → 이전 tick 샘플과 현재 샘플로 nvmlGpmMetricsGet() 호출
+    → NVML_GPM_METRIC_DRAM_BW_UTIL (ID 10) → 0-100%
+    → Ampere 및 이전 아키텍처: GPM 미지원 → "N/A" 유지
 ```
 
 ### 드라이버 535.x MIG 제한사항 (심층 조사)
@@ -470,9 +478,49 @@ MIG별 utilization 직접 수집이 불가하므로, 부모의 집계된 utiliza
 
 이것은 **근사값**이다 — 부모의 모든 utilization이 해당 MIG 인스턴스에서 발생한다고 가정한다. 여러 MIG 인스턴스가 동시에 활성화되면 부모 utilization이 분배된다.
 
-#### 메모리 컨트롤러 Utilization
+#### 메모리 컨트롤러 Utilization — 전수 조사 결과
 
-드라이버 535.x MIG에서 메모리 컨트롤러 utilization의 폴백 경로는 존재하지 않는다. 오해를 유발하는 0% 대신 "N/A"로 표시한다.
+MIG 환경에서 메모리 컨트롤러(Memory Controller) utilization을 수집하기 위해 가능한 **모든 NVML API**를 조사했다.
+
+##### 시도한 API 목록 및 결과
+
+| # | API / 접근법 | 부모 GPU | MIG 인스턴스 | 판정 |
+|---|---|---|---|---|
+| 1 | `nvmlDeviceGetUtilizationRates().memory` | NotSupported | NotSupported | ❌ MIG 공식 미지원 |
+| 2 | `nvmlDeviceGetProcessUtilization()` → `memUtil` | fetch 실패 | InvalidArg | ❌ 0 또는 에러 |
+| 3 | `nvmlDeviceGetSamples(MEM_UTIL)` | **NotSupported** | InvalidArg | ❌ 부모에서도 불가 → 스케일링 원천 차단 |
+| 4 | `nvmlDeviceGetFieldValues(MEM_UTIL=204)` | FAIL (ret=2) | "OK" but val=0 | ❌ 더미 데이터 |
+| 5 | `nvidia-smi dmon` mem% | — | MIG 미지원 | ❌ nvidia-smi 자체 제한 |
+| 6 | CUDA `cudaMemGetInfo` | 용량만 | 용량만 | ❌ 컨트롤러 활용률 아닌 용량 |
+| 7 | `nvmlDeviceGetMemoryBusWidth` | 정적값 | 정적값 | ❌ 버스 폭(bit)이지 utilization 아님 |
+| 8 | 드라이버 545/550/555 | — | — | ❌ 표준 API 제한 해제 없음 |
+| 9 | **NVML GPM `DRAM_BW_UTIL`** | — | **Hopper+ 동작** | ✅ 유일한 경로 |
+
+##### GPU Util과의 핵심 차이
+
+GPU Util은 부모 GPU의 `nvmlDeviceGetSamples(GPU_UTIL)`이 **동작**하여 MIG 슬라이스 비율 스케일링이 가능했다. 그러나 `MEM_UTIL`은 **부모 GPU에서조차 NotSupported**이므로 스케일링할 원본 데이터 자체가 존재하지 않는다.
+
+##### GPM (GPU Performance Monitoring) — Hopper+ 전용 솔루션
+
+NVML GPM API는 드라이버 520+에서 **Hopper (H100) 이상** 아키텍처에 도입되었다. `NVML_GPM_METRIC_DRAM_BW_UTIL` (ID 10)은 이론적 최대 대비 DRAM 대역폭 사용률(0.0~100.0%)을 제공하며, MIG 인스턴스에서도 `nvmlGpmMigSampleGet()`으로 수집 가능하다.
+
+```
+GPM 수집 흐름:
+1. nvmlGpmQueryDeviceSupport(device) → GPM 지원 확인 (DeviceInfo 캐시)
+2. nvmlGpmSampleAlloc() → 샘플 버퍼 할당
+3. nvmlGpmMigSampleGet(parent, gpuInstanceId, sample) — MIG 인스턴스
+   nvmlGpmSampleGet(device, sample) — 일반 GPU
+4. 이전 tick의 샘플과 현재 샘플로 nvmlGpmMetricsGet() 호출
+5. metrics[0].value → DRAM BW Util (0.0~100.0%)
+```
+
+| GPU 아키텍처 | GPM 지원 | Mem Ctrl 표시 |
+|---|---|---|
+| Ampere (A100/A30) | ❌ | "N/A" 유지 |
+| Hopper (H100/GH200) | ✅ | DRAM BW Util % |
+| Blackwell+ | ✅ | DRAM BW Util % |
+
+> **구현 상태:** 본 도구는 GPM DRAM BW Util 수집을 이미 구현하였으며, Hopper+ GPU에서 자동 활성화된다. 첫 tick은 baseline 수집(None), 2번째 tick부터 실측값 표시.
 
 > **참고:** NVIDIA 드라이버 550+ (CUDA 12.4+)부터 MIG 디바이스 핸들에서 `nvmlDeviceGetUtilizationRates()` 정식 지원이 추가되어, 3단계 폴백이 불필요해진다.
 

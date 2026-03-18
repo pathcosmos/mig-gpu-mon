@@ -54,6 +54,7 @@ src/
 - **3단계 MIG utilization 폴백**: (1) `utilization_rates()` → (2) `nvmlDeviceGetProcessUtilization()` → (3) `nvmlDeviceGetSamples(GPU_UTIL)` + MIG 슬라이스 비율 스케일링
 - 드라이버 535.x에서 모든 표준 utilization API가 MIG에서 실패 → 부모 GPU의 `nvmlDeviceGetSamples` raw 값(/10000)을 MIG `gpuInstanceSliceCount` 비율로 환산
 - `gpu_util`, `memory_util`은 `Option<u32>` — API 실패 시 0% 대신 "N/A" 표시로 오해 방지
+- **GPM DRAM BW Util 폴백**: Hopper+ GPU에서 `nvmlGpmMigSampleGet()` → `NVML_GPM_METRIC_DRAM_BW_UTIL`로 MIG 메모리 컨트롤러 utilization 수집. Ampere에서는 GPM 미지원 → "N/A" 유지. 이전 tick 샘플과 현재 샘플 간 delta 계산 방식 (첫 tick은 None)
 - 모든 확장 메트릭(clock, PCIe, ECC, throttle 등)은 `.ok()`로 래핑 → MIG/vGPU에서 실패 시 `None`으로 graceful 처리
 - 정적 메트릭(architecture, CC, temp thresholds, MIG slice count 등)은 `DeviceInfo` 캐시에 1회만 수집
 - NVML 샘플 버퍼는 `RefCell<Vec<nvmlSample_t>>`로 grow-only 재사용 (tick당 할당 없음, ~2KB)

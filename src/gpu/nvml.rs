@@ -8,7 +8,9 @@ use nvml_wrapper::enums::device::{DeviceArchitecture, UsedGpuMemory};
 use nvml_wrapper::Device;
 use nvml_wrapper::Nvml;
 use nvml_wrapper_sys::bindings::{
-    nvmlDeviceAttributes_t, nvmlDevice_t, nvmlProcessUtilizationSample_t, nvmlSample_t, NvmlLib,
+    nvmlDeviceAttributes_t, nvmlDevice_t, nvmlGpmMetricId_t_NVML_GPM_METRIC_DRAM_BW_UTIL,
+    nvmlGpmMetricsGet_t, nvmlGpmSample_t, nvmlGpmSupport_t, nvmlProcessUtilizationSample_t,
+    nvmlSample_t, NvmlLib, NVML_GPM_METRICS_GET_VERSION, NVML_GPM_SUPPORT_VERSION,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -29,6 +31,10 @@ struct DeviceInfo {
     temp_slowdown: Option<u32>,
     /// MIG GPU instance slice count (e.g. 3 for 3g.40gb) — only set on MIG devices
     gpu_instance_slice_count: Option<u32>,
+    /// Whether the device supports GPM (GPU Performance Monitoring) — Hopper+ only
+    gpm_supported: bool,
+    /// MIG GPU instance ID (for GPM MIG sampling via parent device)
+    gpu_instance_id: Option<u32>,
 }
 
 pub struct NvmlCollector {
@@ -42,6 +48,9 @@ pub struct NvmlCollector {
     proc_sample_buf: RefCell<Vec<nvmlProcessUtilizationSample_t>>,
     /// Reusable buffer for GPU utilization samples (avoid alloc per tick)
     sample_buf: RefCell<Vec<nvmlSample_t>>,
+    /// Previous GPM samples for DRAM BW util computation (keyed by device handle pointer).
+    /// Each value is an allocated nvmlGpmSample_t that must be freed on drop.
+    gpm_prev_samples: RefCell<HashMap<usize, nvmlGpmSample_t>>,
 }
 
 impl NvmlCollector {
@@ -120,6 +129,7 @@ impl NvmlCollector {
             device_cache: RefCell::new(HashMap::new()),
             proc_sample_buf: RefCell::new(Vec::with_capacity(32)),
             sample_buf: RefCell::new(Vec::with_capacity(128)),
+            gpm_prev_samples: RefCell::new(HashMap::new()),
         })
     }
 
@@ -252,6 +262,19 @@ impl NvmlCollector {
                         }
                     }
 
+                    // GPM fallback for memory_util: DRAM BW util (Hopper+ only)
+                    if metrics.memory_util.is_none() {
+                        let mig_info = self.get_device_info(&mig_device);
+                        if mig_info.gpm_supported {
+                            metrics.memory_util = self.get_dram_bw_util_gpm(
+                                mig_handle,
+                                true,
+                                mig_info.gpu_instance_id,
+                                Some(parent_handle),
+                            );
+                        }
+                    }
+
                     metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name);
                     mig_metrics.push(metrics);
                 }
@@ -375,6 +398,70 @@ impl NvmlCollector {
         Some(util)
     }
 
+    /// Get DRAM bandwidth utilization via GPM API (Hopper+ only).
+    /// Uses previous tick's sample and current sample to compute utilization.
+    /// For MIG: uses nvmlGpmMigSampleGet with gpuInstanceId on parent handle.
+    /// For regular GPU: uses nvmlGpmSampleGet on device handle.
+    unsafe fn get_dram_bw_util_gpm(
+        &self,
+        device_handle: nvmlDevice_t,
+        is_mig: bool,
+        gpu_instance_id: Option<u32>,
+        parent_handle: Option<nvmlDevice_t>,
+    ) -> Option<u32> {
+        // Allocate new sample
+        let mut new_sample: nvmlGpmSample_t = std::ptr::null_mut();
+        if self.raw_lib.nvmlGpmSampleAlloc(&mut new_sample) != 0 || new_sample.is_null() {
+            return None;
+        }
+
+        // Take sample
+        let ret = if is_mig {
+            let parent = parent_handle?;
+            let gi_id = gpu_instance_id?;
+            self.raw_lib.nvmlGpmMigSampleGet(parent, gi_id, new_sample)
+        } else {
+            self.raw_lib.nvmlGpmSampleGet(device_handle, new_sample)
+        };
+
+        if ret != 0 {
+            self.raw_lib.nvmlGpmSampleFree(new_sample);
+            return None;
+        }
+
+        let key = device_handle as usize;
+        let mut prev_map = self.gpm_prev_samples.borrow_mut();
+
+        let result = if let Some(&prev_sample) = prev_map.get(&key) {
+            // Compute metrics from previous + current samples
+            let mut metrics_get: nvmlGpmMetricsGet_t = std::mem::zeroed();
+            metrics_get.version = NVML_GPM_METRICS_GET_VERSION;
+            metrics_get.numMetrics = 1;
+            metrics_get.sample1 = prev_sample;
+            metrics_get.sample2 = new_sample;
+            metrics_get.metrics[0].metricId = nvmlGpmMetricId_t_NVML_GPM_METRIC_DRAM_BW_UTIL;
+
+            if self.raw_lib.nvmlGpmMetricsGet(&mut metrics_get) == 0
+                && metrics_get.metrics[0].nvmlReturn == 0
+            {
+                let val = metrics_get.metrics[0].value;
+                Some((val.round() as u32).min(100))
+            } else {
+                None
+            }
+        } else {
+            // First tick — no previous sample yet, just store for next tick
+            None
+        };
+
+        // Free old sample if exists, store new one
+        if let Some(old) = prev_map.insert(key, new_sample) {
+            self.raw_lib.nvmlGpmSampleFree(old);
+        }
+
+        result
+    }
+
     /// Get cached or fetch device info. Static fields never change at runtime.
     fn get_device_info(&self, device: &Device) -> DeviceInfo {
         let key = unsafe { device.handle() } as usize;
@@ -412,6 +499,31 @@ impl NvmlCollector {
                     None
                 }
             },
+            gpm_supported: unsafe {
+                let mut support: nvmlGpmSupport_t = std::mem::zeroed();
+                support.version = NVML_GPM_SUPPORT_VERSION;
+                if self
+                    .raw_lib
+                    .nvmlGpmQueryDeviceSupport(device.handle(), &mut support)
+                    == 0
+                {
+                    support.isSupportedDevice != 0
+                } else {
+                    false
+                }
+            },
+            gpu_instance_id: unsafe {
+                let mut id: c_uint = 0;
+                if self
+                    .raw_lib
+                    .nvmlDeviceGetGpuInstanceId(device.handle(), &mut id)
+                    == 0
+                {
+                    Some(id)
+                } else {
+                    None
+                }
+            },
         };
 
         self.device_cache.borrow_mut().insert(key, info.clone());
@@ -436,8 +548,15 @@ impl NvmlCollector {
                 } else {
                     None
                 };
-                (sampled, None) // memory_util has no known fallback
+                (sampled, None) // memory_util: GPM fallback attempted below
             }
+        };
+
+        // GPM fallback for memory_util on non-MIG devices (Hopper+ only)
+        let memory_util = if memory_util.is_none() && info.gpm_supported {
+            unsafe { self.get_dram_bw_util_gpm(device.handle(), false, None, None) }
+        } else {
+            memory_util
         };
 
         let (memory_used, memory_total) = device
@@ -567,6 +686,19 @@ impl NvmlCollector {
                 format!("{major}.{minor}")
             })
             .unwrap_or_else(|_| "Unknown".to_string())
+    }
+}
+
+impl Drop for NvmlCollector {
+    fn drop(&mut self) {
+        let prev_map = self.gpm_prev_samples.borrow();
+        for &sample in prev_map.values() {
+            if !sample.is_null() {
+                unsafe {
+                    let _ = self.raw_lib.nvmlGpmSampleFree(sample);
+                }
+            }
+        }
     }
 }
 
