@@ -506,12 +506,22 @@ NVML GPM API는 드라이버 520+에서 **Hopper (H100) 이상** 아키텍처에
 
 ```
 GPM 수집 흐름:
-1. nvmlGpmQueryDeviceSupport(device) → GPM 지원 확인 (DeviceInfo 캐시)
+1. nvmlGpmQueryDeviceSupport(parent_device) → GPM 지원 확인 (DeviceInfo 캐시)
+   ⚠ 반드시 부모 GPU 핸들로 체크 — MIG 핸들에서는 에러 반환 가능
 2. nvmlGpmSampleAlloc() → 샘플 버퍼 할당
 3. nvmlGpmMigSampleGet(parent, gpuInstanceId, sample) — MIG 인스턴스
-   nvmlGpmSampleGet(device, sample) — 일반 GPU
+   nvmlGpmSampleGet(device, sample) — 일반 GPU (non-MIG only)
+   ⚠ MIG 핸들에 nvmlGpmSampleGet 호출 금지 — NVML 상태 오염 → VRAM 등 후속 쿼리 실패
 4. 이전 tick의 샘플과 현재 샘플로 nvmlGpmMetricsGet() 호출
 5. metrics[0].value → DRAM BW Util (0.0~100.0%)
+
+주의사항 (v0.2.1 수정):
+- VRAM 쿼리(memory_info)는 반드시 GPM 호출 전에 실행
+  → MIG 핸들에 잘못된 GPM 호출이 NVML 상태를 오염시키면 후속 memory_info() 실패
+- collect_device_metrics 내 GPM fallback은 non-MIG 디바이스에만 적용
+  → MIG는 collect_mig_instances에서 parent 핸들 경유로 별도 처리
+- GPM 지원 확인은 parent device 핸들로만 수행
+  → MIG 핸들에서 nvmlGpmQueryDeviceSupport → 에러 → gpm_supported=false → fallback 전체 스킵
 ```
 
 | GPU 아키텍처 | GPM 지원 | Mem Ctrl 표시 |

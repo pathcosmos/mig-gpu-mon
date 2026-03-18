@@ -1,6 +1,6 @@
 [package]
 name = "mig-gpu-mon"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Real-time GPU monitoring tool for NVIDIA MIG environments"
 

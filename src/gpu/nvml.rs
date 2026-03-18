@@ -217,6 +217,10 @@ impl NvmlCollector {
             // MaxMigDeviceCount = total number of GPU instance slices (e.g. 7 for H100)
             let total_slices = max_count;
 
+            // GPM support must be checked on the parent device (not MIG handles)
+            let parent_info = self.get_device_info(parent_device);
+            let parent_gpm_supported = parent_info.gpm_supported;
+
             for mig_idx in 0..max_count {
                 let mut mig_handle: nvmlDevice_t = std::ptr::null_mut();
                 let ret = self.raw_lib.nvmlDeviceGetMigDeviceHandleByIndex(
@@ -263,16 +267,15 @@ impl NvmlCollector {
                     }
 
                     // GPM fallback for memory_util: DRAM BW util (Hopper+ only)
-                    if metrics.memory_util.is_none() {
+                    // GPM support is checked on parent device — MIG handles may not support the query
+                    if metrics.memory_util.is_none() && parent_gpm_supported {
                         let mig_info = self.get_device_info(&mig_device);
-                        if mig_info.gpm_supported {
-                            metrics.memory_util = self.get_dram_bw_util_gpm(
-                                mig_handle,
-                                true,
-                                mig_info.gpu_instance_id,
-                                Some(parent_handle),
-                            );
-                        }
+                        metrics.memory_util = self.get_dram_bw_util_gpm(
+                            mig_handle,
+                            true,
+                            mig_info.gpu_instance_id,
+                            Some(parent_handle),
+                        );
                     }
 
                     metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name);
@@ -539,6 +542,12 @@ impl NvmlCollector {
     ) -> Result<GpuMetrics> {
         let info = self.get_device_info(device);
 
+        // VRAM query first — before any GPM calls that might disturb NVML state on MIG handles
+        let (memory_used, memory_total) = device
+            .memory_info()
+            .map(|m| (m.used, m.total))
+            .unwrap_or((0, 0));
+
         let (gpu_util, memory_util): (Option<u32>, Option<u32>) = match device.utilization_rates() {
             Ok(u) => (Some(u.gpu), Some(u.memory)),
             Err(_) => {
@@ -548,21 +557,17 @@ impl NvmlCollector {
                 } else {
                     None
                 };
-                (sampled, None) // memory_util: GPM fallback attempted below
+                (sampled, None) // memory_util: GPM fallback attempted in caller for MIG
             }
         };
 
-        // GPM fallback for memory_util on non-MIG devices (Hopper+ only)
-        let memory_util = if memory_util.is_none() && info.gpm_supported {
+        // GPM fallback for memory_util on non-MIG devices only (Hopper+ only).
+        // MIG devices must use nvmlGpmMigSampleGet via parent — handled in collect_mig_instances.
+        let memory_util = if memory_util.is_none() && !is_mig && info.gpm_supported {
             unsafe { self.get_dram_bw_util_gpm(device.handle(), false, None, None) }
         } else {
             memory_util
         };
-
-        let (memory_used, memory_total) = device
-            .memory_info()
-            .map(|m| (m.used, m.total))
-            .unwrap_or((0, 0));
 
         let temperature = device.temperature(TemperatureSensor::Gpu).ok();
         let power_usage = device.power_usage().ok();

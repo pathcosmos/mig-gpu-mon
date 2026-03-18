@@ -506,12 +506,22 @@ The NVML GPM API was introduced in driver 520+ for **Hopper (H100) and newer** a
 
 ```
 GPM Collection Flow:
-1. nvmlGpmQueryDeviceSupport(device) → check GPM support (cached in DeviceInfo)
+1. nvmlGpmQueryDeviceSupport(parent_device) → check GPM support (cached in DeviceInfo)
+   ⚠ Must use parent GPU handle — MIG handles may return errors
 2. nvmlGpmSampleAlloc() → allocate sample buffer
 3. nvmlGpmMigSampleGet(parent, gpuInstanceId, sample) — for MIG instances
-   nvmlGpmSampleGet(device, sample) — for regular GPUs
+   nvmlGpmSampleGet(device, sample) — for regular GPUs (non-MIG only)
+   ⚠ Never call nvmlGpmSampleGet on MIG handles — corrupts NVML state → breaks subsequent queries
 4. nvmlGpmMetricsGet() with previous tick's sample + current sample
 5. metrics[0].value → DRAM BW Util (0.0–100.0%)
+
+Important notes (fixed in v0.2.1):
+- VRAM query (memory_info) must execute BEFORE any GPM calls
+  → Wrong GPM calls on MIG handles can corrupt NVML state, causing subsequent memory_info() to fail
+- GPM fallback in collect_device_metrics applies to non-MIG devices only
+  → MIG devices are handled separately in collect_mig_instances via parent handle
+- GPM support check must use parent device handle
+  → nvmlGpmQueryDeviceSupport on MIG handle → error → gpm_supported=false → entire fallback skipped
 ```
 
 | GPU Architecture | GPM Support | Mem Ctrl Display |
