@@ -7,7 +7,9 @@ use nvml_wrapper::enum_wrappers::device::{
 use nvml_wrapper::enums::device::{DeviceArchitecture, UsedGpuMemory};
 use nvml_wrapper::Device;
 use nvml_wrapper::Nvml;
-use nvml_wrapper_sys::bindings::{nvmlDevice_t, nvmlProcessUtilizationSample_t, NvmlLib};
+use nvml_wrapper_sys::bindings::{
+    nvmlDeviceAttributes_t, nvmlDevice_t, nvmlProcessUtilizationSample_t, nvmlSample_t, NvmlLib,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -25,6 +27,8 @@ struct DeviceInfo {
     ecc_enabled: Option<bool>,
     temp_shutdown: Option<u32>,
     temp_slowdown: Option<u32>,
+    /// MIG GPU instance slice count (e.g. 3 for 3g.40gb) — only set on MIG devices
+    gpu_instance_slice_count: Option<u32>,
 }
 
 pub struct NvmlCollector {
@@ -36,6 +40,8 @@ pub struct NvmlCollector {
     device_cache: RefCell<HashMap<usize, DeviceInfo>>,
     /// Reusable buffer for process utilization samples (avoid alloc per tick)
     proc_sample_buf: RefCell<Vec<nvmlProcessUtilizationSample_t>>,
+    /// Reusable buffer for GPU utilization samples (avoid alloc per tick)
+    sample_buf: RefCell<Vec<nvmlSample_t>>,
 }
 
 impl NvmlCollector {
@@ -113,6 +119,7 @@ impl NvmlCollector {
             raw_lib,
             device_cache: RefCell::new(HashMap::new()),
             proc_sample_buf: RefCell::new(Vec::with_capacity(32)),
+            sample_buf: RefCell::new(Vec::with_capacity(128)),
         })
     }
 
@@ -195,6 +202,11 @@ impl NvmlCollector {
                 return Ok(mig_metrics);
             }
 
+            // Pre-fetch parent-level GPU util via samples (for slice-ratio fallback)
+            let parent_sampled_util = self.get_gpu_util_from_samples(parent_handle);
+            // MaxMigDeviceCount = total number of GPU instance slices (e.g. 7 for H100)
+            let total_slices = max_count;
+
             for mig_idx in 0..max_count {
                 let mut mig_handle: nvmlDevice_t = std::ptr::null_mut();
                 let ret = self.raw_lib.nvmlDeviceGetMigDeviceHandleByIndex(
@@ -211,11 +223,33 @@ impl NvmlCollector {
                 if let Ok(mut metrics) =
                     self.collect_device_metrics(&mig_device, mig_idx, true, Some(gpu_index))
                 {
-                    if metrics.gpu_util == 0 && metrics.memory_util == 0 {
+                    // Fallback 1: process utilization
+                    if metrics.gpu_util.is_none() {
                         let (sm, mem) = self.get_process_utilization(mig_handle);
-                        metrics.gpu_util = sm;
-                        metrics.memory_util = mem;
-                        metrics.sm_util = Some(sm);
+                        if sm > 0 {
+                            metrics.gpu_util = Some(sm);
+                            metrics.sm_util = Some(sm);
+                        }
+                        if mem > 0 {
+                            metrics.memory_util = Some(mem);
+                        }
+                    }
+
+                    // Fallback 2: scale parent's sampled util by MIG slice ratio
+                    if metrics.gpu_util.is_none() {
+                        if let Some(p_util) = parent_sampled_util {
+                            let mig_info = self.get_device_info(&mig_device);
+                            if let Some(mig_slices) = mig_info.gpu_instance_slice_count {
+                                // parent util is aggregate; scale up by slice ratio
+                                // e.g., parent=29%, MIG 3g → slices=3, total=7
+                                //   MIG util ≈ parent * total / mig_slices = 29 * 7/3 ≈ 68%
+                                let scaled = ((p_util as u64) * (total_slices as u64)
+                                    / (mig_slices as u64))
+                                    .min(100) as u32;
+                                metrics.gpu_util = Some(scaled);
+                                metrics.sm_util = Some(scaled);
+                            }
+                        }
                     }
 
                     metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name);
@@ -273,6 +307,60 @@ impl NvmlCollector {
         (max_sm, max_mem)
     }
 
+    /// Get GPU utilization from nvmlDeviceGetSamples (parent device only).
+    /// Returns the average of recent samples scaled to 0-100%.
+    /// Reuses internal buffer to avoid allocation per call.
+    unsafe fn get_gpu_util_from_samples(&self, device_handle: nvmlDevice_t) -> Option<u32> {
+        let mut val_type: c_uint = 0;
+        let mut count: c_uint = 0;
+
+        // Size query
+        let ret = self.raw_lib.nvmlDeviceGetSamples(
+            device_handle,
+            0, // NVML_GPU_UTILIZATION_SAMPLES
+            0,
+            &mut val_type,
+            &mut count,
+            std::ptr::null_mut(),
+        );
+
+        // ret==0 means count is already set; ret==7 means INSUFFICIENT_SIZE (also sets count)
+        if (ret != 0 && ret != 7) || count == 0 {
+            return None;
+        }
+
+        let mut buf = self.sample_buf.borrow_mut();
+        let needed = count as usize;
+        if buf.len() < needed {
+            buf.resize(needed, std::mem::zeroed());
+        }
+
+        let ret = self.raw_lib.nvmlDeviceGetSamples(
+            device_handle,
+            0,
+            0,
+            &mut val_type,
+            &mut count,
+            buf.as_mut_ptr(),
+        );
+        if ret != 0 || count == 0 {
+            return None;
+        }
+
+        // Use last ~5 samples for a responsive average (not all 120)
+        let n = (count as usize).min(5);
+        let start = count as usize - n;
+        let sum: u64 = buf[start..count as usize]
+            .iter()
+            .map(|s| s.sampleValue.uiVal as u64)
+            .sum();
+        let avg = sum / n as u64;
+
+        // Driver 535 returns raw values ~290000 range; /10000 gives 0-100%
+        let util = (avg / 10000).min(100) as u32;
+        Some(util)
+    }
+
     /// Get cached or fetch device info. Static fields never change at runtime.
     fn get_device_info(&self, device: &Device) -> DeviceInfo {
         let key = unsafe { device.handle() } as usize;
@@ -297,6 +385,19 @@ impl NvmlCollector {
             temp_slowdown: device
                 .temperature_threshold(TemperatureThreshold::Slowdown)
                 .ok(),
+            gpu_instance_slice_count: unsafe {
+                let mut attrs: nvmlDeviceAttributes_t = std::mem::zeroed();
+                if self
+                    .raw_lib
+                    .nvmlDeviceGetAttributes_v2(device.handle(), &mut attrs)
+                    == 0
+                    && attrs.gpuInstanceSliceCount > 0
+                {
+                    Some(attrs.gpuInstanceSliceCount)
+                } else {
+                    None
+                }
+            },
         };
 
         self.device_cache.borrow_mut().insert(key, info.clone());
@@ -312,10 +413,18 @@ impl NvmlCollector {
     ) -> Result<GpuMetrics> {
         let info = self.get_device_info(device);
 
-        let (gpu_util, memory_util) = device
-            .utilization_rates()
-            .map(|u| (u.gpu, u.memory))
-            .unwrap_or((0, 0));
+        let (gpu_util, memory_util): (Option<u32>, Option<u32>) = match device.utilization_rates() {
+            Ok(u) => (Some(u.gpu), Some(u.memory)),
+            Err(_) => {
+                // Fallback: try nvmlDeviceGetSamples on non-MIG (parent) devices
+                let sampled = if !is_mig {
+                    unsafe { self.get_gpu_util_from_samples(device.handle()) }
+                } else {
+                    None
+                };
+                (sampled, None) // memory_util has no known fallback
+            }
+        };
 
         let (memory_used, memory_total) = device
             .memory_info()

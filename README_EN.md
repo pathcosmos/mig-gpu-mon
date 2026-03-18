@@ -122,11 +122,13 @@ draw()
 In MIG environments, `nvidia-smi` cannot display key metrics such as GPU Utilization and Memory Utilization.
 This is because `nvmlDeviceGetUtilizationRates()` returns `NVML_ERROR_NOT_SUPPORTED` for MIG device handles.
 
-This tool bypasses that limitation by calling the NVML C API directly:
+This tool bypasses that limitation through a **3-tier fallback mechanism** using the NVML C API directly:
 
-1. `nvmlDeviceGetMigDeviceHandleByIndex()` — Obtain MIG instance handle
-2. `nvmlDeviceGetProcessUtilization()` — Collect per-process SM/Memory utilization
-3. Aggregate per-process values to compute instance-level GPU Util / Memory Util / SM Util
+1. **Tier 1:** `nvmlDeviceGetUtilizationRates()` — Standard API (works on non-MIG GPUs)
+2. **Tier 2:** `nvmlDeviceGetProcessUtilization()` — Per-process SM/Memory utilization aggregation
+3. **Tier 3:** `nvmlDeviceGetSamples(GPU_UTILIZATION_SAMPLES)` — Parent GPU sampling + MIG slice-ratio scaling
+
+When all utilization APIs fail (common on driver 535.x with MIG), metrics are displayed as "N/A" instead of a misleading 0%.
 
 ## Features
 
@@ -394,20 +396,99 @@ loop {
 
 ## MIG Utilization Collection Mechanism
 
-How GPU/Memory utilization is obtained in MIG environments:
+### 3-Tier Fallback Architecture
+
+GPU/Memory utilization collection in MIG environments uses a cascading fallback strategy:
 
 ```
 nvmlDeviceGetMigDeviceHandleByIndex(parent, idx)
     → mig_handle
 
-nvmlDeviceGetUtilizationRates(mig_handle)
-    → Success: use gpu_util, memory_util
-    → Failure (NVML_ERROR_NOT_SUPPORTED):
-        nvmlDeviceGetProcessUtilization(mig_handle, samples, &count, 0)
-            → 1st call: count=0 → NVML_ERROR_INSUFFICIENT_SIZE, count returns required size
-            → 2nd call: pass buffer → collect per-process smUtil, memUtil
-            → Aggregate max(smUtil), max(memUtil) for instance-level values
+Tier 1: nvmlDeviceGetUtilizationRates(mig_handle)
+    → Success: use gpu_util, memory_util directly
+    → Failure (NVML_ERROR_NOT_SUPPORTED): proceed to Tier 2
+
+Tier 2: nvmlDeviceGetProcessUtilization(mig_handle, samples, &count, 0)
+    → 1st call: count=0 → NVML_ERROR_INSUFFICIENT_SIZE, count returns required size
+    → 2nd call: pass buffer → collect per-process smUtil, memUtil
+    → Aggregate max(smUtil), max(memUtil) for instance-level values
+    → If all samples are zero or fetch fails: proceed to Tier 3
+
+Tier 3: nvmlDeviceGetSamples(parent_handle, GPU_UTILIZATION_SAMPLES)
+    → Collect raw utilization samples from parent GPU (20ms intervals)
+    → Average last 5 samples, divide by 10000 to get 0-100% scale
+    → Scale by MIG slice ratio: mig_util = parent_util × total_slices / mig_slices
+    → Example: parent=29%, MIG 3g.40gb → 29% × 7/3 ≈ 67%
+    → If unavailable: display "N/A"
 ```
+
+### Driver 535.x MIG Limitations (Deep Investigation)
+
+Extensive testing on **H100 PCIe + MIG 3g.40gb + Driver 535.129.03** revealed that **no standard NVML API** provides per-MIG-instance GPU utilization or memory controller utilization on this driver version.
+
+#### NVML API Test Results (Driver 535.129.03)
+
+| NVML API | Parent GPU | MIG Instance |
+|---|---|---|
+| `nvmlDeviceGetUtilizationRates()` | NotSupported (ret=3) | NotSupported (ret=3) |
+| `nvmlDeviceGetProcessUtilization()` | Size query OK → fetch NotSupported | Size query OK → fetch InvalidArg (ret=2) |
+| `nvmlDeviceGetSamples(GPU_UTIL)` | **Works** (119 samples, raw values) | InvalidArg (ret=2) |
+| `nvmlDeviceGetSamples(MEM_UTIL)` | NotSupported | InvalidArg |
+| `nvmlDeviceGetFieldValues(GPU_UTIL=203)` | FAIL (ret=2) | "OK" but val=0 (dummy data) |
+| `nvmlDeviceGetFieldValues(MEM_UTIL=204)` | FAIL (ret=2) | "OK" but val=0 (dummy data) |
+
+#### What Works on Each Device Type
+
+| Metric | MIG Instance | Parent GPU |
+|---|---|---|
+| VRAM used/total | OK | NoPermission |
+| Temperature | InvalidArg | OK |
+| Power usage | NotSupported | OK |
+| Clock speeds | NotSupported | OK |
+| PCIe throughput | InvalidArg | OK |
+| Process list | OK | - |
+| `nvmlDeviceGetSamples(GPU_UTIL)` | InvalidArg | **OK** (raw values ~290000 range) |
+
+#### Raw Sample Value Interpretation
+
+`nvmlDeviceGetSamples(GPU_UTILIZATION_SAMPLES)` on the parent device returns:
+- ~119 samples at 20ms intervals
+- Values in ~230000-340000 range (not 0-100%)
+- Dividing by 10000 yields plausible utilization percentages (~29%)
+- Verified stable across multiple rounds (avg=291419, 292075, 292760)
+
+#### MIG Slice-Ratio Scaling
+
+Since per-MIG utilization is unavailable, the parent's aggregate utilization is scaled proportionally:
+- MIG device attributes provide `gpuInstanceSliceCount` (e.g., 3 for 3g.40gb)
+- `MaxMigDeviceCount` provides total slices (e.g., 7 for H100)
+- Formula: `mig_util = parent_util × total_slices / mig_slices`
+- Example: parent=29%, slices=3/7 → MIG util ≈ 67%
+
+This is an **approximation** — it assumes all parent utilization comes from this MIG instance. Multiple active MIG instances would share the parent utilization.
+
+#### Memory Controller Utilization
+
+No fallback path exists for memory controller utilization on MIG with driver 535.x. It is displayed as "N/A" rather than a misleading 0%.
+
+> **Note:** NVIDIA driver 550+ (CUDA 12.4+) added proper `nvmlDeviceGetUtilizationRates()` support for MIG device handles, making all 3 fallback tiers unnecessary.
+
+### NVML API Latency Benchmark
+
+Measured on H100 PCIe, 1000 iterations per API call:
+
+| API Call | Avg Latency | Notes |
+|---|---|---|
+| `nvmlDeviceGetSamples(GPU_UTIL)` 2-phase | **835 µs** | New addition for MIG fallback |
+| `nvmlDeviceGetUtilizationRates()` (fails) | 202 µs | Fast even on failure path |
+| `temperature()` | 234 µs | Simple sensor read |
+| `power_usage()` | 3,592 µs | Most expensive (hardware SMBus) |
+| `clock_info(Graphics)` | 1,489 µs | Moderate |
+| `memory_info()` | 7 µs | Fastest |
+
+The new `nvmlDeviceGetSamples` call adds ~835µs per tick — less than 0.1% overhead at 1-second intervals, and cheaper than the existing `power_usage()` call.
+
+Buffer: 128 entries × 16 bytes = 2,048 bytes (reused via `RefCell<Vec>`, no per-tick allocation).
 
 ## Performance Optimization
 
@@ -446,6 +527,7 @@ Estimates for default settings (1-second interval), 1 GPU + 2 MIG instances:
 │   ├── ecc_errors (×2)        ~0.2ms   Corrected/Uncorrected
 │   ├── running_compute_procs  ~0.5ms
 │   └── (MIG) process_util     ~1-3ms   Per MIG instance, fallback only
+│   └── (MIG) gpu_util_samples ~0.8ms   nvmlDeviceGetSamples fallback, parent only
 ├── sysinfo refresh       ~0.1-0.3ms
 │   ├── refresh_cpu_usage      ~0.1ms   Reads /proc/stat
 │   └── refresh_memory         ~0.05ms  Reads /proc/meminfo
@@ -470,6 +552,7 @@ Total RSS ~4-8 MB
 ├── Reusable buffers                    ~5 KB
 │   ├── thread_local sparkline buf      ~2.4 KB
 │   ├── proc_sample_buf                 ~1 KB
+│   ├── gpu_sample_buf                    ~2 KB
 │   └── cpu_buf                         ~0.3 KB
 └── HashMap, String caches, etc.        ~5-10 KB
 ```
@@ -514,6 +597,7 @@ Total RSS ~4-8 MB
 | Optimization | Location | Effect |
 |-------------|----------|--------|
 | `utilization_rates()` first | `nvml.rs` | Try even on MIG, fallback to process util only on failure (saves 2 extra IPCs) |
+| `nvmlDeviceGetSamples` fallback | `nvml.rs` | Parent-level GPU util sampling when `utilization_rates()` fails on MIG, scaled by slice ratio — buffer reused via `RefCell<Vec>` |
 | Process util 2-pass | `nvml.rs` | 1st call with count=0 to get size, 2nd call to fetch data — prevents over-allocation |
 | `RefCell` interior mutability | `nvml.rs` | Allows cache/buffer mutation with `&self` while NVML handles borrow, no borrow checker conflicts |
 | Zero GPU resource usage | Design | NVML is read-only driver query — no CUDA context, no VRAM allocation |

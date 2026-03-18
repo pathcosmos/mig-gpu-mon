@@ -351,9 +351,13 @@ fn draw_gpu_list(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::White)
             };
+            let gpu_str = m.gpu_util.map_or("N/A".to_string(), |v| format!("{}%", v));
+            let mem_str = m
+                .memory_util
+                .map_or("N/A".to_string(), |v| format!("{}%", v));
             ListItem::new(format!(
-                "{} {} {}: {} | GPU:{}% Mem:{}%",
-                indicator, prefix, m.index, m.name, m.gpu_util, m.memory_util
+                "{} {} {}: {} | GPU:{} Mem:{}",
+                indicator, prefix, m.index, m.name, gpu_str, mem_str
             ))
             .style(style)
         })
@@ -438,16 +442,28 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     ]));
 
     // Line 5: GPU / Mem / SM util (compact horizontal)
+    let gpu_util_str = m.gpu_util.map_or("N/A".to_string(), |v| format!("{}%", v));
+    let mem_util_str = m
+        .memory_util
+        .map_or("N/A".to_string(), |v| format!("{}%", v));
     let mut util_spans = vec![
         Span::styled("GPU: ", Style::default().fg(Color::Green)),
         Span::styled(
-            format!("{}%", m.gpu_util),
-            Style::default().fg(Color::White),
+            gpu_util_str,
+            Style::default().fg(if m.gpu_util.is_some() {
+                Color::White
+            } else {
+                Color::DarkGray
+            }),
         ),
         Span::styled("  Mem: ", Style::default().fg(Color::Blue)),
         Span::styled(
-            format!("{}%", m.memory_util),
-            Style::default().fg(Color::White),
+            mem_util_str,
+            Style::default().fg(if m.memory_util.is_some() {
+                Color::White
+            } else {
+                Color::DarkGray
+            }),
         ),
     ];
     if let Some(sm) = m.sm_util {
@@ -687,7 +703,11 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     // GPU Utilization sparkline
     let gpu_title = app
         .selected_metrics()
-        .map(|m| format!(" GPU Util {}% ", m.gpu_util))
+        .map(|m| {
+            m.gpu_util.map_or(" GPU Util N/A ".to_string(), |v| {
+                format!(" GPU Util {}% ", v)
+            })
+        })
         .unwrap_or_else(|| " GPU Util ".to_string());
     with_spark_data_u32(&history.gpu_util, |data| {
         let sparkline = Sparkline::default()
@@ -705,7 +725,11 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     // Memory Controller Utilization sparkline
     let mem_ctrl_title = app
         .selected_metrics()
-        .map(|m| format!(" Mem Ctrl {}% ", m.memory_util))
+        .map(|m| {
+            m.memory_util.map_or(" Mem Ctrl N/A ".to_string(), |v| {
+                format!(" Mem Ctrl {}% ", v)
+            })
+        })
         .unwrap_or_else(|| " Mem Ctrl ".to_string());
     with_spark_data_u32(&history.memory_util, |data| {
         let sparkline = Sparkline::default()

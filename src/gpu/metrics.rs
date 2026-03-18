@@ -23,9 +23,9 @@ pub struct GpuMetrics {
     pub is_mig_instance: bool,
     pub parent_gpu_index: Option<u32>,
 
-    // Utilization (0-100%)
-    pub gpu_util: u32,
-    pub memory_util: u32,
+    // Utilization (0-100%) — None when driver/MIG doesn't support the query
+    pub gpu_util: Option<u32>,
+    pub memory_util: Option<u32>,
     pub sm_util: Option<u32>,
 
     // Memory (bytes)
@@ -131,8 +131,12 @@ impl MetricsHistory {
     }
 
     pub fn push(&mut self, metrics: &GpuMetrics) {
-        Self::push_ring(&mut self.gpu_util, metrics.gpu_util, self.max_entries);
-        Self::push_ring(&mut self.memory_util, metrics.memory_util, self.max_entries);
+        if let Some(val) = metrics.gpu_util {
+            Self::push_ring(&mut self.gpu_util, val, self.max_entries);
+        }
+        if let Some(val) = metrics.memory_util {
+            Self::push_ring(&mut self.memory_util, val, self.max_entries);
+        }
         Self::push_ring(
             &mut self.memory_used_mb,
             metrics.memory_used_mb(),

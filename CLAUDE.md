@@ -51,7 +51,11 @@ src/
 ## Key Design Decisions
 
 - MIG 환경에서 `nvidia-smi`가 제공하지 않는 메트릭은 NVML `nvmlDeviceGetMigDeviceHandleByIndex` → `nvmlDeviceGetUtilizationRates` 등으로 직접 수집
+- **3단계 MIG utilization 폴백**: (1) `utilization_rates()` → (2) `nvmlDeviceGetProcessUtilization()` → (3) `nvmlDeviceGetSamples(GPU_UTIL)` + MIG 슬라이스 비율 스케일링
+- 드라이버 535.x에서 모든 표준 utilization API가 MIG에서 실패 → 부모 GPU의 `nvmlDeviceGetSamples` raw 값(/10000)을 MIG `gpuInstanceSliceCount` 비율로 환산
+- `gpu_util`, `memory_util`은 `Option<u32>` — API 실패 시 0% 대신 "N/A" 표시로 오해 방지
 - 모든 확장 메트릭(clock, PCIe, ECC, throttle 등)은 `.ok()`로 래핑 → MIG/vGPU에서 실패 시 `None`으로 graceful 처리
-- 정적 메트릭(architecture, CC, temp thresholds 등)은 `DeviceInfo` 캐시에 1회만 수집
+- 정적 메트릭(architecture, CC, temp thresholds, MIG slice count 등)은 `DeviceInfo` 캐시에 1회만 수집
+- NVML 샘플 버퍼는 `RefCell<Vec<nvmlSample_t>>`로 grow-only 재사용 (tick당 할당 없음, ~2KB)
 - 폴링 주기 기본 1000ms, 사용자 설정 가능 (`--interval`)
 - GPU 인스턴스가 여러 개일 때 탭/스크롤로 전환

@@ -122,11 +122,13 @@ draw()
 MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 메트릭을 표시하지 못한다.
 `nvmlDeviceGetUtilizationRates()`가 MIG 디바이스 핸들에서 `NVML_ERROR_NOT_SUPPORTED`를 반환하기 때문이다.
 
-이 도구는 NVML C API를 직접 호출하여 이 제한을 우회한다:
+이 도구는 NVML C API를 직접 호출하는 **3단계 폴백 메커니즘**으로 이 제한을 우회한다:
 
-1. `nvmlDeviceGetMigDeviceHandleByIndex()` — MIG 인스턴스 핸들 획득
-2. `nvmlDeviceGetProcessUtilization()` — 프로세스별 SM/Memory utilization 수집
-3. 프로세스별 값을 집계하여 인스턴스 레벨의 GPU Util / Memory Util / SM Util 산출
+1. **1단계:** `nvmlDeviceGetUtilizationRates()` — 표준 API (비-MIG GPU에서 동작)
+2. **2단계:** `nvmlDeviceGetProcessUtilization()` — 프로세스별 SM/Memory utilization 수집 후 집계
+3. **3단계:** `nvmlDeviceGetSamples(GPU_UTILIZATION_SAMPLES)` — 부모 GPU 샘플링 + MIG 슬라이스 비율 스케일링
+
+모든 utilization API가 실패하면 (드라이버 535.x MIG에서 흔한 상황) 오해를 유발하는 0% 대신 "N/A"를 표시한다.
 
 ## Features
 
@@ -394,20 +396,99 @@ loop {
 
 ## MIG Utilization 수집 메커니즘
 
-MIG 환경에서 GPU/Memory utilization을 얻는 과정:
+### 3단계 폴백 아키텍처
+
+MIG 환경에서 GPU/Memory utilization 수집은 계단식 폴백 전략을 사용한다:
 
 ```
 nvmlDeviceGetMigDeviceHandleByIndex(parent, idx)
     → mig_handle
 
-nvmlDeviceGetUtilizationRates(mig_handle)
-    → 성공: gpu_util, memory_util 사용
-    → 실패 (NVML_ERROR_NOT_SUPPORTED):
-        nvmlDeviceGetProcessUtilization(mig_handle, samples, &count, 0)
-            → 1차 호출: count=0 → NVML_ERROR_INSUFFICIENT_SIZE, count에 필요 크기 반환
-            → 2차 호출: 버퍼 전달 → 프로세스별 smUtil, memUtil 수집
-            → max(smUtil), max(memUtil) 집계하여 인스턴스 레벨 값 산출
+1단계: nvmlDeviceGetUtilizationRates(mig_handle)
+    → 성공: gpu_util, memory_util 직접 사용
+    → 실패 (NVML_ERROR_NOT_SUPPORTED): 2단계로 진행
+
+2단계: nvmlDeviceGetProcessUtilization(mig_handle, samples, &count, 0)
+    → 1차 호출: count=0 → NVML_ERROR_INSUFFICIENT_SIZE, count에 필요 크기 반환
+    → 2차 호출: 버퍼 전달 → 프로세스별 smUtil, memUtil 수집
+    → max(smUtil), max(memUtil) 집계하여 인스턴스 레벨 값 산출
+    → 모든 샘플이 0이거나 fetch 실패 시: 3단계로 진행
+
+3단계: nvmlDeviceGetSamples(parent_handle, GPU_UTILIZATION_SAMPLES)
+    → 부모 GPU에서 raw utilization 샘플 수집 (20ms 간격)
+    → 최근 5개 샘플 평균, /10000으로 0-100% 스케일 변환
+    → MIG 슬라이스 비율로 스케일링: mig_util = parent_util × total_slices / mig_slices
+    → 예: parent=29%, MIG 3g.40gb → 29% × 7/3 ≈ 67%
+    → 불가능 시: "N/A" 표시
 ```
+
+### 드라이버 535.x MIG 제한사항 (심층 조사)
+
+**H100 PCIe + MIG 3g.40gb + 드라이버 535.129.03** 환경에서 광범위한 테스트 결과, 이 드라이버 버전에서는 **어떤 표준 NVML API로도** MIG 인스턴스별 GPU utilization 또는 메모리 컨트롤러 utilization을 수집할 수 없음을 확인했다.
+
+#### NVML API 테스트 결과 (드라이버 535.129.03)
+
+| NVML API | 부모 GPU | MIG 인스턴스 |
+|---|---|---|
+| `nvmlDeviceGetUtilizationRates()` | NotSupported (ret=3) | NotSupported (ret=3) |
+| `nvmlDeviceGetProcessUtilization()` | size query OK → fetch NotSupported | size query OK → fetch InvalidArg (ret=2) |
+| `nvmlDeviceGetSamples(GPU_UTIL)` | **동작** (119개 샘플, raw 값) | InvalidArg (ret=2) |
+| `nvmlDeviceGetSamples(MEM_UTIL)` | NotSupported | InvalidArg |
+| `nvmlDeviceGetFieldValues(GPU_UTIL=203)` | FAIL (ret=2) | "OK"이지만 val=0 (더미 데이터) |
+| `nvmlDeviceGetFieldValues(MEM_UTIL=204)` | FAIL (ret=2) | "OK"이지만 val=0 (더미 데이터) |
+
+#### 디바이스별 메트릭 가용성
+
+| 메트릭 | MIG 인스턴스 | 부모 GPU |
+|---|---|---|
+| VRAM 사용/총량 | OK | NoPermission |
+| Temperature | InvalidArg | OK |
+| Power usage | NotSupported | OK |
+| Clock speeds | NotSupported | OK |
+| PCIe throughput | InvalidArg | OK |
+| Process list | OK | - |
+| `nvmlDeviceGetSamples(GPU_UTIL)` | InvalidArg | **OK** (raw 값 ~290000 범위) |
+
+#### Raw 샘플 값 해석
+
+부모 디바이스의 `nvmlDeviceGetSamples(GPU_UTILIZATION_SAMPLES)` 반환값:
+- ~119개 샘플, 20ms 간격
+- 값 범위: ~230000-340000 (0-100%가 아님)
+- 10000으로 나누면 합리적인 utilization 퍼센트 산출 (~29%)
+- 여러 라운드에서 안정적으로 확인 (avg=291419, 292075, 292760)
+
+#### MIG 슬라이스 비율 스케일링
+
+MIG별 utilization 직접 수집이 불가하므로, 부모의 집계된 utilization을 비례 배분:
+- MIG 디바이스 속성에서 `gpuInstanceSliceCount` 제공 (예: 3g.40gb → 3)
+- `MaxMigDeviceCount`로 전체 슬라이스 수 확인 (예: H100 → 7)
+- 공식: `mig_util = parent_util × total_slices / mig_slices`
+- 예: parent=29%, slices=3/7 → MIG util ≈ 67%
+
+이것은 **근사값**이다 — 부모의 모든 utilization이 해당 MIG 인스턴스에서 발생한다고 가정한다. 여러 MIG 인스턴스가 동시에 활성화되면 부모 utilization이 분배된다.
+
+#### 메모리 컨트롤러 Utilization
+
+드라이버 535.x MIG에서 메모리 컨트롤러 utilization의 폴백 경로는 존재하지 않는다. 오해를 유발하는 0% 대신 "N/A"로 표시한다.
+
+> **참고:** NVIDIA 드라이버 550+ (CUDA 12.4+)부터 MIG 디바이스 핸들에서 `nvmlDeviceGetUtilizationRates()` 정식 지원이 추가되어, 3단계 폴백이 불필요해진다.
+
+### NVML API 지연시간 벤치마크
+
+H100 PCIe에서 API 호출당 1000회 반복 측정:
+
+| API 호출 | 평균 지연 | 비고 |
+|---|---|---|
+| `nvmlDeviceGetSamples(GPU_UTIL)` 2-phase | **835 µs** | MIG 폴백 신규 추가 |
+| `nvmlDeviceGetUtilizationRates()` (실패) | 202 µs | 실패 경로도 빠름 |
+| `temperature()` | 234 µs | 단순 센서 읽기 |
+| `power_usage()` | 3,592 µs | 가장 비싼 호출 (하드웨어 SMBus) |
+| `clock_info(Graphics)` | 1,489 µs | 보통 |
+| `memory_info()` | 7 µs | 가장 빠름 |
+
+신규 `nvmlDeviceGetSamples` 호출은 tick당 ~835µs 추가 — 1초 인터벌에서 0.1% 미만 오버헤드이며, 기존 `power_usage()` 호출보다 가볍다.
+
+버퍼: 128 entries × 16 bytes = 2,048 bytes (`RefCell<Vec>` 재사용, tick당 할당 없음).
 
 ## Performance Optimization
 
@@ -446,6 +527,7 @@ nvmlDeviceGetUtilizationRates(mig_handle)
 │   ├── ecc_errors (×2)        ~0.2ms   Corrected/Uncorrected
 │   ├── running_compute_procs  ~0.5ms
 │   └── (MIG) process_util     ~1-3ms   MIG 인스턴스당, 폴백 시에만
+│   └── (MIG) gpu_util_samples ~0.8ms   nvmlDeviceGetSamples 폴백, 부모 GPU만
 ├── sysinfo refresh       ~0.1-0.3ms
 │   ├── refresh_cpu_usage      ~0.1ms   /proc/stat 읽기
 │   └── refresh_memory         ~0.05ms  /proc/meminfo 읽기
@@ -470,6 +552,7 @@ nvmlDeviceGetUtilizationRates(mig_handle)
 ├── 재사용 버퍼들                        ~5 KB
 │   ├── thread_local sparkline buf        ~2.4 KB
 │   ├── proc_sample_buf                   ~1 KB
+│   ├── gpu_sample_buf                    ~2 KB
 │   └── cpu_buf                           ~0.3 KB
 └── HashMap, String 캐시 등              ~5-10 KB
 ```
@@ -514,6 +597,7 @@ nvmlDeviceGetUtilizationRates(mig_handle)
 | 최적화 | 위치 | 효과 |
 |--------|------|------|
 | `utilization_rates()` 우선 | `nvml.rs` | MIG에서도 일단 시도, 실패 시에만 process util 폴백 (추가 IPC 2회 절약) |
+| `nvmlDeviceGetSamples` 폴백 | `nvml.rs` | `utilization_rates()` MIG 실패 시 부모 GPU 레벨 샘플링 → 슬라이스 비율 스케일링, 버퍼 `RefCell<Vec>` 재사용 |
 | process util 2-pass | `nvml.rs` | 1차 count=0으로 크기 확인, 2차 데이터 수집 — 과다 버퍼 할당 방지 |
 | `RefCell` 내부 가변성 | `nvml.rs` | `&self`로 NVML 핸들 빌린 상태에서 캐시/버퍼 수정 가능, borrow checker 충돌 없이 |
 | GPU 자원 0 사용 | 설계 | NVML은 읽기 전용 드라이버 쿼리 — CUDA 컨텍스트 없음, VRAM 할당 없음 |
