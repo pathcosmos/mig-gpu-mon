@@ -758,14 +758,14 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     // VRAM Usage sparkline
     let vram_title = app
         .selected_metrics()
-        .map(|m| {
-            match (m.memory_used_mb(), m.memory_total_mb(), m.memory_percent()) {
+        .map(
+            |m| match (m.memory_used_mb(), m.memory_total_mb(), m.memory_percent()) {
                 (Some(used), Some(total), Some(pct)) => {
                     format!(" VRAM {}/{} MB ({:.1}%) ", used, total, pct)
                 }
                 _ => " VRAM N/A ".to_string(),
-            }
-        })
+            },
+        )
         .unwrap_or_else(|| " VRAM ".to_string());
     let vram_max = app
         .selected_metrics()

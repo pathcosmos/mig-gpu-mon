@@ -816,7 +816,7 @@ Estimates for default settings (1-second interval), 1 GPU + 2 MIG instances:
 | **RSS Memory** | **4~8 MB** | Binary + libnvidia-ml.so + history buffers + TUI buffers |
 | **GPU Compute** | **0% (unused)** | NVML is read-only driver IPC, no CUDA context created |
 | **GPU VRAM** | **0 MB (unused)** | No GPU memory allocation |
-| **Disk I/O** | **0** | No file reads/writes |
+| **Disk I/O** | **Effectively 0** | Only reads `/proc` (virtual procfs) — no actual disk access |
 | **Network** | **0** | No network communication |
 
 #### Per-Tick Time Breakdown (1-second interval)
@@ -837,7 +837,7 @@ Estimates for default settings (1-second interval), 1 GPU + 2 MIG instances:
 │   ├── throttle_reasons       ~0.1ms
 │   ├── encoder/decoder_util   ~0.2ms
 │   ├── ecc_errors (×2)        ~0.2ms   Corrected/Uncorrected
-│   ├── running_compute_procs  ~0.5ms
+│   ├── running_compute_procs  ~0.5ms   + /proc name reads for top-5 only (deferred I/O)
 │   └── (MIG) process_util     ~1-3ms   Per MIG instance, fallback only
 │   └── (MIG) gpu_util_samples ~0.8ms   nvmlDeviceGetSamples fallback, parent only
 ├── sysinfo refresh       ~0.1-0.3ms
@@ -891,10 +891,12 @@ Total RSS ~4-8 MB
 | CPU buffer zero-copy swap | `main.rs` | `Vec::clone()` every tick → `std::mem::take` + reclaim buffer from previous SystemMetrics (zero alloc after first tick) |
 | Sparkline conversion buffer | `dashboard.rs` | 5× `Vec<u64>` alloc per draw → `thread_local!` single scratch reuse |
 | Process partial sort | `nvml.rs` | O(n log n) full sort → O(n) `select_nth_unstable_by` (when > 5 processes) |
+| Deferred process name I/O | `nvml.rs` | Read `/proc/{pid}/comm` for all N processes → select top-5 first, read names for only 5 (up to 95% I/O reduction) |
 | CPU cores Vec reuse | `dashboard.rs` | Vec alloc per draw → `thread_local!` buffer reuse |
 | `make_bar()` string | `dashboard.rs` | `.repeat()` 2× concatenation → `String::with_capacity` + push loop |
 | HashMap uuid clone | `app.rs` | `uuid.clone()` every tick → `contains_key` then clone only on miss |
 | GPU history auto-cleanup | `app.rs` | Unbounded HashMap growth on MIG reconfig/GPU removal → `retain()` removes orphan UUID entries |
+| GPM sample + device cache auto-pruning | `nvml.rs` | Stale `nvmlGpmSample_t` + `DeviceInfo` leaked on MIG reconfig → per-tick active handle tracking + `retain()` + `nvmlGpmSampleFree()` |
 | NVML sample buffer shrink | `nvml.rs` | grow-only buffer could grow unbounded → auto `shrink_to(needed×2)` when capacity > needed×4 |
 | `format_pstate` zero-alloc | `nvml.rs` | `"P0".to_string()` per tick → returns `&'static str` (zero allocation) |
 | `format_architecture` zero-alloc | `nvml.rs` | Same pattern: `"Ampere".to_string()` → `&'static str` |
@@ -918,6 +920,8 @@ Total RSS ~4-8 MB
 | `nvmlDeviceGetSamples` fallback | `nvml.rs` | Parent-level GPU util sampling when `utilization_rates()` fails on MIG, scaled by slice ratio — buffer reused via `RefCell<Vec>` |
 | Process util 2-pass | `nvml.rs` | 1st call with count=0 to get size, 2nd call to fetch data — prevents over-allocation |
 | `RefCell` interior mutability | `nvml.rs` | Allows cache/buffer mutation with `&self` while NVML handles borrow, no borrow checker conflicts |
+| Deferred process name reads (top-5) | `nvml.rs` | Read `/proc` for all N processes → collect pid+VRAM only, select top-5, then read `/proc/{pid}/comm` for just 5 |
+| GPM + device cache per-tick pruning | `nvml.rs` | Track active handles → free stale `nvmlGpmSample_t` + remove `DeviceInfo`, prevents NVML resource leaks on MIG reconfig |
 | Zero GPU resource usage | Design | NVML is read-only driver query — no CUDA context, no VRAM allocation |
 
 ### Optimization Details: Binary Size
@@ -942,6 +946,7 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 |---------------------|----------|-------------|
 | VecDeque ring buffer (300 fixed) | `metrics.rs` | GPU/system history size fixed, cannot grow unbounded |
 | GPU history auto-cleanup | `app.rs` | Orphan entries auto-deleted on MIG reconfig/GPU removal |
+| GPM sample + device cache pruning | `nvml.rs` | Per-tick active handle tracking → frees stale `nvmlGpmSample_t` + removes `DeviceInfo`, no leaks across repeated MIG reconfigs |
 | NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > needed×4, recovers after transient spikes |
 | DeviceInfo cache (one-time) | `nvml.rs` | Static info (arch, CC, etc.) cached on first call, zero allocation thereafter |
 | sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |

@@ -164,12 +164,16 @@ impl NvmlCollector {
     pub fn collect_all(&self) -> Result<Vec<GpuMetrics>> {
         let device_count = self.nvml.device_count()?;
         let mut all_metrics = Vec::with_capacity(device_count as usize * 2);
+        // Track active device handles to prune stale cache entries (MIG reconfig / hot-remove)
+        let mut active_handles: Vec<usize> = Vec::with_capacity(device_count as usize * 8);
 
         for i in 0..device_count {
             let device = self.nvml.device_by_index(i)?;
+            active_handles.push(unsafe { device.handle() } as usize);
 
             if self.is_mig_enabled(&device) {
-                if let Ok(mig_metrics) = self.collect_mig_instances(&device, i) {
+                if let Ok(mig_metrics) = self.collect_mig_instances(&device, i, &mut active_handles)
+                {
                     all_metrics.extend(mig_metrics);
                 }
             }
@@ -178,6 +182,10 @@ impl NvmlCollector {
                 all_metrics.push(metrics);
             }
         }
+
+        // Prune stale cache entries for removed GPUs / reconfigured MIG instances.
+        // Prevents unbounded HashMap growth and frees NVML-allocated GPM samples.
+        self.prune_stale_caches(&active_handles);
 
         Ok(all_metrics)
     }
@@ -198,6 +206,7 @@ impl NvmlCollector {
         &self,
         parent_device: &Device,
         gpu_index: u32,
+        active_handles: &mut Vec<usize>,
     ) -> Result<Vec<GpuMetrics>> {
         let mut mig_metrics = Vec::new();
 
@@ -236,6 +245,7 @@ impl NvmlCollector {
                 if ret != 0 || mig_handle.is_null() {
                     continue;
                 }
+                active_handles.push(mig_handle as usize);
 
                 let mig_device = Device::new(mig_handle, &self.nvml);
 
@@ -616,28 +626,34 @@ impl NvmlCollector {
         let (process_count, top_processes) = match device.running_compute_processes() {
             Ok(procs) => {
                 let count = procs.len() as u32;
-                let mut proc_infos: Vec<GpuProcessInfo> = procs
+                // Phase 1: collect pid + VRAM only (defer /proc reads to avoid O(n) I/O)
+                let mut entries: Vec<(u32, u64)> = procs
                     .iter()
                     .filter_map(|p| {
                         let vram = match p.used_gpu_memory {
                             UsedGpuMemory::Used(bytes) => bytes,
                             UsedGpuMemory::Unavailable => return None,
                         };
-                        Some(GpuProcessInfo {
-                            pid: p.pid,
-                            name: Self::process_name(p.pid),
-                            vram_used: vram,
-                        })
+                        Some((p.pid, vram))
                     })
                     .collect();
-                // Partial sort optimization: O(n) select for top-5 instead of O(n log n) full sort
-                if proc_infos.len() > 5 {
-                    proc_infos.select_nth_unstable_by(4, |a, b| b.vram_used.cmp(&a.vram_used));
-                    proc_infos.truncate(5);
-                    proc_infos.sort_by(|a, b| b.vram_used.cmp(&a.vram_used));
+                // Phase 2: partial sort for top-5 by VRAM (no /proc reads yet)
+                if entries.len() > 5 {
+                    entries.select_nth_unstable_by(4, |a, b| b.1.cmp(&a.1));
+                    entries.truncate(5);
+                    entries.sort_by(|a, b| b.1.cmp(&a.1));
                 } else {
-                    proc_infos.sort_by(|a, b| b.vram_used.cmp(&a.vram_used));
+                    entries.sort_by(|a, b| b.1.cmp(&a.1));
                 }
+                // Phase 3: read /proc names only for top-5 (not all N processes)
+                let proc_infos: Vec<GpuProcessInfo> = entries
+                    .into_iter()
+                    .map(|(pid, vram)| GpuProcessInfo {
+                        pid,
+                        name: Self::process_name(pid),
+                        vram_used: vram,
+                    })
+                    .collect();
                 (count, proc_infos)
             }
             Err(_) => (0, Vec::new()),
@@ -709,6 +725,28 @@ impl NvmlCollector {
                 format!("{major}.{minor}")
             })
             .unwrap_or_else(|_| "Unknown".to_string())
+    }
+
+    /// Remove cache entries for device handles that were not seen during this tick.
+    /// Prevents unbounded growth of device_cache / gpm_prev_samples on MIG reconfig or GPU hot-remove.
+    fn prune_stale_caches(&self, active_handles: &[usize]) {
+        self.device_cache
+            .borrow_mut()
+            .retain(|k, _| active_handles.contains(k));
+
+        let raw_lib = &self.raw_lib;
+        self.gpm_prev_samples.borrow_mut().retain(|k, sample| {
+            if active_handles.contains(k) {
+                true
+            } else {
+                if !sample.is_null() {
+                    unsafe {
+                        raw_lib.nvmlGpmSampleFree(*sample);
+                    }
+                }
+                false
+            }
+        });
     }
 }
 

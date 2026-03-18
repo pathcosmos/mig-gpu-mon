@@ -816,7 +816,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | **RSS 메모리** | **4~8 MB** | 바이너리 + libnvidia-ml.so + 히스토리 버퍼 + TUI 버퍼 |
 | **GPU 연산 자원** | **0% (사용 안 함)** | NVML은 읽기 전용 드라이버 IPC, CUDA 컨텍스트 미생성 |
 | **GPU VRAM** | **0 MB (사용 안 함)** | GPU 메모리 할당 없음 |
-| **디스크 I/O** | **0** | 파일 읽기/쓰기 없음 |
+| **디스크 I/O** | **사실상 0** | `/proc` (procfs 가상 FS) 읽기만 — 실제 디스크 접근 없음 |
 | **네트워크** | **0** | 네트워크 통신 없음 |
 
 #### tick당 시간 분해 (1초 interval 기준)
@@ -837,7 +837,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 │   ├── throttle_reasons       ~0.1ms
 │   ├── encoder/decoder_util   ~0.2ms
 │   ├── ecc_errors (×2)        ~0.2ms   Corrected/Uncorrected
-│   ├── running_compute_procs  ~0.5ms
+│   ├── running_compute_procs  ~0.5ms   + top-5만 /proc 이름 읽기 (지연 I/O)
 │   └── (MIG) process_util     ~1-3ms   MIG 인스턴스당, 폴백 시에만
 │   └── (MIG) gpu_util_samples ~0.8ms   nvmlDeviceGetSamples 폴백, 부모 GPU만
 ├── sysinfo refresh       ~0.1-0.3ms
@@ -891,10 +891,12 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | CPU 버퍼 zero-copy 스왑 | `main.rs` | 매 tick `Vec::clone()` → `std::mem::take` + 이전 SystemMetrics에서 버퍼 회수 (첫 tick 이후 할당 0) |
 | sparkline 변환 버퍼 | `dashboard.rs` | draw마다 5개 `Vec<u64>` 할당 → `thread_local!` scratch 1개 재사용 |
 | 프로세스 partial sort | `nvml.rs` | O(n log n) 전체 정렬 → O(n) `select_nth_unstable_by` (프로세스 > 5일 때) |
+| 프로세스 이름 지연 읽기 | `nvml.rs` | 모든 프로세스 N개의 `/proc/{pid}/comm` 읽기 → top-5 선별 후 5개만 읽기 (I/O 최대 95% 감소) |
 | CPU cores Vec 재사용 | `dashboard.rs` | 매 draw마다 Vec 할당 → `thread_local!` 버퍼 재사용 |
 | `make_bar()` 문자열 | `dashboard.rs` | `.repeat()` 2회 연결 → `String::with_capacity` + push loop |
 | HashMap uuid clone | `app.rs` | 매 tick `uuid.clone()` → `contains_key` 후 miss 시에만 clone |
 | GPU 히스토리 자동 정리 | `app.rs` | MIG 재구성/GPU 제거 시 HashMap 엔트리 무한 증가 → `retain()`으로 사라진 UUID 자동 제거 |
+| GPM 샘플·디바이스 캐시 자동 정리 | `nvml.rs` | MIG 재구성 시 stale handle의 `nvmlGpmSample_t` + `DeviceInfo` 무한 잔류 → 매 tick active handle 추적 후 `retain()` + `nvmlGpmSampleFree()` |
 | NVML 샘플 버퍼 shrink | `nvml.rs` | grow-only 버퍼 무한 증가 가능 → capacity > needed×4 시 `shrink_to(needed×2)` 자동 축소 |
 | `format_pstate` 제로 할당 | `nvml.rs` | 매 tick `"P0".to_string()` String 할당 → `&'static str` 반환 (할당 0) |
 | `format_architecture` 제로 할당 | `nvml.rs` | 동일 패턴: `"Ampere".to_string()` → `&'static str` |
@@ -918,6 +920,8 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | `nvmlDeviceGetSamples` 폴백 | `nvml.rs` | `utilization_rates()` MIG 실패 시 부모 GPU 레벨 샘플링 → 슬라이스 비율 스케일링, 버퍼 `RefCell<Vec>` 재사용 |
 | process util 2-pass | `nvml.rs` | 1차 count=0으로 크기 확인, 2차 데이터 수집 — 과다 버퍼 할당 방지 |
 | `RefCell` 내부 가변성 | `nvml.rs` | `&self`로 NVML 핸들 빌린 상태에서 캐시/버퍼 수정 가능, borrow checker 충돌 없이 |
+| 프로세스 이름 지연 읽기 (top-5) | `nvml.rs` | 모든 프로세스 `/proc` 읽기 → pid+VRAM만 수집 후 top-5 선별 → 5개만 `/proc/{pid}/comm` 읽기 |
+| GPM·디바이스 캐시 tick별 정리 | `nvml.rs` | active handle 추적 → stale `nvmlGpmSample_t` free + `DeviceInfo` 제거, MIG 재구성 시 NVML 리소스 누수 방지 |
 | GPU 자원 0 사용 | 설계 | NVML은 읽기 전용 드라이버 쿼리 — CUDA 컨텍스트 없음, VRAM 할당 없음 |
 
 ### 최적화 상세: Binary Size
@@ -942,6 +946,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 |-------------|------|------|
 | VecDeque 링 버퍼 (300 고정) | `metrics.rs` | GPU/시스템 히스토리 크기 고정, 무한 증가 불가 |
 | GPU 히스토리 자동 정리 | `app.rs` | MIG 재구성/GPU 제거 시 orphan 엔트리 자동 삭제 |
+| GPM 샘플·디바이스 캐시 정리 | `nvml.rs` | 매 tick active handle 추적 → stale `nvmlGpmSample_t` free + `DeviceInfo` 제거, MIG 재구성 반복 시에도 누수 없음 |
 | NVML 샘플 버퍼 shrink-to-fit | `nvml.rs` | capacity > needed×4 시 자동 축소, 일시적 급증 후 복구 |
 | DeviceInfo 캐시 1회 수집 | `nvml.rs` | 정적 정보(arch, CC 등)는 첫 호출 시 캐시, 이후 0 할당 |
 | sysinfo targeted refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 호출, 프로세스 누적 없음 |

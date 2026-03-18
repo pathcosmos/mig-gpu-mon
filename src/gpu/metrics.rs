@@ -152,8 +152,16 @@ impl MetricsHistory {
             metrics.clock_graphics_mhz,
             self.max_entries,
         );
-        Self::push_or_repeat(&mut self.pcie_tx_kbps, metrics.pcie_tx_kbps, self.max_entries);
-        Self::push_or_repeat(&mut self.pcie_rx_kbps, metrics.pcie_rx_kbps, self.max_entries);
+        Self::push_or_repeat(
+            &mut self.pcie_tx_kbps,
+            metrics.pcie_tx_kbps,
+            self.max_entries,
+        );
+        Self::push_or_repeat(
+            &mut self.pcie_rx_kbps,
+            metrics.pcie_rx_kbps,
+            self.max_entries,
+        );
     }
 
     /// Push value if Some, otherwise repeat last known value to keep sparkline rolling.
