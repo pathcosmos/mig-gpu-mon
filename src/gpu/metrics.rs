@@ -43,7 +43,7 @@ pub struct GpuMetrics {
     pub top_processes: Vec<GpuProcessInfo>,
 
     // --- Static info (cached, collected once) ---
-    pub architecture: Option<String>, // "Ampere", "Hopper" etc.
+    pub architecture: Option<&'static str>, // "Ampere", "Hopper" etc.
     pub compute_capability: Option<String>, // "8.0", "9.0" etc.
     pub ecc_enabled: Option<bool>,
     pub temp_shutdown: Option<u32>, // shutdown threshold °C
@@ -57,10 +57,10 @@ pub struct GpuMetrics {
     pub pcie_rx_kbps: Option<u32>,
     pub pcie_gen: Option<u32>,
     pub pcie_width: Option<u32>,
-    pub performance_state: Option<String>, // "P0"~"P15"
-    pub throttle_reasons: Option<String>,  // "None" or "SwPwrCap, HW-Therm"
-    pub encoder_util: Option<u32>,         // 0-100%
-    pub decoder_util: Option<u32>,         // 0-100%
+    pub performance_state: Option<&'static str>, // "P0"~"P15"
+    pub throttle_reasons: Option<String>,        // "None" or "SwPwrCap, HW-Therm"
+    pub encoder_util: Option<u32>,               // 0-100%
+    pub decoder_util: Option<u32>,               // 0-100%
     pub ecc_errors_corrected: Option<u64>,
     pub ecc_errors_uncorrected: Option<u64>,
 }

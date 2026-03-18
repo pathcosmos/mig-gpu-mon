@@ -12,6 +12,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 use app::App;
@@ -88,23 +89,36 @@ fn main() -> Result<()> {
     // Prime CPU measurements (first call always returns 0)
     sys.refresh_cpu_usage();
 
-    // Pre-allocate reusable buffer for CPU usage
     let cpu_count = sys.cpus().len();
-    let mut cpu_buf: Vec<f32> = Vec::with_capacity(cpu_count);
+    let tick_rate = Duration::from_millis(cli.interval);
 
-    // Setup terminal
+    // Setup terminal — with panic hook to restore terminal state on crash
     enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+
+    // Install panic hook AFTER enabling raw mode so it can clean up
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // App state
     let mut app = App::new(driver, cuda);
-    let events = EventHandler::new(cli.interval);
+    let events = EventHandler::new();
 
-    // Main loop
+    // Reusable buffer for per-core CPU usage
+    let mut cpu_buf: Vec<f32> = Vec::with_capacity(cpu_count);
+
+    // Main loop — drift-corrected: actual period ≈ tick_rate regardless of work time
     while app.running {
+        let tick_start = Instant::now();
+
         // Collect GPU metrics
         match collector.collect_all() {
             Ok(metrics) => app.update_metrics(metrics),
@@ -123,8 +137,11 @@ fn main() -> Result<()> {
             cpu_buf.iter().sum::<f32>() / cpu_buf.len() as f32
         };
 
+        // Move cpu_buf into SystemMetrics, replace with a fresh buffer.
+        // Next tick, we reclaim the previous buffer from app to avoid allocation.
+        let cpu_usage = std::mem::take(&mut cpu_buf);
         app.update_system_metrics(SystemMetrics {
-            cpu_usage: cpu_buf.clone(),
+            cpu_usage,
             cpu_total,
             ram_used: sys.used_memory(),
             ram_total: sys.total_memory(),
@@ -135,8 +152,18 @@ fn main() -> Result<()> {
         // Draw
         terminal.draw(|f| ui::dashboard::draw(f, &app))?;
 
-        // Handle events (blocks up to tick_rate)
-        match events.next()? {
+        // Reclaim cpu buffer from previous SystemMetrics for reuse (zero-alloc after first tick)
+        if let Some(ref mut sm) = app.system_metrics {
+            cpu_buf = std::mem::take(&mut sm.cpu_usage);
+            // Ensure capacity is sufficient
+            if cpu_buf.capacity() < cpu_count {
+                cpu_buf.reserve(cpu_count - cpu_buf.capacity());
+            }
+        }
+
+        // Handle events — subtract elapsed work time to maintain consistent tick rate
+        let remaining = tick_rate.saturating_sub(tick_start.elapsed());
+        match events.next(remaining)? {
             AppEvent::Key(key) => match key.code {
                 KeyCode::Tab | KeyCode::Down | KeyCode::Right => app.next_gpu(),
                 KeyCode::BackTab | KeyCode::Up | KeyCode::Left => app.prev_gpu(),

@@ -382,6 +382,7 @@ src/
 
 ```
 loop {
+    tick_start = Instant::now()
     1. GPU 메트릭 수집 (NVML API)
        - 물리 GPU: utilization_rates(), memory_info(), temperature(), ...
        - MIG 인스턴스: utilization_rates() 실패 시
@@ -389,7 +390,9 @@ loop {
     2. 시스템 메트릭 수집 (sysinfo)
        - CPU 코어별 usage, 총 RAM/Swap
     3. TUI 렌더링 (ratatui)
-    4. 이벤트 대기 (crossterm poll, interval 만큼 블로킹)
+    4. CPU 버퍼 재활용 (이전 SystemMetrics에서 회수 → zero-alloc)
+    5. 이벤트 대기 (crossterm poll, interval - elapsed 만큼 블로킹)
+       - 드리프트 보정: 작업 시간을 빼고 남은 시간만 poll
        - 키 입력 처리 또는 tick → 다음 루프
 }
 ```
@@ -576,12 +579,17 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | `VecDeque` 링 버퍼 | `metrics.rs` | `Vec::remove(0)` O(n) memmove → `VecDeque::pop_front()` O(1) |
 | 디바이스 정보 캐시 | `nvml.rs` | 매 tick NVML API + String 할당 → `RefCell<HashMap>` 첫 호출만, 이후 캐시 히트 |
 | process sample 버퍼 | `nvml.rs` | MIG 호출마다 `vec![zeroed(); N]` 할당/해제 → `RefCell<Vec>` grow-only 재사용 |
-| CPU 버퍼 재사용 | `main.rs` | 매 tick `Vec::new()` → `cpu_buf.clear()` + extend (용량 유지) |
+| CPU 버퍼 zero-copy 스왑 | `main.rs` | 매 tick `Vec::clone()` → `std::mem::take` + 이전 SystemMetrics에서 버퍼 회수 (첫 tick 이후 할당 0) |
 | sparkline 변환 버퍼 | `dashboard.rs` | draw마다 5개 `Vec<u64>` 할당 → `thread_local!` scratch 1개 재사용 |
 | 프로세스 partial sort | `nvml.rs` | O(n log n) 전체 정렬 → O(n) `select_nth_unstable_by` (프로세스 > 5일 때) |
 | CPU cores Vec 재사용 | `dashboard.rs` | 매 draw마다 Vec 할당 → `thread_local!` 버퍼 재사용 |
 | `make_bar()` 문자열 | `dashboard.rs` | `.repeat()` 2회 연결 → `String::with_capacity` + push loop |
 | HashMap uuid clone | `app.rs` | 매 tick `uuid.clone()` → `contains_key` 후 miss 시에만 clone |
+| GPU 히스토리 자동 정리 | `app.rs` | MIG 재구성/GPU 제거 시 HashMap 엔트리 무한 증가 → `retain()`으로 사라진 UUID 자동 제거 |
+| NVML 샘플 버퍼 shrink | `nvml.rs` | grow-only 버퍼 무한 증가 가능 → capacity > needed×4 시 `shrink_to(needed×2)` 자동 축소 |
+| `format_pstate` 제로 할당 | `nvml.rs` | 매 tick `"P0".to_string()` String 할당 → `&'static str` 반환 (할당 0) |
+| `format_architecture` 제로 할당 | `nvml.rs` | 동일 패턴: `"Ampere".to_string()` → `&'static str` |
+| `format_throttle_reasons` Vec 제거 | `nvml.rs` | `Vec::new()` + `push` + `join()` → macro로 `String`에 직접 append (Vec 할당 제거) |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
@@ -591,6 +599,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | 타겟 refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 — /proc/stat, /proc/meminfo 2개만 읽기 |
 | 기본 interval 1000ms | `main.rs` | 500ms 대비 모든 시스콜+NVML 호출 횟수 절반 |
 | CPU priming | `main.rs` | sysinfo 첫 `refresh_cpu_usage()` 0% 반환 방지 — 초기화 시 1회 선호출 |
+| 드리프트 보정 tick 루프 | `main.rs` | `작업시간 + interval` 누적 밀림 → `Instant` 기반 경과시간 측정, `interval - elapsed`만 poll |
 
 ### 최적화 상세: GPU (NVML 호출 최소화)
 
@@ -609,8 +618,41 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | `opt-level` | 3 | 최대 최적화 |
 | `lto` | true | Link-Time Optimization, 미사용 코드 제거 |
 | `strip` | true | 디버그 심볼 완전 제거 |
+| `codegen-units` | 1 | 단일 코드 생성 단위로 전체 최적화 (빌드 느려짐, 런타임 빨라짐) |
+| `panic` | "abort" | unwind 코드 제거 — 바이너리 크기 감소 + 패닉 시 즉시 종료 |
 | `tokio` 제거 | — | async 미사용, 동기 이벤트 루프로 충분 — 바이너리 ~200KB 절약 |
 | 최종 크기 | **~1.5MB** | 단일 바이너리 (libc 동적 링크) |
+
+## Runtime Stability (장시간 운영 안전성)
+
+24/7 운영 시 메모리 증가나 리소스 누수 없이 안정적으로 동작하도록 설계되었다.
+
+### 메모리 안정성
+
+| 보호 메커니즘 | 위치 | 설명 |
+|-------------|------|------|
+| VecDeque 링 버퍼 (300 고정) | `metrics.rs` | GPU/시스템 히스토리 크기 고정, 무한 증가 불가 |
+| GPU 히스토리 자동 정리 | `app.rs` | MIG 재구성/GPU 제거 시 orphan 엔트리 자동 삭제 |
+| NVML 샘플 버퍼 shrink-to-fit | `nvml.rs` | capacity > needed×4 시 자동 축소, 일시적 급증 후 복구 |
+| DeviceInfo 캐시 1회 수집 | `nvml.rs` | 정적 정보(arch, CC 등)는 첫 호출 시 캐시, 이후 0 할당 |
+| sysinfo targeted refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 호출, 프로세스 누적 없음 |
+
+### 장시간 메모리 사용량 예측
+
+```
+시작 직후:  ~4 MB RSS
+5분 후:     ~5-8 MB RSS (히스토리 버퍼 300개 채워짐)
+5분 이후:   변동 없음 (링 버퍼 → 정상 상태 유지)
+```
+
+### 런타임 안전성
+
+| 보호 메커니즘 | 위치 | 설명 |
+|-------------|------|------|
+| 패닉 복구 훅 | `main.rs` | 패닉 발생 시 `disable_raw_mode()` + `LeaveAlternateScreen` 자동 호출 → 터미널 상태 복구 |
+| 드리프트 보정 타이머 | `main.rs` | `Instant` 기반 경과시간 측정 → 작업 시간 빼고 남은 시간만 poll, 누적 밀림 방지 |
+| Option 기반 graceful 실패 | `nvml.rs` | 모든 확장 메트릭 `.ok()` 래핑 → MIG/vGPU 실패 시 `None` ("N/A") 표시, 패닉 없음 |
+| `saturating_sub` 시간 계산 | `main.rs` | 작업 시간 > interval 시에도 음수 없이 즉시 다음 틱 진행 |
 
 ## Why Rust
 

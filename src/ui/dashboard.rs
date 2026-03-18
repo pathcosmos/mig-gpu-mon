@@ -398,15 +398,12 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::White),
         ),
     ];
-    if let Some(ref arch) = m.architecture {
+    if let Some(arch) = m.architecture {
         uuid_spans.push(Span::styled(
             "  Arch: ",
             Style::default().fg(Color::DarkGray),
         ));
-        uuid_spans.push(Span::styled(
-            arch.as_str(),
-            Style::default().fg(Color::Cyan),
-        ));
+        uuid_spans.push(Span::styled(arch, Style::default().fg(Color::Cyan)));
     }
     if let Some(ref cc) = m.compute_capability {
         uuid_spans.push(Span::styled("  CC: ", Style::default().fg(Color::DarkGray)));
@@ -516,12 +513,12 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Cyan),
             ));
         }
-        if let Some(ref ps) = m.performance_state {
+        if let Some(ps) = m.performance_state {
             if !clk_spans.is_empty() {
                 clk_spans.push(Span::raw("  "));
             }
             let ps_color = pstate_color(ps);
-            clk_spans.push(Span::styled(ps.as_str(), Style::default().fg(ps_color)));
+            clk_spans.push(Span::styled(ps, Style::default().fg(ps_color)));
         }
         if !clk_spans.is_empty() {
             lines.push(Line::from(clk_spans));

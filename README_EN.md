@@ -382,6 +382,7 @@ src/
 
 ```
 loop {
+    tick_start = Instant::now()
     1. Collect GPU metrics (NVML API)
        - Physical GPU: utilization_rates(), memory_info(), temperature(), ...
        - MIG instance: on utilization_rates() failure
@@ -389,7 +390,9 @@ loop {
     2. Collect system metrics (sysinfo)
        - Per-core CPU usage, total RAM/Swap
     3. TUI rendering (ratatui)
-    4. Wait for events (crossterm poll, blocks for interval duration)
+    4. Reclaim CPU buffer (recover from previous SystemMetrics → zero-alloc)
+    5. Wait for events (crossterm poll, blocks for interval - elapsed)
+       - Drift-corrected: subtracts work time, polls only remaining duration
        - Process key input or tick → next loop iteration
 }
 ```
@@ -576,12 +579,17 @@ Total RSS ~4-8 MB
 | `VecDeque` ring buffer | `metrics.rs` | `Vec::remove(0)` O(n) memmove → `VecDeque::pop_front()` O(1) |
 | Device info cache | `nvml.rs` | NVML API + String alloc every tick → `RefCell<HashMap>` first call only, cache hit thereafter |
 | Process sample buffer | `nvml.rs` | `vec![zeroed(); N]` alloc/dealloc per MIG call → `RefCell<Vec>` grow-only reuse |
-| CPU buffer reuse | `main.rs` | `Vec::new()` every tick → `cpu_buf.clear()` + extend (capacity retained) |
+| CPU buffer zero-copy swap | `main.rs` | `Vec::clone()` every tick → `std::mem::take` + reclaim buffer from previous SystemMetrics (zero alloc after first tick) |
 | Sparkline conversion buffer | `dashboard.rs` | 5× `Vec<u64>` alloc per draw → `thread_local!` single scratch reuse |
 | Process partial sort | `nvml.rs` | O(n log n) full sort → O(n) `select_nth_unstable_by` (when > 5 processes) |
 | CPU cores Vec reuse | `dashboard.rs` | Vec alloc per draw → `thread_local!` buffer reuse |
 | `make_bar()` string | `dashboard.rs` | `.repeat()` 2× concatenation → `String::with_capacity` + push loop |
 | HashMap uuid clone | `app.rs` | `uuid.clone()` every tick → `contains_key` then clone only on miss |
+| GPU history auto-cleanup | `app.rs` | Unbounded HashMap growth on MIG reconfig/GPU removal → `retain()` removes orphan UUID entries |
+| NVML sample buffer shrink | `nvml.rs` | grow-only buffer could grow unbounded → auto `shrink_to(needed×2)` when capacity > needed×4 |
+| `format_pstate` zero-alloc | `nvml.rs` | `"P0".to_string()` per tick → returns `&'static str` (zero allocation) |
+| `format_architecture` zero-alloc | `nvml.rs` | Same pattern: `"Ampere".to_string()` → `&'static str` |
+| `format_throttle_reasons` Vec removal | `nvml.rs` | `Vec::new()` + `push` + `join()` → macro appends directly to `String` (eliminates Vec allocation) |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
@@ -591,6 +599,7 @@ Total RSS ~4-8 MB
 | Targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` — reads just /proc/stat and /proc/meminfo |
 | Default interval 1000ms | `main.rs` | Halves all syscall + NVML call frequency vs 500ms |
 | CPU priming | `main.rs` | Prevents sysinfo's first `refresh_cpu_usage()` returning 0% — one pre-call at init |
+| Drift-corrected tick loop | `main.rs` | Cumulative drift from `work_time + interval` → `Instant`-based elapsed measurement, poll only `interval - elapsed` |
 
 ### Optimization Details: GPU (Minimize NVML Calls)
 
@@ -609,8 +618,41 @@ Total RSS ~4-8 MB
 | `opt-level` | 3 | Maximum optimization |
 | `lto` | true | Link-Time Optimization, dead code elimination |
 | `strip` | true | Complete debug symbol removal |
+| `codegen-units` | 1 | Single codegen unit for whole-program optimization (slower build, faster runtime) |
+| `panic` | "abort" | Removes unwind code — smaller binary + immediate exit on panic |
 | `tokio` removal | — | No async needed, synchronous event loop suffices — saves ~200KB |
 | Final size | **~1.5MB** | Single binary (dynamically links libc) |
+
+## Runtime Stability (Long-Running Safety)
+
+Designed for stable 24/7 operation with no memory growth or resource leaks.
+
+### Memory Stability
+
+| Protection Mechanism | Location | Description |
+|---------------------|----------|-------------|
+| VecDeque ring buffer (300 fixed) | `metrics.rs` | GPU/system history size fixed, cannot grow unbounded |
+| GPU history auto-cleanup | `app.rs` | Orphan entries auto-deleted on MIG reconfig/GPU removal |
+| NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > needed×4, recovers after transient spikes |
+| DeviceInfo cache (one-time) | `nvml.rs` | Static info (arch, CC, etc.) cached on first call, zero allocation thereafter |
+| sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |
+
+### Long-Running Memory Profile
+
+```
+At startup:     ~4 MB RSS
+After 5 min:    ~5-8 MB RSS (history buffers fill to 300 entries)
+After 5 min:    No change (ring buffer → steady state maintained)
+```
+
+### Runtime Safety
+
+| Protection Mechanism | Location | Description |
+|---------------------|----------|-------------|
+| Panic recovery hook | `main.rs` | On panic: auto-calls `disable_raw_mode()` + `LeaveAlternateScreen` → terminal state restored |
+| Drift-corrected timer | `main.rs` | `Instant`-based elapsed measurement → subtracts work time from interval, prevents cumulative drift |
+| Option-based graceful failure | `nvml.rs` | All extended metrics wrapped with `.ok()` → `None` ("N/A") on MIG/vGPU failure, no panics |
+| `saturating_sub` time calc | `main.rs` | Even if work_time > interval, no negative values — immediately proceeds to next tick |
 
 ## Why Rust
 

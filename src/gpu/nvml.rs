@@ -22,7 +22,7 @@ use super::metrics::{GpuMetrics, GpuProcessInfo};
 struct DeviceInfo {
     name: String,
     uuid: String,
-    architecture: Option<String>,
+    architecture: Option<&'static str>,
     compute_capability: Option<String>,
     ecc_enabled: Option<bool>,
     temp_shutdown: Option<u32>,
@@ -293,9 +293,16 @@ impl NvmlCollector {
             return (0, 0);
         }
 
+        // Shrink buffer if it grew much larger than needed (prevent unbounded growth)
+        let actual = count as usize;
+        if buf.capacity() > actual.max(32) * 4 {
+            buf.truncate(actual);
+            buf.shrink_to(actual * 2);
+        }
+
         let mut max_sm: u32 = 0;
         let mut max_mem: u32 = 0;
-        for sample in &buf[..count as usize] {
+        for sample in &buf[..actual] {
             if sample.smUtil <= 100 {
                 max_sm = max_sm.max(sample.smUtil);
             }
@@ -347,10 +354,17 @@ impl NvmlCollector {
             return None;
         }
 
+        // Shrink buffer if it grew much larger than needed (prevent unbounded growth)
+        let actual = count as usize;
+        if buf.capacity() > actual.max(128) * 4 {
+            buf.truncate(actual);
+            buf.shrink_to(actual * 2);
+        }
+
         // Use last ~5 samples for a responsive average (not all 120)
-        let n = (count as usize).min(5);
-        let start = count as usize - n;
-        let sum: u64 = buf[start..count as usize]
+        let n = actual.min(5);
+        let start = actual - n;
+        let sum: u64 = buf[start..actual]
             .iter()
             .map(|s| s.sampleValue.uiVal as u64)
             .sum();
@@ -556,79 +570,74 @@ impl NvmlCollector {
     }
 }
 
-fn format_pstate(ps: PerformanceState) -> String {
+fn format_pstate(ps: PerformanceState) -> &'static str {
     match ps {
-        PerformanceState::Zero => "P0".to_string(),
-        PerformanceState::One => "P1".to_string(),
-        PerformanceState::Two => "P2".to_string(),
-        PerformanceState::Three => "P3".to_string(),
-        PerformanceState::Four => "P4".to_string(),
-        PerformanceState::Five => "P5".to_string(),
-        PerformanceState::Six => "P6".to_string(),
-        PerformanceState::Seven => "P7".to_string(),
-        PerformanceState::Eight => "P8".to_string(),
-        PerformanceState::Nine => "P9".to_string(),
-        PerformanceState::Ten => "P10".to_string(),
-        PerformanceState::Eleven => "P11".to_string(),
-        PerformanceState::Twelve => "P12".to_string(),
-        PerformanceState::Thirteen => "P13".to_string(),
-        PerformanceState::Fourteen => "P14".to_string(),
-        PerformanceState::Fifteen => "P15".to_string(),
-        PerformanceState::Unknown => "P?".to_string(),
+        PerformanceState::Zero => "P0",
+        PerformanceState::One => "P1",
+        PerformanceState::Two => "P2",
+        PerformanceState::Three => "P3",
+        PerformanceState::Four => "P4",
+        PerformanceState::Five => "P5",
+        PerformanceState::Six => "P6",
+        PerformanceState::Seven => "P7",
+        PerformanceState::Eight => "P8",
+        PerformanceState::Nine => "P9",
+        PerformanceState::Ten => "P10",
+        PerformanceState::Eleven => "P11",
+        PerformanceState::Twelve => "P12",
+        PerformanceState::Thirteen => "P13",
+        PerformanceState::Fourteen => "P14",
+        PerformanceState::Fifteen => "P15",
+        PerformanceState::Unknown => "P?",
     }
 }
 
 fn format_throttle_reasons(tr: ThrottleReasons) -> String {
     if tr.is_empty() || tr == ThrottleReasons::NONE {
-        return "None".to_string();
+        return String::from("None");
     }
 
-    let mut reasons = Vec::new();
-    if tr.contains(ThrottleReasons::GPU_IDLE) {
-        reasons.push("Idle");
+    let mut s = String::with_capacity(48);
+    macro_rules! check {
+        ($flag:expr, $name:expr) => {
+            if tr.contains($flag) {
+                if !s.is_empty() {
+                    s.push_str(", ");
+                }
+                s.push_str($name);
+            }
+        };
     }
-    if tr.contains(ThrottleReasons::APPLICATIONS_CLOCKS_SETTING) {
-        reasons.push("AppClk");
-    }
-    if tr.contains(ThrottleReasons::SW_POWER_CAP) {
-        reasons.push("SwPwrCap");
-    }
-    if tr.contains(ThrottleReasons::HW_SLOWDOWN) {
-        reasons.push("HW-Slow");
-    }
-    if tr.contains(ThrottleReasons::SYNC_BOOST) {
-        reasons.push("SyncBoost");
-    }
-    if tr.contains(ThrottleReasons::SW_THERMAL_SLOWDOWN) {
-        reasons.push("SW-Therm");
-    }
-    if tr.contains(ThrottleReasons::HW_THERMAL_SLOWDOWN) {
-        reasons.push("HW-Therm");
-    }
-    if tr.contains(ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN) {
-        reasons.push("HW-PwrBrake");
-    }
-    if tr.contains(ThrottleReasons::DISPLAY_CLOCK_SETTING) {
-        reasons.push("DispClk");
-    }
+    check!(ThrottleReasons::GPU_IDLE, "Idle");
+    check!(ThrottleReasons::APPLICATIONS_CLOCKS_SETTING, "AppClk");
+    check!(ThrottleReasons::SW_POWER_CAP, "SwPwrCap");
+    check!(ThrottleReasons::HW_SLOWDOWN, "HW-Slow");
+    check!(ThrottleReasons::SYNC_BOOST, "SyncBoost");
+    check!(ThrottleReasons::SW_THERMAL_SLOWDOWN, "SW-Therm");
+    check!(ThrottleReasons::HW_THERMAL_SLOWDOWN, "HW-Therm");
+    check!(ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN, "HW-PwrBrake");
+    check!(ThrottleReasons::DISPLAY_CLOCK_SETTING, "DispClk");
 
-    if reasons.is_empty() {
-        "Unknown".to_string()
+    if s.is_empty() {
+        String::from("Unknown")
     } else {
-        reasons.join(", ")
+        s
     }
 }
 
-fn format_architecture(arch: DeviceArchitecture) -> String {
+fn format_architecture(arch: DeviceArchitecture) -> &'static str {
     match arch {
-        DeviceArchitecture::Kepler => "Kepler".to_string(),
-        DeviceArchitecture::Maxwell => "Maxwell".to_string(),
-        DeviceArchitecture::Pascal => "Pascal".to_string(),
-        DeviceArchitecture::Volta => "Volta".to_string(),
-        DeviceArchitecture::Turing => "Turing".to_string(),
-        DeviceArchitecture::Ampere => "Ampere".to_string(),
-        DeviceArchitecture::Ada => "Ada".to_string(),
-        DeviceArchitecture::Hopper => "Hopper".to_string(),
-        _ => "Unknown".to_string(),
+        DeviceArchitecture::Kepler => "Kepler",
+        DeviceArchitecture::Maxwell => "Maxwell",
+        DeviceArchitecture::Pascal => "Pascal",
+        DeviceArchitecture::Volta => "Volta",
+        DeviceArchitecture::Turing => "Turing",
+        DeviceArchitecture::Ampere => "Ampere",
+        DeviceArchitecture::Ada => "Ada",
+        DeviceArchitecture::Hopper => "Hopper",
+        // Blackwell: nvml-wrapper v0.10 doesn't have this variant yet;
+        // when the crate adds it, uncomment below.
+        // DeviceArchitecture::Blackwell => "Blackwell",
+        _ => "Unknown",
     }
 }

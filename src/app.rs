@@ -38,6 +38,14 @@ impl App {
             }
             self.history.get_mut(&m.uuid).unwrap().push(m);
         }
+
+        // Remove history entries for GPUs that are no longer present
+        // (prevents unbounded HashMap growth on MIG reconfigs / GPU hot-remove)
+        if self.history.len() > new_metrics.len() {
+            self.history
+                .retain(|uuid, _| new_metrics.iter().any(|m| m.uuid == *uuid));
+        }
+
         self.metrics = new_metrics;
 
         // Clamp selection
