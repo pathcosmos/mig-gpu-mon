@@ -507,7 +507,7 @@ The NVML GPM API was introduced in driver 520+ for **Hopper (H100) and newer** a
 ```
 GPM Collection Flow:
 1. nvmlGpmQueryDeviceSupport(parent_device) → check GPM support (cached in DeviceInfo)
-   ⚠ Must use parent GPU handle — MIG handles may return errors
+   ⚠ Must use parent GPU handle — MIG handles return errors AND corrupt NVML state
 2. nvmlGpmSampleAlloc() → allocate sample buffer
 3. nvmlGpmMigSampleGet(parent, gpuInstanceId, sample) — for MIG instances
    nvmlGpmSampleGet(device, sample) — for regular GPUs (non-MIG only)
@@ -515,13 +515,12 @@ GPM Collection Flow:
 4. nvmlGpmMetricsGet() with previous tick's sample + current sample
 5. metrics[0].value → DRAM BW Util (0.0–100.0%)
 
-Important notes (fixed in v0.2.1):
-- VRAM query (memory_info) must execute BEFORE any GPM calls
-  → Wrong GPM calls on MIG handles can corrupt NVML state, causing subsequent memory_info() to fail
-- GPM fallback in collect_device_metrics applies to non-MIG devices only
-  → MIG devices are handled separately in collect_mig_instances via parent handle
-- GPM support check must use parent device handle
-  → nvmlGpmQueryDeviceSupport on MIG handle → error → gpm_supported=false → entire fallback skipped
+collect_mig_instances 2-phase collection (v0.3):
+  Phase 1: Collect VRAM + utilization for all MIG instances (no GPM calls)
+           → memory_info(), utilization_rates(), process util, sample scaling
+  Phase 2: GPM fallbacks for memory_util (Mem Ctrl) collection (Hopper+ only)
+           → nvmlGpmMigSampleGet(parent, gi_id, sample)
+  Purpose: Even if GPM calls corrupt NVML state, VRAM is already collected in Phase 1
 ```
 
 | GPU Architecture | GPM Support | Mem Ctrl Display |
@@ -533,6 +532,147 @@ Important notes (fixed in v0.2.1):
 > **Implementation Status:** This tool already implements GPM DRAM BW Util collection, automatically enabled on Hopper+ GPUs. First tick collects baseline (None), actual values displayed from 2nd tick onwards.
 
 > **Note:** NVIDIA driver 550+ (CUDA 12.4+) added proper `nvmlDeviceGetUtilizationRates()` support for MIG device handles, making all 3 fallback tiers unnecessary.
+
+#### VRAM + Mem Ctrl Simultaneous Display Bug Analysis & Fix (v0.3)
+
+##### Symptoms
+
+In MIG environments, VRAM was displayed only on the first tick, then silently dropped to `0/0 MB`. Meanwhile, Mem Ctrl showed "N/A" or an actual value. Both metrics should be displayed simultaneously.
+
+##### Root Cause Analysis — 3 Cascading Bugs
+
+**Bug 1: `get_device_info` GPM query corrupts NVML state on MIG handles**
+
+```
+collect_device_metrics() call order (before fix):
+  line 543: get_device_info(mig_device)
+            → nvmlGpmQueryDeviceSupport(mig_handle)  ← corrupts NVML state!
+  line 546: memory_info()                             ← queries VRAM in corrupted state → fails
+```
+
+`get_device_info()` called `nvmlGpmQueryDeviceSupport()` on MIG handles. This GPM query corrupted NVML driver internal state, causing the subsequent `memory_info()` VRAM query to fail or return `(0, 0)`. Although cached after the first call (DeviceInfo cache), it combined with Bug 2 for persistent damage.
+
+**Bug 2: Cross-tick GPM state corruption (core mechanism)**
+
+```
+Tick N:   VRAM query (succeeds) → GPM fallback (nvmlGpmMigSampleGet) → NVML state corrupted
+Tick N+1: VRAM query (fails — residual corruption from Tick N GPM call) → GPM fallback → corrupts again
+Tick N+2: VRAM query (fails) → ...
+```
+
+The GPM fallback (`nvmlGpmMigSampleGet`) in `collect_mig_instances` executed after the VRAM query within the same tick, but the GPM call corrupted NVML driver state that **persisted across ticks**. Reordering within the same function was insufficient — corruption survived between ticks.
+
+**Bug 3: `memory_used`/`memory_total` silently masked failures**
+
+```rust
+// Before fix: unwrap_or((0, 0)) — failure silently becomes 0/0
+let (memory_used, memory_total) = device.memory_info()
+    .map(|m| (m.used, m.total))
+    .unwrap_or((0, 0));  // ← "VRAM 0/0 MB (0.0%)" — user perceives as "disabled"
+```
+
+When the VRAM query failed, the `u64` type fell back to `(0, 0)`, showing "VRAM 0/0 MB (0.0%)". This contrasted with `memory_util` (`Option<u32>`) which explicitly showed "Mem Ctrl N/A". From the user's perspective, VRAM appeared to "disappear."
+
+##### Timeline Reproduction
+
+```
+Tick 1 (first tick):
+  ├── get_device_info(mig) → nvmlGpmQueryDeviceSupport(mig_handle) [first call, cache miss]
+  │   → possible NVML state corruption (but cached, no repeat calls)
+  ├── memory_info() → succeeds or fails depending on corruption severity
+  ├── utilization_rates() → NVML_ERROR_NOT_SUPPORTED (MIG limitation)
+  ├── process_util fallback → collects sm/mem util
+  └── GPM fallback → nvmlGpmMigSampleGet(parent, gi_id) → first tick, no prev_sample → None
+      → but the GPM call itself corrupts NVML state
+
+Tick 2 (subsequent ticks):
+  ├── get_device_info(mig) → cache hit (no GPM query)
+  ├── memory_info() → FAILS (residual corruption from Tick 1 GPM call)
+  │   → unwrap_or((0, 0)) → VRAM 0/0 MB ← what the user sees as "disabled"
+  ├── ... (rest unchanged)
+  └── GPM fallback → nvmlGpmMigSampleGet → has prev_sample → returns memory_util value!
+      → but corrupts NVML state again → Tick 3 VRAM also fails
+
+Result: VRAM displays on Tick 1 only, shows 0/0 MB from Tick 2 onwards
+        Mem Ctrl displays value from Tick 2+ (or always N/A on Ampere)
+```
+
+##### Fix Details (3 changes)
+
+**Fix 1: Block GPM query on MIG handles in `get_device_info`** (`nvml.rs`)
+
+```rust
+// Before: GPM query on all devices
+fn get_device_info(&self, device: &Device) -> DeviceInfo {
+    gpm_supported: nvmlGpmQueryDeviceSupport(device.handle(), ...)  // MIG handle → corruption!
+}
+
+// After: skip_gpm_query parameter added
+fn get_device_info(&self, device: &Device, skip_gpm_query: bool) -> DeviceInfo {
+    gpm_supported: if skip_gpm_query { false } else { nvmlGpmQueryDeviceSupport(...) }
+}
+// MIG handles: get_device_info(mig_device, true)  → GPM query skipped
+// Parent:      get_device_info(parent_device, false) → GPM query runs normally
+```
+
+**Fix 2: 2-phase separation in `collect_mig_instances`** (`nvml.rs`)
+
+```rust
+// Before: VRAM + GPM interleaved per MIG instance
+for mig in mig_instances {
+    metrics = collect_device_metrics(mig)  // VRAM query
+    gpm_fallback(mig)                      // GPM call → corrupts next MIG's VRAM query
+}
+
+// After: 2-phase separation
+// Phase 1: Collect all MIG VRAM (no GPM calls)
+for mig in mig_instances {
+    metrics = collect_device_metrics(mig)  // VRAM + utilization + process util
+    phase1.push(metrics)
+}
+// Phase 2: GPM fallbacks (all VRAM already collected)
+for metrics in &mut phase1 {
+    gpm_fallback(metrics)  // GPM call → corruption doesn't affect VRAM
+}
+```
+
+**Fix 3: `memory_used`/`memory_total` → `Option<u64>`** (`metrics.rs` + `dashboard.rs`)
+
+```rust
+// Before: u64 — failures masked as (0, 0)
+pub memory_used: u64,
+pub memory_total: u64,
+// → "VRAM 0/0 MB (0.0%)" — confusing to users
+
+// After: Option<u64> — failures shown as "N/A"
+pub memory_used: Option<u64>,
+pub memory_total: Option<u64>,
+// → "VRAM N/A" — consistent with gpu_util, memory_util pattern
+```
+
+UI updated simultaneously:
+- Detail panel: displays `VRAM N/A` (DarkGray color)
+- Sparkline title: displays `VRAM N/A`
+- History: pushes only on `Some` → prevents graph data corruption on failed ticks
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/nvml.rs` | Added `skip_gpm_query` parameter to `get_device_info`, 2-phase separation in `collect_mig_instances`, MIG callers pass `skip_gpm_query=true` |
+| `src/gpu/metrics.rs` | `memory_used`/`memory_total` → `Option<u64>`, `memory_used_mb()`/`memory_total_mb()`/`memory_percent()` → return `Option` |
+| `src/ui/dashboard.rs` | Added `N/A` fallback to VRAM detail/sparkline, `vram_max` uses `and_then` |
+
+##### Cross-Verification Matrix
+
+| Scenario | VRAM Display | Mem Ctrl Display | Verification |
+|----------|-------------|-----------------|-------------|
+| Hopper+ MIG, Tick 1 | Normal value (Phase 1) | N/A (GPM first tick, no prev_sample) | VRAM collected in Phase 1 → Phase 2 GPM corruption irrelevant |
+| Hopper+ MIG, Tick 2+ | Normal value (Phase 1) | Normal value (Phase 2 GPM delta) | Even with GPM corruption, VRAM already completed in Phase 1 |
+| Ampere MIG | Normal value | N/A (GPM unsupported) | No GPM calls at all → no VRAM corruption possible |
+| Non-MIG GPU | Normal value | Normal or GPM value | GPM called only for non-MIG, VRAM collected first |
+| memory_info() failure | "VRAM N/A" | Separate path | Option<u64> provides explicit failure display |
+| get_device_info first call (MIG) | Normal value | — | skip_gpm_query=true → GPM query skipped → no NVML corruption |
 
 ### NVML API Latency Benchmark
 

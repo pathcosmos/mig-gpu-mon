@@ -218,8 +218,13 @@ impl NvmlCollector {
             let total_slices = max_count;
 
             // GPM support must be checked on the parent device (not MIG handles)
-            let parent_info = self.get_device_info(parent_device);
+            let parent_info = self.get_device_info(parent_device, false);
             let parent_gpm_supported = parent_info.gpm_supported;
+
+            // === Phase 1: Collect base metrics (VRAM, utilization) for all MIG instances ===
+            // All VRAM queries happen here, BEFORE any GPM calls that could corrupt NVML state.
+            // Also collect MIG handles for phase 2.
+            let mut phase1: Vec<(nvmlDevice_t, GpuMetrics)> = Vec::new();
 
             for mig_idx in 0..max_count {
                 let mut mig_handle: nvmlDevice_t = std::ptr::null_mut();
@@ -237,7 +242,7 @@ impl NvmlCollector {
                 if let Ok(mut metrics) =
                     self.collect_device_metrics(&mig_device, mig_idx, true, Some(gpu_index))
                 {
-                    // Fallback 1: process utilization
+                    // Fallback 1: process utilization (no GPM involvement)
                     if metrics.gpu_util.is_none() {
                         let (sm, mem) = self.get_process_utilization(mig_handle);
                         if sm > 0 {
@@ -249,14 +254,11 @@ impl NvmlCollector {
                         }
                     }
 
-                    // Fallback 2: scale parent's sampled util by MIG slice ratio
+                    // Fallback 2: scale parent's sampled util by MIG slice ratio (no GPM)
                     if metrics.gpu_util.is_none() {
                         if let Some(p_util) = parent_sampled_util {
-                            let mig_info = self.get_device_info(&mig_device);
+                            let mig_info = self.get_device_info(&mig_device, true);
                             if let Some(mig_slices) = mig_info.gpu_instance_slice_count {
-                                // parent util is aggregate; scale up by slice ratio
-                                // e.g., parent=29%, MIG 3g → slices=3, total=7
-                                //   MIG util ≈ parent * total / mig_slices = 29 * 7/3 ≈ 68%
                                 let scaled = ((p_util as u64) * (total_slices as u64)
                                     / (mig_slices as u64))
                                     .min(100) as u32;
@@ -266,22 +268,28 @@ impl NvmlCollector {
                         }
                     }
 
-                    // GPM fallback for memory_util: DRAM BW util (Hopper+ only)
-                    // GPM support is checked on parent device — MIG handles may not support the query
-                    if metrics.memory_util.is_none() && parent_gpm_supported {
-                        let mig_info = self.get_device_info(&mig_device);
-                        metrics.memory_util = self.get_dram_bw_util_gpm(
-                            mig_handle,
-                            true,
-                            mig_info.gpu_instance_id,
-                            Some(parent_handle),
-                        );
-                    }
-
                     metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name);
-                    mig_metrics.push(metrics);
+                    phase1.push((mig_handle, metrics));
                 }
             }
+
+            // === Phase 2: GPM fallbacks (after all VRAM queries are done) ===
+            // GPM calls (nvmlGpmMigSampleGet) may corrupt NVML state, but all VRAM
+            // has already been collected in phase 1, so corruption won't affect it.
+            for (mig_handle, metrics) in &mut phase1 {
+                if metrics.memory_util.is_none() && parent_gpm_supported {
+                    let mig_device = Device::new(*mig_handle, &self.nvml);
+                    let mig_info = self.get_device_info(&mig_device, true);
+                    metrics.memory_util = self.get_dram_bw_util_gpm(
+                        *mig_handle,
+                        true,
+                        mig_info.gpu_instance_id,
+                        Some(parent_handle),
+                    );
+                }
+            }
+
+            mig_metrics.extend(phase1.into_iter().map(|(_, m)| m));
         }
 
         Ok(mig_metrics)
@@ -466,7 +474,10 @@ impl NvmlCollector {
     }
 
     /// Get cached or fetch device info. Static fields never change at runtime.
-    fn get_device_info(&self, device: &Device) -> DeviceInfo {
+    /// `skip_gpm_query`: set true for MIG handles — nvmlGpmQueryDeviceSupport on MIG handles
+    /// can corrupt NVML driver state, causing subsequent memory_info() calls to fail.
+    /// GPM support should be checked on the parent device instead.
+    fn get_device_info(&self, device: &Device, skip_gpm_query: bool) -> DeviceInfo {
         let key = unsafe { device.handle() } as usize;
         let cache = self.device_cache.borrow();
         if let Some(info) = cache.get(&key) {
@@ -502,17 +513,23 @@ impl NvmlCollector {
                     None
                 }
             },
-            gpm_supported: unsafe {
-                let mut support: nvmlGpmSupport_t = std::mem::zeroed();
-                support.version = NVML_GPM_SUPPORT_VERSION;
-                if self
-                    .raw_lib
-                    .nvmlGpmQueryDeviceSupport(device.handle(), &mut support)
-                    == 0
-                {
-                    support.isSupportedDevice != 0
-                } else {
-                    false
+            // Never query GPM support on MIG handles — it corrupts NVML state.
+            // GPM support is checked on the parent device in collect_mig_instances.
+            gpm_supported: if skip_gpm_query {
+                false
+            } else {
+                unsafe {
+                    let mut support: nvmlGpmSupport_t = std::mem::zeroed();
+                    support.version = NVML_GPM_SUPPORT_VERSION;
+                    if self
+                        .raw_lib
+                        .nvmlGpmQueryDeviceSupport(device.handle(), &mut support)
+                        == 0
+                    {
+                        support.isSupportedDevice != 0
+                    } else {
+                        false
+                    }
                 }
             },
             gpu_instance_id: unsafe {
@@ -540,13 +557,14 @@ impl NvmlCollector {
         is_mig: bool,
         parent_index: Option<u32>,
     ) -> Result<GpuMetrics> {
-        let info = self.get_device_info(device);
+        // For MIG handles, skip GPM support query in get_device_info — it corrupts NVML state.
+        let info = self.get_device_info(device, is_mig);
 
         // VRAM query first — before any GPM calls that might disturb NVML state on MIG handles
         let (memory_used, memory_total) = device
             .memory_info()
-            .map(|m| (m.used, m.total))
-            .unwrap_or((0, 0));
+            .map(|m| (Some(m.used), Some(m.total)))
+            .unwrap_or((None, None));
 
         let (gpu_util, memory_util): (Option<u32>, Option<u32>) = match device.utilization_rates() {
             Ok(u) => (Some(u.gpu), Some(u.memory)),

@@ -507,7 +507,7 @@ NVML GPM API는 드라이버 520+에서 **Hopper (H100) 이상** 아키텍처에
 ```
 GPM 수집 흐름:
 1. nvmlGpmQueryDeviceSupport(parent_device) → GPM 지원 확인 (DeviceInfo 캐시)
-   ⚠ 반드시 부모 GPU 핸들로 체크 — MIG 핸들에서는 에러 반환 가능
+   ⚠ 반드시 부모 GPU 핸들로 체크 — MIG 핸들에서는 에러 반환 + NVML 상태 오염
 2. nvmlGpmSampleAlloc() → 샘플 버퍼 할당
 3. nvmlGpmMigSampleGet(parent, gpuInstanceId, sample) — MIG 인스턴스
    nvmlGpmSampleGet(device, sample) — 일반 GPU (non-MIG only)
@@ -515,13 +515,12 @@ GPM 수집 흐름:
 4. 이전 tick의 샘플과 현재 샘플로 nvmlGpmMetricsGet() 호출
 5. metrics[0].value → DRAM BW Util (0.0~100.0%)
 
-주의사항 (v0.2.1 수정):
-- VRAM 쿼리(memory_info)는 반드시 GPM 호출 전에 실행
-  → MIG 핸들에 잘못된 GPM 호출이 NVML 상태를 오염시키면 후속 memory_info() 실패
-- collect_device_metrics 내 GPM fallback은 non-MIG 디바이스에만 적용
-  → MIG는 collect_mig_instances에서 parent 핸들 경유로 별도 처리
-- GPM 지원 확인은 parent device 핸들로만 수행
-  → MIG 핸들에서 nvmlGpmQueryDeviceSupport → 에러 → gpm_supported=false → fallback 전체 스킵
+collect_mig_instances 2-phase 수집 (v0.3 적용):
+  Phase 1: 모든 MIG 인스턴스의 VRAM + utilization 수집 (GPM 호출 없음)
+           → memory_info(), utilization_rates(), process util, sample scaling
+  Phase 2: GPM fallback으로 memory_util(Mem Ctrl) 수집 (Hopper+ only)
+           → nvmlGpmMigSampleGet(parent, gi_id, sample)
+  목적: GPM 호출이 NVML 상태를 오염시켜도 Phase 1에서 VRAM이 이미 수집 완료
 ```
 
 | GPU 아키텍처 | GPM 지원 | Mem Ctrl 표시 |
@@ -533,6 +532,147 @@ GPM 수집 흐름:
 > **구현 상태:** 본 도구는 GPM DRAM BW Util 수집을 이미 구현하였으며, Hopper+ GPU에서 자동 활성화된다. 첫 tick은 baseline 수집(None), 2번째 tick부터 실측값 표시.
 
 > **참고:** NVIDIA 드라이버 550+ (CUDA 12.4+)부터 MIG 디바이스 핸들에서 `nvmlDeviceGetUtilizationRates()` 정식 지원이 추가되어, 3단계 폴백이 불필요해진다.
+
+#### VRAM + Mem Ctrl 동시 표시 버그 분석 및 수정 (v0.3)
+
+##### 증상
+
+MIG 환경에서 VRAM이 첫 tick에만 표시되고 이후 `0/0 MB`로 사라지며, Mem Ctrl만 "N/A" 또는 값으로 표시되는 현상. 둘 다 동시에 정상 표시되어야 함.
+
+##### 근본 원인 분석 — 3가지 연쇄 버그
+
+**버그 1: `get_device_info`의 GPM 쿼리가 MIG 핸들에서 NVML 상태 오염**
+
+```
+collect_device_metrics() 호출 순서 (수정 전):
+  line 543: get_device_info(mig_device)
+            → nvmlGpmQueryDeviceSupport(mig_handle)  ← NVML 상태 오염!
+  line 546: memory_info()                             ← 오염된 상태에서 VRAM 쿼리 → 실패
+```
+
+`get_device_info()`가 MIG 핸들에 대해 `nvmlGpmQueryDeviceSupport()`를 호출. 이 GPM 쿼리가 NVML 드라이버 내부 상태를 오염시켜, 바로 아래의 `memory_info()` VRAM 쿼리가 실패하거나 `(0, 0)` 반환. DeviceInfo 캐시 덕분에 첫 tick에서만 발생하지만, 버그 2와 결합하면 매 tick 문제.
+
+**버그 2: 크로스-틱 GPM 상태 오염 (핵심 메커니즘)**
+
+```
+Tick N:  VRAM 쿼리(성공) → GPM fallback(nvmlGpmMigSampleGet) → NVML 상태 오염
+Tick N+1: VRAM 쿼리(실패 — 이전 tick GPM 오염 잔존) → GPM fallback → 또 오염
+Tick N+2: VRAM 쿼리(실패) → ...
+```
+
+`collect_mig_instances`에서 GPM fallback(`nvmlGpmMigSampleGet`)이 VRAM 쿼리 이후에 실행되지만, 이 GPM 호출이 NVML 드라이버 상태를 오염시키면 **다음 tick**의 VRAM 쿼리가 실패. 같은 함수 내에서 순서를 바꾸는 것만으로는 해결 불가 — tick 간 상태가 지속됨.
+
+**버그 3: `memory_used`/`memory_total`이 실패를 은닉**
+
+```rust
+// 수정 전: unwrap_or((0, 0)) — 실패 시 0/0으로 조용히 사라짐
+let (memory_used, memory_total) = device.memory_info()
+    .map(|m| (m.used, m.total))
+    .unwrap_or((0, 0));  // ← VRAM 0/0 MB (0.0%) — 사용자는 "비활성화"로 인식
+```
+
+VRAM 쿼리 실패 시 `u64` 타입이라 `(0, 0)`으로 fallback되어 "VRAM 0/0 MB (0.0%)"로 표시. `memory_util`은 `Option<u32>`라서 "Mem Ctrl N/A"로 명시적 표시되는 것과 대조적. 사용자 입장에서 VRAM이 "사라진" 것처럼 보임.
+
+##### 타임라인 재현
+
+```
+Tick 1 (첫 tick):
+  ├── get_device_info(mig) → nvmlGpmQueryDeviceSupport(mig_handle) [첫 호출, 캐시 미스]
+  │   → NVML 상태 오염 가능 (but 캐시되어 이후 호출 없음)
+  ├── memory_info() → 성공 또는 실패 (오염 정도에 따라)
+  ├── utilization_rates() → NVML_ERROR_NOT_SUPPORTED (MIG 제한)
+  ├── process_util fallback → sm/mem util 수집
+  └── GPM fallback → nvmlGpmMigSampleGet(parent, gi_id) → 첫 tick이라 prev_sample 없음 → None
+      → 그러나 GPM 호출 자체가 NVML 상태 오염
+
+Tick 2 (이후 tick):
+  ├── get_device_info(mig) → 캐시 히트 (GPM 쿼리 안 함)
+  ├── memory_info() → 실패! (Tick 1 GPM 호출의 잔존 오염)
+  │   → unwrap_or((0, 0)) → VRAM 0/0 MB ← 사용자가 보는 "비활성화"
+  ├── ... (나머지 동일)
+  └── GPM fallback → nvmlGpmMigSampleGet → prev_sample 있음 → memory_util 값 반환!
+      → 그러나 또 NVML 상태 오염 → Tick 3 VRAM도 실패
+
+결과: VRAM은 Tick 1에서만 표시, Tick 2+에서 0/0 MB
+      Mem Ctrl은 Tick 2+에서 값 표시 (또는 Ampere에서 항상 N/A)
+```
+
+##### 수정 내용 (3건)
+
+**수정 1: `get_device_info`에서 MIG 핸들 GPM 쿼리 차단** (`nvml.rs`)
+
+```rust
+// 수정 전: 모든 디바이스에 대해 GPM 쿼리 실행
+fn get_device_info(&self, device: &Device) -> DeviceInfo {
+    gpm_supported: nvmlGpmQueryDeviceSupport(device.handle(), ...)  // MIG 핸들 → 오염!
+}
+
+// 수정 후: skip_gpm_query 파라미터 추가
+fn get_device_info(&self, device: &Device, skip_gpm_query: bool) -> DeviceInfo {
+    gpm_supported: if skip_gpm_query { false } else { nvmlGpmQueryDeviceSupport(...) }
+}
+// MIG 핸들: get_device_info(mig_device, true)  → GPM 쿼리 스킵
+// Parent:   get_device_info(parent_device, false) → GPM 쿼리 정상 실행
+```
+
+**수정 2: `collect_mig_instances` 2-phase 분리** (`nvml.rs`)
+
+```rust
+// 수정 전: MIG 인스턴스별 VRAM + GPM 인터리브
+for mig in mig_instances {
+    metrics = collect_device_metrics(mig)  // VRAM 쿼리
+    gpm_fallback(mig)                      // GPM 호출 → 다음 MIG의 VRAM 쿼리 오염
+}
+
+// 수정 후: 2-phase 분리
+// Phase 1: 모든 MIG VRAM 수집 (GPM 호출 없음)
+for mig in mig_instances {
+    metrics = collect_device_metrics(mig)  // VRAM + utilization + process util
+    phase1.push(metrics)
+}
+// Phase 2: GPM fallback (모든 VRAM 이미 수집 완료)
+for metrics in &mut phase1 {
+    gpm_fallback(metrics)  // GPM 호출 → 오염되어도 VRAM에 영향 없음
+}
+```
+
+**수정 3: `memory_used`/`memory_total` → `Option<u64>`** (`metrics.rs` + `dashboard.rs`)
+
+```rust
+// 수정 전: u64 — 실패 시 (0, 0)으로 은닉
+pub memory_used: u64,
+pub memory_total: u64,
+// → "VRAM 0/0 MB (0.0%)" — 사용자에게 혼란
+
+// 수정 후: Option<u64> — 실패 시 "N/A" 명시
+pub memory_used: Option<u64>,
+pub memory_total: Option<u64>,
+// → "VRAM N/A" — gpu_util, memory_util과 동일한 패턴
+```
+
+UI도 동시 업데이트:
+- Detail 패널: `VRAM N/A` 표시 (DarkGray 색상)
+- Sparkline 타이틀: `VRAM N/A` 표시
+- 히스토리: `Some`일 때만 push → 실패 tick에서 그래프 데이터 오염 방지
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/nvml.rs` | `get_device_info(skip_gpm_query)` 파라미터 추가, `collect_mig_instances` 2-phase 분리, MIG 호출자에서 `skip_gpm_query=true` 전달 |
+| `src/gpu/metrics.rs` | `memory_used`/`memory_total` → `Option<u64>`, `memory_used_mb()`/`memory_total_mb()`/`memory_percent()` → `Option` 반환 |
+| `src/ui/dashboard.rs` | VRAM detail/sparkline에 `N/A` fallback 추가, `vram_max` 계산에 `and_then` 사용 |
+
+##### 상호 검증 매트릭스
+
+| 시나리오 | VRAM 표시 | Mem Ctrl 표시 | 검증 |
+|----------|-----------|-------------|------|
+| Hopper+ MIG, Tick 1 | 정상값 (Phase 1에서 수집) | N/A (GPM 첫 tick, prev_sample 없음) | Phase 1에서 VRAM 수집 → Phase 2 GPM 오염 무관 |
+| Hopper+ MIG, Tick 2+ | 정상값 (Phase 1) | 정상값 (Phase 2 GPM delta) | GPM 오염이 있어도 VRAM은 Phase 1에서 이미 완료 |
+| Ampere MIG | 정상값 | N/A (GPM 미지원) | GPM 호출 자체가 없음 → VRAM 오염 불가 |
+| Non-MIG GPU | 정상값 | 정상값 또는 GPM값 | GPM은 non-MIG에서만 직접 호출, VRAM 먼저 수집 |
+| memory_info() 실패 | "VRAM N/A" | 별도 경로 | Option<u64>로 명시적 실패 표시 |
+| get_device_info 첫 호출 (MIG) | 정상값 | — | skip_gpm_query=true → GPM 쿼리 스킵 → NVML 오염 없음 |
 
 ### NVML API 지연시간 벤치마크
 

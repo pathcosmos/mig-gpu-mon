@@ -28,9 +28,9 @@ pub struct GpuMetrics {
     pub memory_util: Option<u32>,
     pub sm_util: Option<u32>,
 
-    // Memory (bytes)
-    pub memory_used: u64,
-    pub memory_total: u64,
+    // Memory (bytes) — None when NVML memory_info() fails (GPM state corruption on MIG)
+    pub memory_used: Option<u64>,
+    pub memory_total: Option<u64>,
 
     // Temperature & Power
     pub temperature: Option<u32>,
@@ -66,19 +66,21 @@ pub struct GpuMetrics {
 }
 
 impl GpuMetrics {
-    pub fn memory_used_mb(&self) -> u64 {
-        self.memory_used / (1024 * 1024)
+    pub fn memory_used_mb(&self) -> Option<u64> {
+        self.memory_used.map(|v| v / (1024 * 1024))
     }
 
-    pub fn memory_total_mb(&self) -> u64 {
-        self.memory_total / (1024 * 1024)
+    pub fn memory_total_mb(&self) -> Option<u64> {
+        self.memory_total.map(|v| v / (1024 * 1024))
     }
 
-    pub fn memory_percent(&self) -> f64 {
-        if self.memory_total == 0 {
-            return 0.0;
+    pub fn memory_percent(&self) -> Option<f64> {
+        let used = self.memory_used?;
+        let total = self.memory_total?;
+        if total == 0 {
+            return Some(0.0);
         }
-        (self.memory_used as f64 / self.memory_total as f64) * 100.0
+        Some((used as f64 / total as f64) * 100.0)
     }
 
     pub fn power_usage_w(&self) -> Option<f64> {
@@ -137,11 +139,9 @@ impl MetricsHistory {
         if let Some(val) = metrics.memory_util {
             Self::push_ring(&mut self.memory_util, val, self.max_entries);
         }
-        Self::push_ring(
-            &mut self.memory_used_mb,
-            metrics.memory_used_mb(),
-            self.max_entries,
-        );
+        if let Some(val) = metrics.memory_used_mb() {
+            Self::push_ring(&mut self.memory_used_mb, val, self.max_entries);
+        }
         if let Some(sm) = metrics.sm_util {
             Self::push_ring(&mut self.sm_util, sm, self.max_entries);
         }

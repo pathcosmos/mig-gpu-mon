@@ -415,28 +415,42 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
 
     // Line 4: VRAM
-    lines.push(Line::from(vec![
-        Span::styled(
-            "VRAM ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{} MB", m.memory_used_mb()),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" / {} MB ", m.memory_total_mb()),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("({:.1}%)", m.memory_percent()),
-            Style::default().fg(vram_pct_color(m.memory_percent())),
-        ),
-    ]));
+    if let (Some(used_mb), Some(total_mb), Some(pct)) =
+        (m.memory_used_mb(), m.memory_total_mb(), m.memory_percent())
+    {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "VRAM ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} MB", used_mb),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" / {} MB ", total_mb),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("({:.1}%)", pct),
+                Style::default().fg(vram_pct_color(pct)),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "VRAM ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
 
     // Line 5: GPU / Mem / SM util (compact horizontal)
     let gpu_util_str = m.gpu_util.map_or("N/A".to_string(), |v| format!("{}%", v));
@@ -745,17 +759,17 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     let vram_title = app
         .selected_metrics()
         .map(|m| {
-            format!(
-                " VRAM {}/{} MB ({:.1}%) ",
-                m.memory_used_mb(),
-                m.memory_total_mb(),
-                m.memory_percent()
-            )
+            match (m.memory_used_mb(), m.memory_total_mb(), m.memory_percent()) {
+                (Some(used), Some(total), Some(pct)) => {
+                    format!(" VRAM {}/{} MB ({:.1}%) ", used, total, pct)
+                }
+                _ => " VRAM N/A ".to_string(),
+            }
         })
         .unwrap_or_else(|| " VRAM ".to_string());
     let vram_max = app
         .selected_metrics()
-        .map(|m| m.memory_total_mb())
+        .and_then(|m| m.memory_total_mb())
         .unwrap_or(1);
     with_spark_data_u64(&history.memory_used_mb, |data| {
         let sparkline = Sparkline::default()
