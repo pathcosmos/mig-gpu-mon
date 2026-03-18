@@ -29,7 +29,17 @@ impl App {
         }
     }
 
-    pub fn update_metrics(&mut self, new_metrics: Vec<GpuMetrics>) {
+    pub fn update_metrics(&mut self, mut new_metrics: Vec<GpuMetrics>) {
+        // Carry forward last-known VRAM when memory_info() fails (GPM state corruption across ticks)
+        for m in &mut new_metrics {
+            if m.memory_used.is_none() {
+                if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) {
+                    m.memory_used = prev.memory_used;
+                    m.memory_total = prev.memory_total;
+                }
+            }
+        }
+
         for m in &new_metrics {
             // Avoid uuid.clone() on every tick — only clone on first encounter
             if !self.history.contains_key(&m.uuid) {

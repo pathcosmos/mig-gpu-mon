@@ -674,6 +674,117 @@ UI updated simultaneously:
 | memory_info() failure | "VRAM N/A" | Separate path | Option<u64> provides explicit failure display |
 | get_device_info first call (MIG) | Normal value | — | skip_gpm_query=true → GPM query skipped → no NVML corruption |
 
+#### VRAM Stagnation Bug Analysis & Fix (v0.3.1)
+
+##### Symptoms
+
+In MIG environments, VRAM displays correctly for the first few ticks, then becomes **stagnant** — the text value freezes and the sparkline graph stops updating.
+
+##### Root Cause Analysis — 2 Cascading Bugs
+
+**Bug 1: Cross-tick GPM corruption causes `memory_info()` failure**
+
+The v0.3 2-phase separation prevented GPM→VRAM corruption **within the same tick**, but the NVML driver state corruption left by GPM calls **persists across ticks**.
+
+```
+Tick N:   Phase 1 (VRAM succeeds) → Phase 2 (GPM call → NVML state corrupted)
+Tick N+1: Phase 1 (memory_info() fails — residual corruption from prev tick) → memory_used = None
+Tick N+2: Phase 1 (fails again) → ...
+```
+
+2-phase only provides intra-tick protection. **Cross-tick** corruption persistence requires separate handling.
+
+**Bug 2: `MetricsHistory::push()` skips on `None` → sparkline freezes**
+
+```rust
+// Before: skips push entirely when None
+if let Some(val) = metrics.memory_used_mb() {
+    Self::push_ring(&mut self.memory_used_mb, val, self.max_entries);
+}
+// → when memory_info() fails, ring buffer stops updating → sparkline frozen
+```
+
+When `memory_used` is `None`, nothing is pushed to the `memory_used_mb` ring buffer, causing the sparkline to freeze at the last successful value. The same issue affected all sparkline metrics: `gpu_util`, `memory_util`, `temperature`, etc.
+
+##### Fix Details (2 changes)
+
+**Fix 1: VRAM carry-forward in `update_metrics()`** (`app.rs`)
+
+```rust
+// Before: stored as-is
+pub fn update_metrics(&mut self, new_metrics: Vec<GpuMetrics>) { ... }
+
+// After: when memory_used is None, inherit from previous tick's same UUID
+pub fn update_metrics(&mut self, mut new_metrics: Vec<GpuMetrics>) {
+    for m in &mut new_metrics {
+        if m.memory_used.is_none() {
+            if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) {
+                m.memory_used = prev.memory_used;
+                m.memory_total = prev.memory_total;
+            }
+        }
+    }
+    // ... existing logic
+}
+```
+
+- Even when `memory_info()` fails due to GPM corruption, text display doesn't drop to "N/A"
+- UUID-based matching prevents cross-instance confusion
+
+**Fix 2: `push_or_repeat()` for all sparkline metrics** (`metrics.rs`)
+
+```rust
+// Before: skips push on None
+if let Some(val) = metrics.gpu_util {
+    Self::push_ring(&mut self.gpu_util, val, self.max_entries);
+}
+
+// After: repeats last value on None → sparkline keeps rolling
+fn push_or_repeat<T: Copy>(buf: &mut VecDeque<T>, val: Option<T>, max: usize) {
+    let v = match val {
+        Some(v) => v,
+        None => match buf.back() {
+            Some(&last) => last,
+            None => return,  // never observed — don't fabricate data
+        },
+    };
+    Self::push_ring(buf, v, max);
+}
+```
+
+Applied uniformly to all sparkline metrics: `gpu_util`, `memory_util`, `memory_used_mb`, `sm_util`, `temperature`, `power_usage_w`, `clock_graphics_mhz`, `pcie_tx_kbps`, `pcie_rx_kbps`.
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/app.rs` | `update_metrics()` — VRAM carry-forward (inherit from previous tick's same UUID) |
+| `src/gpu/metrics.rs` | `push_or_repeat()` — repeat last value on None for all sparkline metrics |
+
+##### Cross-Verification Matrix
+
+| Scenario | VRAM Text | VRAM Sparkline | Verification |
+|----------|-----------|---------------|-------------|
+| Tick 1 (normal) | Normal value | Normal push | Phase 1 collection succeeds |
+| Tick 2+ (memory_info fails from GPM corruption) | Previous value (carry-forward) | Last value repeated (rolling) | update_metrics inheritance + push_or_repeat |
+| Tick 2+ (memory_info recovers) | New value shown | New value pushed | Carry-forward only activates on None |
+| GPU util temporarily None | Last value retained | Last value repeated | push_or_repeat applied |
+| Never-observed metric | N/A | No push | `buf.back() == None` → return, prevents data fabrication |
+| Ampere MIG (no GPM) | Normal value | Normal push | No GPM calls → no corruption possible |
+| Non-MIG GPU | Normal value | Normal push | memory_info() works normally |
+
+##### Relationship to v0.3 Fixes
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3 Fix 1: `skip_gpm_query` | Blocks GPM query on MIG handles → prevents first-call corruption | `get_device_info()` |
+| v0.3 Fix 2: 2-phase separation | Blocks GPM→VRAM corruption within same tick | `collect_mig_instances()` |
+| v0.3 Fix 3: `Option<u64>` | Shows "N/A" instead of 0/0 on VRAM failure | `metrics.rs` |
+| **v0.3.1 Fix 1: carry-forward** | **Inherits VRAM value when cross-tick GPM corruption persists** | `app.rs:update_metrics()` |
+| **v0.3.1 Fix 2: push_or_repeat** | **Prevents sparkline stagnation on None values** | `metrics.rs:push()` |
+
+v0.3 provides "corruption prevention" defense; v0.3.1 adds a "resilience" layer that maintains display even when corruption occurs.
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:

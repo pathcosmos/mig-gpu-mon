@@ -133,33 +133,40 @@ impl MetricsHistory {
     }
 
     pub fn push(&mut self, metrics: &GpuMetrics) {
-        if let Some(val) = metrics.gpu_util {
-            Self::push_ring(&mut self.gpu_util, val, self.max_entries);
-        }
-        if let Some(val) = metrics.memory_util {
-            Self::push_ring(&mut self.memory_util, val, self.max_entries);
-        }
-        if let Some(val) = metrics.memory_used_mb() {
-            Self::push_ring(&mut self.memory_used_mb, val, self.max_entries);
-        }
-        if let Some(sm) = metrics.sm_util {
-            Self::push_ring(&mut self.sm_util, sm, self.max_entries);
-        }
-        if let Some(temp) = metrics.temperature {
-            Self::push_ring(&mut self.temperature, temp, self.max_entries);
-        }
-        if let Some(power) = metrics.power_usage_w() {
-            Self::push_ring(&mut self.power_usage_w, power, self.max_entries);
-        }
-        if let Some(clk) = metrics.clock_graphics_mhz {
-            Self::push_ring(&mut self.clock_graphics_mhz, clk, self.max_entries);
-        }
-        if let Some(tx) = metrics.pcie_tx_kbps {
-            Self::push_ring(&mut self.pcie_tx_kbps, tx, self.max_entries);
-        }
-        if let Some(rx) = metrics.pcie_rx_kbps {
-            Self::push_ring(&mut self.pcie_rx_kbps, rx, self.max_entries);
-        }
+        Self::push_or_repeat(&mut self.gpu_util, metrics.gpu_util, self.max_entries);
+        Self::push_or_repeat(&mut self.memory_util, metrics.memory_util, self.max_entries);
+        Self::push_or_repeat(
+            &mut self.memory_used_mb,
+            metrics.memory_used_mb(),
+            self.max_entries,
+        );
+        Self::push_or_repeat(&mut self.sm_util, metrics.sm_util, self.max_entries);
+        Self::push_or_repeat(&mut self.temperature, metrics.temperature, self.max_entries);
+        Self::push_or_repeat(
+            &mut self.power_usage_w,
+            metrics.power_usage_w(),
+            self.max_entries,
+        );
+        Self::push_or_repeat(
+            &mut self.clock_graphics_mhz,
+            metrics.clock_graphics_mhz,
+            self.max_entries,
+        );
+        Self::push_or_repeat(&mut self.pcie_tx_kbps, metrics.pcie_tx_kbps, self.max_entries);
+        Self::push_or_repeat(&mut self.pcie_rx_kbps, metrics.pcie_rx_kbps, self.max_entries);
+    }
+
+    /// Push value if Some, otherwise repeat last known value to keep sparkline rolling.
+    /// Does nothing if the metric has never been observed (no data yet).
+    fn push_or_repeat<T: Copy>(buf: &mut VecDeque<T>, val: Option<T>, max: usize) {
+        let v = match val {
+            Some(v) => v,
+            None => match buf.back() {
+                Some(&last) => last,
+                None => return, // never observed — don't fabricate data
+            },
+        };
+        Self::push_ring(buf, v, max);
     }
 
     fn push_ring<T>(buf: &mut VecDeque<T>, val: T, max: usize) {

@@ -674,6 +674,117 @@ UI도 동시 업데이트:
 | memory_info() 실패 | "VRAM N/A" | 별도 경로 | Option<u64>로 명시적 실패 표시 |
 | get_device_info 첫 호출 (MIG) | 정상값 | — | skip_gpm_query=true → GPM 쿼리 스킵 → NVML 오염 없음 |
 
+#### VRAM 정체(Stagnation) 버그 분석 및 수정 (v0.3.1)
+
+##### 증상
+
+MIG 환경에서 VRAM이 초반 몇 tick에 정상 표시되다가 이후 값이 **정체**(고정)된다. 텍스트 값이 변하지 않고, sparkline 그래프도 멈춤.
+
+##### 근본 원인 분석 — 2가지 연쇄 버그
+
+**버그 1: 크로스-틱 GPM 오염이 `memory_info()` 실패를 유발**
+
+v0.3에서 2-phase 분리로 **같은 tick 내** GPM→VRAM 오염을 차단했지만, GPM 호출이 남긴 NVML 드라이버 상태 오염은 **다음 tick까지 지속**된다.
+
+```
+Tick N:   Phase 1(VRAM 성공) → Phase 2(GPM 호출 → NVML 상태 오염)
+Tick N+1: Phase 1(memory_info() 실패 — 이전 tick GPM 오염 잔존) → memory_used = None
+Tick N+2: Phase 1(또 실패) → ...
+```
+
+2-phase는 같은 tick 내 보호만 제공. **tick 간** 오염 잔존은 별도 대응 필요.
+
+**버그 2: `MetricsHistory::push()`가 `None`일 때 push 안 함 → sparkline 정체**
+
+```rust
+// 수정 전: None이면 push 자체를 건너뜀
+if let Some(val) = metrics.memory_used_mb() {
+    Self::push_ring(&mut self.memory_used_mb, val, self.max_entries);
+}
+// → memory_info() 실패 시 ring buffer 업데이트 중단 → sparkline 고정
+```
+
+`memory_used`가 `None`이면 `memory_used_mb` 링 버퍼에 아무것도 push되지 않아 sparkline이 마지막 성공 값에서 멈춤. 동일 문제가 `gpu_util`, `memory_util`, `temperature` 등 모든 sparkline 메트릭에 존재.
+
+##### 수정 내용 (2건)
+
+**수정 1: `update_metrics()`에서 VRAM carry-forward** (`app.rs`)
+
+```rust
+// 수정 전: 그대로 저장
+pub fn update_metrics(&mut self, new_metrics: Vec<GpuMetrics>) { ... }
+
+// 수정 후: memory_used가 None이면 이전 tick의 동일 UUID에서 마지막 값 계승
+pub fn update_metrics(&mut self, mut new_metrics: Vec<GpuMetrics>) {
+    for m in &mut new_metrics {
+        if m.memory_used.is_none() {
+            if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) {
+                m.memory_used = prev.memory_used;
+                m.memory_total = prev.memory_total;
+            }
+        }
+    }
+    // ... 기존 로직
+}
+```
+
+- GPM 오염으로 `memory_info()`가 실패해도 텍스트 표시가 "N/A"로 빠지지 않음
+- UUID 기반 매칭으로 MIG 인스턴스 간 혼선 없음
+
+**수정 2: `MetricsHistory::push()`에 `push_or_repeat()` 적용** (`metrics.rs`)
+
+```rust
+// 수정 전: None이면 push 건너뜀
+if let Some(val) = metrics.gpu_util {
+    Self::push_ring(&mut self.gpu_util, val, self.max_entries);
+}
+
+// 수정 후: None이면 마지막 값 반복 push → sparkline 계속 롤링
+fn push_or_repeat<T: Copy>(buf: &mut VecDeque<T>, val: Option<T>, max: usize) {
+    let v = match val {
+        Some(v) => v,
+        None => match buf.back() {
+            Some(&last) => last,
+            None => return,  // 한 번도 관측 안 된 메트릭은 데이터 조작 방지
+        },
+    };
+    Self::push_ring(buf, v, max);
+}
+```
+
+모든 sparkline 메트릭(`gpu_util`, `memory_util`, `memory_used_mb`, `sm_util`, `temperature`, `power_usage_w`, `clock_graphics_mhz`, `pcie_tx_kbps`, `pcie_rx_kbps`)에 동일 적용.
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/app.rs` | `update_metrics()` — VRAM carry-forward (이전 tick 동일 UUID에서 계승) |
+| `src/gpu/metrics.rs` | `push_or_repeat()` — 모든 sparkline 메트릭에 None 시 마지막 값 반복 push |
+
+##### 상호 검증 매트릭스
+
+| 시나리오 | VRAM 텍스트 | VRAM sparkline | 검증 |
+|----------|------------|---------------|------|
+| Tick 1 (정상) | 정상값 | 정상 push | Phase 1에서 수집 성공 |
+| Tick 2+ (GPM 오염으로 memory_info 실패) | 이전 값 유지 (carry-forward) | 이전 값 반복 push (rolling) | update_metrics에서 계승 + push_or_repeat |
+| Tick 2+ (memory_info 정상 복구) | 새 값 표시 | 새 값 push | carry-forward는 None일 때만 동작 |
+| GPU util 일시 None | 마지막 값 유지 | 마지막 값 반복 push | push_or_repeat 적용 |
+| 한 번도 관측 안 된 메트릭 | N/A | push 안 함 | `buf.back() == None` → return, 데이터 조작 방지 |
+| Ampere MIG (GPM 없음) | 정상값 | 정상 push | GPM 호출 없어 오염 불가 |
+| Non-MIG GPU | 정상값 | 정상 push | memory_info() 정상 동작 |
+
+##### v0.3 수정과의 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3 Fix 1: `skip_gpm_query` | MIG 핸들에서 GPM 쿼리 차단 → 첫 호출 오염 방지 | `get_device_info()` |
+| v0.3 Fix 2: 2-phase 분리 | 같은 tick 내 GPM→VRAM 오염 차단 | `collect_mig_instances()` |
+| v0.3 Fix 3: `Option<u64>` | VRAM 실패 시 0/0 대신 "N/A" 명시 | `metrics.rs` |
+| **v0.3.1 Fix 1: carry-forward** | **tick 간 GPM 오염 잔존 시 VRAM 값 계승** | `app.rs:update_metrics()` |
+| **v0.3.1 Fix 2: push_or_repeat** | **None 발생 시 sparkline 정체 방지** | `metrics.rs:push()` |
+
+v0.3은 "오염 자체를 차단"하는 방어, v0.3.1은 "오염이 발생해도 표시를 유지"하는 복원력(resilience) 계층.
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
