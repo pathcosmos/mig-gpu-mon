@@ -920,6 +920,97 @@ entries.truncate(5);
 | More than 5 processes | Top 5 by VRAM | MB first, N/A last | Sort logic |
 | MIG instance | MIG-specific processes | MB or "N/A" | Collected via MIG handle |
 
+#### MIG Top Processes Parent Device Fallback Bug Analysis & Fix (v0.3.3)
+
+##### Symptoms
+
+Despite v0.3.2 fixes (preserving `UsedGpuMemory::Unavailable` processes and unified compute+graphics collection), MIG instances still show "No processes" even when processes are actively running.
+
+##### Root Cause Analysis
+
+**Issue: `running_compute_processes()` / `running_graphics_processes()` fail on MIG device handles**
+
+```rust
+// Inside collect_device_metrics() — called with MIG handle
+if let Ok(procs) = device.running_compute_processes() {   // ← Returns Err on MIG handle
+    for p in &procs { ... }
+}
+if let Ok(procs) = device.running_graphics_processes() {  // ← Returns Err on MIG handle
+    for p in &procs { ... }
+}
+```
+
+On NVIDIA drivers like 535.x, `nvmlDeviceGetComputeRunningProcesses()` / `nvmlDeviceGetGraphicsRunningProcesses()` return `NVML_ERROR_NOT_SUPPORTED` for **MIG device handles**. The `if let Ok` pattern silently swallows the error, leaving `entries` empty → "No processes" displayed.
+
+However, calling the same APIs on the **parent GPU device handle** returns all processes across all MIG instances, with the `gpu_instance_id` field properly set.
+
+##### Fix Details
+
+**Added Phase 3 to `collect_mig_instances()`** (`nvml.rs`)
+
+```rust
+// === Phase 3: MIG process parent device fallback ===
+// When Phase 1 fails to collect processes via MIG handle,
+// query parent GPU and filter by gpu_instance_id
+
+// 1. Query compute + graphics processes from parent device (once)
+let parent_procs = parent_device.running_compute_processes()
+    + parent_device.running_graphics_processes();  // PID dedup
+
+// 2. Distribute to MIG instances by gpu_instance_id matching
+for (mig_handle, metrics) in &mut phase1 {
+    if !metrics.top_processes.is_empty() { continue; }  // Skip if already collected
+    let gi_id = get_device_info(mig_device).gpu_instance_id;
+    metrics.top_processes = parent_procs
+        .filter(|p| p.gpu_instance_id == gi_id)
+        .sort_by_vram_desc()
+        .truncate(5);
+}
+```
+
+**Key Design:**
+- `nvml-wrapper 0.10`'s `ProcessInfo` struct provides `gpu_instance_id: Option<u32>` → enables per-MIG-instance filtering
+- MIG instances that already collected processes in Phase 1 are skipped (some drivers do support process queries on MIG handles)
+- Parent device query runs only once → minimal additional NVML IPC per tick
+
+##### Full 3-Phase Collection Flow
+
+```
+collect_mig_instances():
+  Phase 1: Collect base metrics for each MIG instance (VRAM, util, process attempt)
+           → Process API on MIG handle fails → top_processes = []
+  Phase 2: GPM fallbacks (memory_util, Hopper+ only)
+           → All VRAM already collected → GPM corruption irrelevant
+  Phase 3: Process parent device fallback (NEW)
+           → Query processes from parent GPU → filter by gpu_instance_id → distribute to MIG instances
+```
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/nvml.rs` | Added Phase 3 to `collect_mig_instances()` — parent device process query + `gpu_instance_id` filtering + per-MIG-instance distribution |
+
+##### Cross-Verification Matrix
+
+| Scenario | Process Display | VRAM Display | Verification |
+|----------|----------------|-------------|-------------|
+| MIG handle process API succeeds | Collected directly in Phase 1 | MB or "N/A" | `!top_processes.is_empty()` → Phase 3 skipped |
+| MIG handle process API fails (535.x) | Collected from parent device → gi_id filter | MB or "N/A" | Phase 3 fallback activates |
+| Parent device process API also fails | "No processes" | — | Both APIs fail → empty list |
+| Processes distributed across multiple MIG instances | Correctly distributed per MIG | MB or "N/A" | `gpu_instance_id` matching ensures accurate distribution |
+| Non-MIG GPU | Phase 3 not executed | MB value | `collect_mig_instances` not called at all |
+
+##### v0.3.2 → v0.3.3 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.2: VRAM Unavailable preservation | Keeps process visible when VRAM is `None` | `collect_device_metrics()` |
+| v0.3.2: compute + graphics unification | Collects from both APIs, PID dedup | `collect_device_metrics()` |
+| **v0.3.3: Parent device fallback** | **When MIG handle process API fails → collect from parent → distribute by gi_id** | `collect_mig_instances()` Phase 3 |
+
+v0.3.2 prevents "data loss when MIG handles do return processes"; v0.3.3 handles "when MIG handle process APIs fail entirely, fall back to parent device".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -1059,6 +1150,7 @@ Total RSS ~4-8 MB
 | `gpm_prev_samples` defensive shrink | `nvml.rs` | Same shrink heuristic applied to GPM sample HashMap → auto-shrink when `capacity > len*4`, reclaims memory on repeated MIG reconfigs |
 | proc_name_cache HashSet-based pruning | `nvml.rs` | Per-tick dead PID pruning changed from O(n·m) nested iteration → `HashSet<u32>` O(n+m) lookup, consistent performance as process count grows |
 | Memory panel consolidated to right | `dashboard.rs` | Removed left Memory box → RAM/SWP bars integrated into right System Charts, expanding CPU core display area |
+| MIG process parent device fallback | `nvml.rs` | When MIG handle process API fails, query parent GPU → filter by `gpu_instance_id` to distribute processes per MIG instance (Phase 3) |
 
 ### Optimization Details: CPU (Minimize System Calls)
 

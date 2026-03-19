@@ -327,6 +327,77 @@ impl NvmlCollector {
                 }
             }
 
+            // === Phase 3: Process fallback from parent device ===
+            // MIG device handles often fail running_compute_processes() / running_graphics_processes()
+            // on drivers like 535.x. Query the parent device instead and filter by gpu_instance_id.
+            {
+                let mut parent_procs: Vec<(u32, Option<u64>, Option<u32>)> = Vec::new();
+                let mut seen_pids = HashSet::new();
+
+                if let Ok(procs) = parent_device.running_compute_processes() {
+                    for p in &procs {
+                        let vram = match p.used_gpu_memory {
+                            UsedGpuMemory::Used(bytes) => Some(bytes),
+                            UsedGpuMemory::Unavailable => None,
+                        };
+                        if seen_pids.insert(p.pid) {
+                            parent_procs.push((p.pid, vram, p.gpu_instance_id));
+                        }
+                    }
+                }
+                if let Ok(procs) = parent_device.running_graphics_processes() {
+                    for p in &procs {
+                        let vram = match p.used_gpu_memory {
+                            UsedGpuMemory::Used(bytes) => Some(bytes),
+                            UsedGpuMemory::Unavailable => None,
+                        };
+                        if seen_pids.insert(p.pid) {
+                            parent_procs.push((p.pid, vram, p.gpu_instance_id));
+                        }
+                    }
+                }
+
+                // Distribute parent processes to MIG instances by gpu_instance_id
+                for (mig_handle, metrics) in &mut phase1 {
+                    // Skip if MIG handle already has processes (some drivers do work)
+                    if !metrics.top_processes.is_empty() {
+                        continue;
+                    }
+
+                    let mig_device = Device::new(*mig_handle, &self.nvml);
+                    let mig_info = self.get_device_info(&mig_device, true);
+                    let gi_id = mig_info.gpu_instance_id;
+
+                    let mut entries: Vec<(u32, Option<u64>)> = parent_procs
+                        .iter()
+                        .filter(|(_, _, proc_gi)| *proc_gi == gi_id && gi_id.is_some())
+                        .map(|(pid, vram, _)| (*pid, *vram))
+                        .collect();
+
+                    // Sort: known VRAM descending, Unavailable at end
+                    entries.sort_by(|a, b| match (b.1, a.1) {
+                        (Some(bv), Some(av)) => bv.cmp(&av),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.0.cmp(&b.0),
+                    });
+                    entries.truncate(5);
+
+                    let count = entries.len() as u32;
+                    let proc_infos: Vec<GpuProcessInfo> = entries
+                        .into_iter()
+                        .map(|(pid, vram)| GpuProcessInfo {
+                            pid,
+                            name: self.process_name(pid),
+                            vram_used: vram,
+                        })
+                        .collect();
+
+                    metrics.process_count = count;
+                    metrics.top_processes = proc_infos;
+                }
+            }
+
             mig_metrics.extend(phase1.into_iter().map(|(_, m)| m));
         }
 

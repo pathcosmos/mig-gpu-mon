@@ -920,6 +920,97 @@ entries.truncate(5);
 | 5개 초과 프로세스 | 상위 5개 (VRAM 기준) | MB 우선, N/A 후순위 | 정렬 로직 |
 | MIG 인스턴스 | 해당 MIG 프로세스 | MB 또는 "N/A" | MIG 핸들에서 수집 |
 
+#### MIG Top Processes 부모 디바이스 폴백 버그 분석 및 수정 (v0.3.3)
+
+##### 증상
+
+v0.3.2에서 `UsedGpuMemory::Unavailable` 프로세스 보존 및 compute+graphics 통합 수집을 적용했음에도, MIG 인스턴스에서 "No processes"가 계속 표시되는 현상.
+
+##### 근본 원인 분석
+
+**문제: `running_compute_processes()` / `running_graphics_processes()`가 MIG 디바이스 핸들에서 실패**
+
+```rust
+// collect_device_metrics() 내부 — MIG 핸들 전달
+if let Ok(procs) = device.running_compute_processes() {   // ← MIG 핸들에서 Err 반환
+    for p in &procs { ... }
+}
+if let Ok(procs) = device.running_graphics_processes() {  // ← MIG 핸들에서 Err 반환
+    for p in &procs { ... }
+}
+```
+
+NVIDIA 드라이버 535.x 등에서 `nvmlDeviceGetComputeRunningProcesses()` / `nvmlDeviceGetGraphicsRunningProcesses()`는 **MIG 디바이스 핸들**에 대해 `NVML_ERROR_NOT_SUPPORTED`를 반환한다. `if let Ok` 패턴으로 에러가 조용히 무시되어 `entries`가 항상 빈 상태 → "No processes" 표시.
+
+반면 **부모 GPU 디바이스 핸들**에서 같은 API를 호출하면 모든 MIG 인스턴스의 프로세스가 `gpu_instance_id` 필드와 함께 정상 반환된다.
+
+##### 수정 내용
+
+**`collect_mig_instances()`에 Phase 3 추가** (`nvml.rs`)
+
+```rust
+// === Phase 3: MIG 프로세스 부모 디바이스 폴백 ===
+// Phase 1에서 MIG 핸들로 수집 실패한 경우, 부모 GPU에서 프로세스 쿼리 후
+// gpu_instance_id로 필터링하여 각 MIG 인스턴스에 분배
+
+// 1. 부모 디바이스에서 compute + graphics 프로세스 1회 쿼리
+let parent_procs = parent_device.running_compute_processes()
+    + parent_device.running_graphics_processes();  // PID dedup
+
+// 2. 각 MIG 인스턴스에 gpu_instance_id 매칭하여 분배
+for (mig_handle, metrics) in &mut phase1 {
+    if !metrics.top_processes.is_empty() { continue; }  // 이미 수집 성공이면 skip
+    let gi_id = get_device_info(mig_device).gpu_instance_id;
+    metrics.top_processes = parent_procs
+        .filter(|p| p.gpu_instance_id == gi_id)
+        .sort_by_vram_desc()
+        .truncate(5);
+}
+```
+
+**핵심 설계:**
+- `nvml-wrapper 0.10`의 `ProcessInfo` 구조체가 `gpu_instance_id: Option<u32>` 필드 제공 → MIG 인스턴스별 필터링 가능
+- Phase 1에서 이미 프로세스를 수집한 MIG 인스턴스는 건너뜀 (일부 드라이버에서는 MIG 핸들에서도 동작)
+- 부모 디바이스 쿼리는 1회만 수행 → tick당 추가 NVML IPC 최소화
+
+##### 3-phase 수집 전체 흐름
+
+```
+collect_mig_instances():
+  Phase 1: 각 MIG 인스턴스의 기본 메트릭 수집 (VRAM, util, 프로세스 시도)
+           → MIG 핸들에서 프로세스 API 실패 시 top_processes = []
+  Phase 2: GPM 폴백 (memory_util, Hopper+ only)
+           → 모든 VRAM 이미 수집 완료 → GPM 오염 무관
+  Phase 3: 프로세스 부모 디바이스 폴백 (NEW)
+           → 부모 GPU에서 프로세스 쿼리 → gpu_instance_id로 MIG 인스턴스별 분배
+```
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/nvml.rs` | `collect_mig_instances()`에 Phase 3 추가 — 부모 디바이스 프로세스 쿼리 + `gpu_instance_id` 필터링 + MIG 인스턴스별 분배 |
+
+##### 상호 검증 매트릭스
+
+| 시나리오 | 프로세스 표시 | VRAM 표시 | 검증 |
+|----------|-------------|-----------|------|
+| MIG 핸들 프로세스 API 성공 | Phase 1에서 직접 수집 | MB 또는 "N/A" | `!top_processes.is_empty()` → Phase 3 skip |
+| MIG 핸들 프로세스 API 실패 (535.x) | 부모 디바이스에서 수집 → gi_id 필터 | MB 또는 "N/A" | Phase 3 폴백 동작 |
+| 부모 디바이스 프로세스 API도 실패 | "No processes" | — | 양쪽 모두 실패 시 빈 리스트 |
+| 여러 MIG 인스턴스에 프로세스 분산 | 각 MIG별로 올바르게 분배 | MB 또는 "N/A" | `gpu_instance_id` 매칭으로 정확한 분배 |
+| Non-MIG GPU | Phase 3 미실행 | MB 값 | `collect_mig_instances` 자체가 호출되지 않음 |
+
+##### v0.3.2 → v0.3.3 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.2: VRAM Unavailable 보존 | 프로세스 VRAM `None`일 때 프로세스 자체는 유지 | `collect_device_metrics()` |
+| v0.3.2: compute + graphics 통합 | 양쪽 API 모두 수집, PID dedup | `collect_device_metrics()` |
+| **v0.3.3: 부모 디바이스 폴백** | **MIG 핸들 프로세스 API 실패 시 부모에서 수집 → gi_id 분배** | `collect_mig_instances()` Phase 3 |
+
+v0.3.2는 "MIG 핸들에서 프로세스가 반환될 때 데이터 손실 방지", v0.3.3은 "MIG 핸들에서 프로세스 API 자체가 실패할 때 부모 디바이스로 폴백".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -1057,6 +1148,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Top Processes 컬럼 정렬 수정 | `dashboard.rs` | 헤더(하드코딩 8+22+4) ↔ 데이터({:<7}+{:<15}+{:>10}) 폭 불일치 → 동일 포맷 폭으로 통일 |
 | Compute + Graphics 프로세스 통합 | `nvml.rs` | compute만 수집 → compute + graphics 양쪽 수집 + HashSet PID dedup, VRAM Unavailable 프로세스 보존 |
 | `GpuProcessInfo.vram_used` Option화 | `metrics.rs` | `u64` → `Option<u64>`, VRAM Unavailable 프로세스 "N/A" 표시 (기존: 필터링 제거) |
+| MIG 프로세스 부모 디바이스 폴백 | `nvml.rs` | MIG 핸들 프로세스 API 실패 시 부모 GPU에서 프로세스 쿼리 → `gpu_instance_id` 필터링으로 MIG 인스턴스별 분배 (Phase 3) |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
