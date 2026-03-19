@@ -221,10 +221,6 @@ impl SystemMetrics {
         (self.swap_used as f64 / self.swap_total as f64) * 100.0
     }
 
-    pub fn ram_used_gb(&self) -> f64 {
-        self.ram_used as f64 / (1024.0 * 1024.0 * 1024.0)
-    }
-
     pub fn ram_total_gb(&self) -> f64 {
         self.ram_total as f64 / (1024.0 * 1024.0 * 1024.0)
     }
@@ -243,6 +239,10 @@ impl SystemMetrics {
 pub struct SystemHistory {
     pub cpu_total: VecDeque<f32>,
     pub ram_percent: VecDeque<f64>,
+    /// Non-reclaimable used % (total - available) / total * 100
+    pub ram_used_pct: VecDeque<f32>,
+    /// Reclaimable cache/buffers % (available - free) / total * 100
+    pub ram_cached_pct: VecDeque<f32>,
     max_entries: usize,
 }
 
@@ -251,6 +251,8 @@ impl SystemHistory {
         Self {
             cpu_total: VecDeque::with_capacity(max_entries),
             ram_percent: VecDeque::with_capacity(max_entries),
+            ram_used_pct: VecDeque::with_capacity(max_entries),
+            ram_cached_pct: VecDeque::with_capacity(max_entries),
             max_entries,
         }
     }
@@ -265,5 +267,27 @@ impl SystemHistory {
             self.ram_percent.pop_front();
         }
         self.ram_percent.push_back(metrics.ram_percent());
+
+        let total = metrics.ram_total as f64;
+        let (used_pct, cached_pct) = if total > 0.0 {
+            let used = metrics.ram_total.saturating_sub(metrics.ram_available) as f64;
+            let cached = metrics.ram_available.saturating_sub(metrics.ram_free) as f64;
+            (
+                (used / total * 100.0) as f32,
+                (cached / total * 100.0) as f32,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        if self.ram_used_pct.len() >= self.max_entries {
+            self.ram_used_pct.pop_front();
+        }
+        self.ram_used_pct.push_back(used_pct);
+
+        if self.ram_cached_pct.len() >= self.max_entries {
+            self.ram_cached_pct.pop_front();
+        }
+        self.ram_cached_pct.push_back(cached_pct);
     }
 }

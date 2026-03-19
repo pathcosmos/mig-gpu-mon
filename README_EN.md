@@ -36,7 +36,7 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 ├─ GPU Util 45% ──────────────────┬─ CPU Total 23.4% ───────────────────┤
 │ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 25%
 ├─ Mem Ctrl 38% ──────────────────┼─ RAM 89.2/256.0 GiB (34.8%) ────────┤    ← Bottom 55%
-│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅                   │ ← 25%
+│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅ ← used+cached color│ ← 25%
 ├─ VRAM 12288/20480 MB (60.0%) ──┼──────────────────────────────────────┤
 │ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             │                                     │ ← 25%
 ├─ PCIe TX:12.3 RX:56.7 MB/s ────┼──────────────────────────────────────┤
@@ -89,7 +89,8 @@ draw()
 │       │   └── PCIe TX/RX MB/s       sparkline   25% (when PCIe data available)
 │       └── System Charts  50%
 │           ├── CPU Total {pct}%       sparkline   50%
-│           └── RAM {u}/{t} GiB ({p}%) sparkline   50%
+│           └── RAM {u}/{t} GiB ({p}%) segmented chart 50%
+│               └── segmented bar chart: used(Green/Yellow/Red) + cached(Blue), per-tick vertical bars
 └── Footer                          Length(3)
 ```
 
@@ -108,7 +109,8 @@ draw()
 | VRAM sparkline | Magenta | — |
 | PCIe sparkline | LightCyan | Shown only when PCIe data available |
 | CPU sparkline | Cyan | — |
-| RAM sparkline | Yellow | — |
+| RAM chart (Used segment) | Green / Yellow / Red | 0-50% / 50-80% / 80%+ (based on used%) |
+| RAM chart (Cached segment) | Blue | Kernel cache/buffers (available - free) |
 | VRAM % (Detail) | Green / Yellow / Red | 0-70% / 70-90% / 90%+ |
 | Temp | Green / Yellow / Red | 0-60°C / 60-80°C / 80°C+ |
 | Clock values | Cyan | — |
@@ -149,7 +151,8 @@ When all utilization APIs fail (common on driver 535.x with MIG), metrics are di
 - **Architecture & Compute Capability** — GPU architecture (Ampere, Hopper, etc.) + CUDA CC
 - Per-core CPU usage (sorted by usage descending, dynamic multi-column bar graph adapting to terminal width)
 - System RAM (segmented bar: used/cached/free color-coded with per-segment numeric values + available/total) / Swap usage
-- Time-series sparkline graphs for GPU Util / Mem Ctrl / **VRAM** / **PCIe** / CPU Total / RAM (current values in title)
+  - RAM calculation: `used = total - available` (non-reclaimable), `cached = available - free` (reclaimable cache/buffers), `free = MemFree`
+- Time-series sparkline graphs for GPU Util / Mem Ctrl / **VRAM** / **PCIe** / CPU Total + **RAM segmented chart** (used/cached color-coded, current values in title)
 - Switch between GPU/MIG instances with Tab/arrow keys
 - Single binary deployment (~1.5MB, dynamically links libc — no separate runtime install needed)
 
@@ -862,7 +865,7 @@ Total RSS ~4-8 MB
 ├── History ring buffers               ~80 KB
 │   ├── MetricsHistory per GPU          ~22 KB   (9 VecDeque × 300 × 4-8B)
 │   │   (× 3 devices = ~42 KB)
-│   └── SystemHistory                   ~5 KB    (2 VecDeque × 300 × 4-8B)
+│   └── SystemHistory                   ~7 KB    (4 VecDeque × 300 × 4-8B, incl. ram_used_pct/ram_cached_pct)
 ├── ratatui Terminal double buffer     ~50-400 KB (proportional to terminal size)
 │   (80×24: ~77KB, 200×50: ~400KB)
 ├── sysinfo System struct              ~30-50 KB  (CPU only, no processes)
@@ -902,7 +905,9 @@ Total RSS ~4-8 MB
 | HashMap uuid clone | `app.rs` | `uuid.clone()` every tick → `contains_key` then clone only on miss |
 | GPU history auto-cleanup | `app.rs` | Unbounded HashMap growth on MIG reconfig/GPU removal → `retain()` removes orphan UUID entries |
 | GPM sample + device cache auto-pruning | `nvml.rs` | Stale `nvmlGpmSample_t` + `DeviceInfo` leaked on MIG reconfig → per-tick active handle tracking + `retain()` + `nvmlGpmSampleFree()` |
-| NVML sample buffer shrink | `nvml.rs` | grow-only buffer could grow unbounded → auto `shrink_to(needed×2)` when capacity > needed×4 |
+| NVML sample buffer shrink | `nvml.rs` | grow-only buffer could grow unbounded → auto `shrink_to(needed×2)` when capacity > needed×2 |
+| RAM chart zero-alloc rendering | `dashboard.rs` | Per-frame `Vec<ColSegment>` allocation → direct iterator + buffer write (zero allocation) |
+| RAM calculation accuracy fix | `dashboard.rs` | `used = ram_used - (avail-free)` (double subtraction) → `used = total - available` (correct non-reclaimable memory) |
 | `format_pstate` zero-alloc | `nvml.rs` | `"P0".to_string()` per tick → returns `&'static str` (zero allocation) |
 | `format_architecture` zero-alloc | `nvml.rs` | Same pattern: `"Ampere".to_string()` → `&'static str` |
 | `format_throttle_reasons` Vec removal | `nvml.rs` | `Vec::new()` + `push` + `join()` → macro appends directly to `String` (eliminates Vec allocation) |
@@ -952,7 +957,7 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | VecDeque ring buffer (300 fixed) | `metrics.rs` | GPU/system history size fixed, cannot grow unbounded |
 | GPU history auto-cleanup | `app.rs` | Orphan entries auto-deleted on MIG reconfig/GPU removal |
 | GPM sample + device cache pruning | `nvml.rs` | Per-tick active handle tracking → frees stale `nvmlGpmSample_t` + removes `DeviceInfo`, no leaks across repeated MIG reconfigs |
-| NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > needed×4, recovers after transient spikes |
+| NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > needed×2, faster recovery after transient spikes |
 | DeviceInfo cache (one-time) | `nvml.rs` | Static info (arch, CC, etc.) cached on first call, zero allocation thereafter |
 | sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |
 

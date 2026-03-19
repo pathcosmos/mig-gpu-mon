@@ -339,7 +339,7 @@ impl NvmlCollector {
 
         // Shrink buffer if it grew much larger than needed (prevent unbounded growth)
         let actual = count as usize;
-        if buf.capacity() > actual.max(32) * 4 {
+        if buf.capacity() > actual.max(32) * 2 {
             buf.truncate(actual);
             buf.shrink_to(actual * 2);
         }
@@ -400,7 +400,7 @@ impl NvmlCollector {
 
         // Shrink buffer if it grew much larger than needed (prevent unbounded growth)
         let actual = count as usize;
-        if buf.capacity() > actual.max(128) * 4 {
+        if buf.capacity() > actual.max(128) * 2 {
             buf.truncate(actual);
             buf.shrink_to(actual * 2);
         }

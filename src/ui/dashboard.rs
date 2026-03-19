@@ -34,15 +34,6 @@ fn with_spark_data_f32(src: &std::collections::VecDeque<f32>, f: impl FnOnce(&[u
     });
 }
 
-fn with_spark_data_f64(src: &std::collections::VecDeque<f64>, f: impl FnOnce(&[u64])) {
-    SPARK_BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.clear();
-        buf.extend(src.iter().map(|&v| v as u64));
-        f(&buf);
-    });
-}
-
 fn with_spark_data_u64(src: &std::collections::VecDeque<u64>, f: impl FnOnce(&[u64])) {
     SPARK_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
@@ -216,7 +207,6 @@ fn make_bar(percent: f32, width: usize) -> String {
     let filled = ((percent / 100.0) * width as f32).round() as usize;
     let filled = filled.min(width);
     let empty = width - filled;
-    // Pre-sized string: " " + filled * "▮"(3 bytes) + empty * "▯"(3 bytes)
     let mut s = String::with_capacity(1 + (filled + empty) * 3);
     s.push(' ');
     for _ in 0..filled {
@@ -290,10 +280,10 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
 
     let ram_bar_width = rows[0].width.saturating_sub(30) as usize;
 
-    // Segment ratios: used (excl cache) | cached/buffers | free
+    // Correct decomposition: used(non-reclaimable) + cached(reclaimable) + free = total
     let total = sys.ram_total as f64;
-    let cached_bytes = sys.ram_available.saturating_sub(sys.ram_free);
-    let used_pure = sys.ram_used.saturating_sub(cached_bytes); // used excluding cache
+    let used_pure = sys.ram_total.saturating_sub(sys.ram_available); // non-reclaimable
+    let cached_bytes = sys.ram_available.saturating_sub(sys.ram_free); // reclaimable cache/buffers
     let (used_pct, cached_pct, free_pct) = if total > 0.0 {
         (
             (used_pure as f64 / total * 100.0) as f32,
@@ -304,7 +294,11 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
         (0.0, 0.0, 0.0)
     };
 
-    let ram_pct = sys.ram_percent();
+    let ram_pct = if total > 0.0 {
+        used_pure as f64 / total * 100.0
+    } else {
+        0.0
+    };
     let used_color = if ram_pct > 80.0 {
         Color::Red
     } else if ram_pct > 50.0 {
@@ -911,31 +905,117 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(sparkline, rows[0]);
     });
 
-    // RAM sparkline
-    let ram_label = app
+    // RAM segmented chart (used=green/yellow/red, cached=blue, free=dark gray)
+    let ram_title = app
         .system_metrics
         .as_ref()
         .map(|s| {
+            let total = s.ram_total as f64;
+            let used_pure = s.ram_total.saturating_sub(s.ram_available) as f64;
+            let gib = 1024.0 * 1024.0 * 1024.0;
+            let used_pct = if total > 0.0 {
+                used_pure / total * 100.0
+            } else {
+                0.0
+            };
             format!(
                 " RAM {:.1}/{:.1} GiB ({:.1}%) ",
-                s.ram_used_gb(),
+                used_pure / gib,
                 s.ram_total_gb(),
-                s.ram_percent()
+                used_pct
             )
         })
         .unwrap_or_else(|| " RAM ".to_string());
-    with_spark_data_f64(&app.system_history.ram_percent, |data| {
-        let sparkline = Sparkline::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(ram_label.as_str()),
-            )
-            .data(data)
-            .max(100)
-            .style(Style::default().fg(Color::Yellow));
-        f.render_widget(sparkline, rows[1]);
-    });
+
+    let ram_title_line = Line::from(vec![
+        Span::raw(ram_title),
+        Span::styled("used", Style::default().fg(Color::Green)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("cached", Style::default().fg(Color::Blue)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("free ", Style::default().fg(Color::DarkGray)),
+    ]);
+    let ram_block = Block::default().borders(Borders::ALL).title(ram_title_line);
+    let ram_inner = ram_block.inner(rows[1]);
+    f.render_widget(ram_block, rows[1]);
+
+    draw_ram_segmented_chart(f, app, ram_inner);
+}
+
+/// Render a segmented vertical bar chart for RAM history.
+/// Each column represents one tick; within each column, colored segments
+/// are stacked bottom-to-top: used (green/yellow/red) then cached (blue).
+/// Remaining height is left empty (background = free).
+/// Zero-alloc: iterates directly over history, no intermediate Vec.
+fn draw_ram_segmented_chart(f: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let hist = &app.system_history;
+    let len = hist.ram_used_pct.len();
+    if len == 0 {
+        return;
+    }
+
+    let width = area.width as usize;
+    let height = area.height as usize;
+    let height_f = height as f32;
+
+    // Take the most recent `width` samples
+    let skip = len.saturating_sub(width);
+    let col_count = len - skip;
+    let x_offset = area.x + (width.saturating_sub(col_count)) as u16;
+
+    let bar_chars: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let buf = f.buffer_mut();
+
+    // Column-major iteration: compute per-column then write cells top-to-bottom
+    for (col_idx, (&u_pct, &c_pct)) in hist
+        .ram_used_pct
+        .iter()
+        .skip(skip)
+        .zip(hist.ram_cached_pct.iter().skip(skip))
+        .enumerate()
+    {
+        let x = x_offset + col_idx as u16;
+        if x >= area.x + area.width {
+            break;
+        }
+
+        let used_h = u_pct / 100.0 * height_f;
+        let cached_h = c_pct / 100.0 * height_f;
+        let used_rows = used_h as usize;
+        let used_frac = used_h.fract();
+        let cached_rows = cached_h as usize;
+        let cached_frac = cached_h.fract();
+        let used_color = if u_pct > 80.0 {
+            Color::Red
+        } else if u_pct > 50.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+
+        for row in 0..height {
+            let bottom_row = height - 1 - row;
+            let (ch, color) = if bottom_row < used_rows {
+                ('█', used_color)
+            } else if bottom_row == used_rows && used_frac > 0.05 {
+                (bar_chars[(used_frac * 8.0) as usize % 8], used_color)
+            } else if bottom_row < used_rows + cached_rows {
+                ('█', Color::Blue)
+            } else if bottom_row == used_rows + cached_rows && cached_frac > 0.05 {
+                (bar_chars[(cached_frac * 8.0) as usize % 8], Color::Blue)
+            } else {
+                continue; // empty cell — skip buffer write
+            };
+
+            let cell = &mut buf[(x, area.y + row as u16)];
+            cell.set_char(ch);
+            cell.set_fg(color);
+        }
+    }
 }
 
 fn vram_pct_color(pct: f64) -> Color {
