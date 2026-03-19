@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
 
+/// 1 GiB in bytes (as f64), used for byte-to-GiB conversions.
+pub const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
+
 /// Per-process GPU memory usage
 #[derive(Debug, Clone)]
 pub struct GpuProcessInfo {
@@ -222,16 +225,56 @@ impl SystemMetrics {
     }
 
     pub fn ram_total_gb(&self) -> f64 {
-        self.ram_total as f64 / (1024.0 * 1024.0 * 1024.0)
+        self.ram_total as f64 / GIB_F64
     }
 
     pub fn swap_used_gb(&self) -> f64 {
-        self.swap_used as f64 / (1024.0 * 1024.0 * 1024.0)
+        self.swap_used as f64 / GIB_F64
     }
 
     pub fn swap_total_gb(&self) -> f64 {
-        self.swap_total as f64 / (1024.0 * 1024.0 * 1024.0)
+        self.swap_total as f64 / GIB_F64
     }
+
+    /// Decompose RAM into (used_pure_bytes, cached_bytes, free_bytes) and percentages.
+    /// Returns (used_pure, cached, free, used_pct, cached_pct, free_pct, avail_gb, total_gb).
+    pub fn ram_breakdown(&self) -> RamBreakdown {
+        let total = self.ram_total as f64;
+        let used_pure = self.ram_total.saturating_sub(self.ram_available);
+        let cached_bytes = self.ram_available.saturating_sub(self.ram_free);
+        let (used_pct, cached_pct, free_pct) = if total > 0.0 {
+            (
+                (used_pure as f64 / total * 100.0) as f32,
+                (cached_bytes as f64 / total * 100.0) as f32,
+                (self.ram_free as f64 / total * 100.0) as f32,
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        RamBreakdown {
+            used_gb: used_pure as f64 / GIB_F64,
+            cached_gb: cached_bytes as f64 / GIB_F64,
+            free_gb: self.ram_free as f64 / GIB_F64,
+            avail_gb: self.ram_available as f64 / GIB_F64,
+            total_gb: self.ram_total_gb(),
+            used_pct,
+            cached_pct,
+            free_pct,
+        }
+    }
+}
+
+/// Pre-computed RAM breakdown to avoid redundant calculations across draw functions.
+#[derive(Debug, Clone, Copy)]
+pub struct RamBreakdown {
+    pub used_gb: f64,
+    pub cached_gb: f64,
+    pub free_gb: f64,
+    pub avail_gb: f64,
+    pub total_gb: f64,
+    pub used_pct: f32,
+    pub cached_pct: f32,
+    pub free_pct: f32,
 }
 
 /// History for system metrics

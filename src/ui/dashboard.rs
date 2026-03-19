@@ -258,18 +258,7 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let mem_title = Line::from(vec![
-        Span::raw(" Memory "),
-        Span::styled("used", Style::default().fg(Color::Green)),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("cached", Style::default().fg(Color::Blue)),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("free", Style::default().fg(Color::DarkGray)),
-        Span::raw(" "),
-        Span::styled("avl", Style::default().fg(Color::White)),
-        Span::raw(" "),
-    ]);
-    let block = Block::default().borders(Borders::ALL).title(mem_title);
+    let block = Block::default().borders(Borders::ALL).title(" Memory ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -280,32 +269,8 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
 
     let ram_bar_width = rows[0].width.saturating_sub(30) as usize;
 
-    // Correct decomposition: used(non-reclaimable) + cached(reclaimable) + free = total
-    let total = sys.ram_total as f64;
-    let used_pure = sys.ram_total.saturating_sub(sys.ram_available); // non-reclaimable
-    let cached_bytes = sys.ram_available.saturating_sub(sys.ram_free); // reclaimable cache/buffers
-    let (used_pct, cached_pct, free_pct) = if total > 0.0 {
-        (
-            (used_pure as f64 / total * 100.0) as f32,
-            (cached_bytes as f64 / total * 100.0) as f32,
-            (sys.ram_free as f64 / total * 100.0) as f32,
-        )
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-
-    let ram_pct = if total > 0.0 {
-        used_pure as f64 / total * 100.0
-    } else {
-        0.0
-    };
-    let used_color = if ram_pct > 80.0 {
-        Color::Red
-    } else if ram_pct > 50.0 {
-        Color::Yellow
-    } else {
-        Color::Green
-    };
+    let rb = sys.ram_breakdown();
+    let used_color = ram_used_color(rb.used_pct);
 
     let mut ram_spans = vec![Span::styled(
         "RAM",
@@ -317,36 +282,31 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
         &mut ram_spans,
         ram_bar_width,
         &[
-            (used_pct, used_color),
-            (cached_pct, Color::Blue),
-            (free_pct, Color::DarkGray),
+            (rb.used_pct, used_color),
+            (rb.cached_pct, Color::Blue),
+            (rb.free_pct, Color::DarkGray),
         ],
     );
-    let gib = 1024.0 * 1024.0 * 1024.0;
-    let used_pure_gb = used_pure as f64 / gib;
-    let cached_gb = cached_bytes as f64 / gib;
-    let free_gb = sys.ram_free as f64 / gib;
-    let avail_gb = sys.ram_available as f64 / gib;
     ram_spans.push(Span::styled(
-        format!(" {:.1}", used_pure_gb),
+        format!(" {:.1}", rb.used_gb),
         Style::default().fg(used_color),
     ));
     ram_spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
     ram_spans.push(Span::styled(
-        format!("{:.1}", cached_gb),
+        format!("{:.1}", rb.cached_gb),
         Style::default().fg(Color::Blue),
     ));
     ram_spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
     ram_spans.push(Span::styled(
-        format!("{:.1}", free_gb),
+        format!("{:.1}", rb.free_gb),
         Style::default().fg(Color::DarkGray),
     ));
     ram_spans.push(Span::styled(
-        format!(" avl:{:.1}", avail_gb),
+        format!(" avl:{:.1}", rb.avail_gb),
         Style::default().fg(Color::White),
     ));
     ram_spans.push(Span::styled(
-        format!("/{:.1}G", sys.ram_total_gb()),
+        format!("/{:.1}G", rb.total_gb),
         Style::default().fg(Color::White),
     ));
     f.render_widget(Paragraph::new(Line::from(ram_spans)), rows[0]);
@@ -887,7 +847,11 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
 fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Length(2),
+            Constraint::Min(3),
+        ])
         .split(area);
 
     // CPU total sparkline
@@ -910,41 +874,58 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(sparkline, rows[0]);
     });
 
-    // RAM segmented chart (used=green/yellow/red, cached=blue, free=dark gray)
-    let ram_title = app
-        .system_metrics
-        .as_ref()
-        .map(|s| {
-            let total = s.ram_total as f64;
-            let used_pure = s.ram_total.saturating_sub(s.ram_available) as f64;
-            let gib = 1024.0 * 1024.0 * 1024.0;
-            let used_pct = if total > 0.0 {
-                used_pure / total * 100.0
-            } else {
-                0.0
-            };
-            format!(
-                " RAM {:.1}/{:.1} GiB ({:.1}%) ",
-                used_pure / gib,
-                s.ram_total_gb(),
-                used_pct
-            )
-        })
-        .unwrap_or_else(|| " RAM ".to_string());
+    // Memory legend (2 lines)
+    draw_memory_legend(f, app, rows[1]);
 
-    let ram_title_line = Line::from(vec![
-        Span::raw(ram_title),
-        Span::styled("used", Style::default().fg(Color::Green)),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("cached", Style::default().fg(Color::Blue)),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("free ", Style::default().fg(Color::DarkGray)),
-    ]);
-    let ram_block = Block::default().borders(Borders::ALL).title(ram_title_line);
-    let ram_inner = ram_block.inner(rows[1]);
-    f.render_widget(ram_block, rows[1]);
+    // RAM segmented chart
+    let ram_block = Block::default().borders(Borders::ALL).title(" RAM ");
+    let ram_inner = ram_block.inner(rows[2]);
+    f.render_widget(ram_block, rows[2]);
 
     draw_ram_segmented_chart(f, app, ram_inner);
+}
+
+fn draw_memory_legend(f: &mut Frame, app: &App, area: Rect) {
+    let sys = match &app.system_metrics {
+        Some(s) => s,
+        None => return,
+    };
+
+    let rb = sys.ram_breakdown();
+    let used_color = ram_used_color(rb.used_pct);
+
+    // Line 1: color legend
+    let line1 = Line::from(vec![
+        Span::styled(" ▮", Style::default().fg(used_color)),
+        Span::styled(" used  ", Style::default().fg(used_color)),
+        Span::styled("▮", Style::default().fg(Color::Blue)),
+        Span::styled(" cached  ", Style::default().fg(Color::Blue)),
+        Span::styled("▮", Style::default().fg(Color::DarkGray)),
+        Span::styled(" free  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("RAM {:.1}/{:.1} GiB ({:.0}%)", rb.used_gb, rb.total_gb, rb.used_pct),
+            Style::default().fg(Color::White),
+        ),
+    ]);
+
+    // Line 2: numeric values
+    let line2 = Line::from(vec![
+        Span::styled(
+            format!(" {:.1}G", rb.used_gb),
+            Style::default().fg(used_color),
+        ),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.1}G", rb.cached_gb), Style::default().fg(Color::Blue)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.1}G", rb.free_gb), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  avl:{:.1}G", rb.avail_gb),
+            Style::default().fg(Color::White),
+        ),
+    ]);
+
+    let para = Paragraph::new(vec![line1, line2]);
+    f.render_widget(para, area);
 }
 
 /// Render a segmented vertical bar chart for RAM history.
@@ -1023,6 +1004,25 @@ fn draw_ram_segmented_chart(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Truncate a string to at most `max_chars` characters without allocation.
+/// Falls back to the full string if it's short enough.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+fn ram_used_color(used_pct: f32) -> Color {
+    if used_pct > 80.0 {
+        Color::Red
+    } else if used_pct > 50.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
 fn vram_pct_color(pct: f64) -> Color {
     if pct > 90.0 {
         Color::Red
@@ -1090,7 +1090,7 @@ fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
         )));
     } else {
         for proc in m.top_processes.iter().take(5) {
-            let name: String = proc.name.chars().take(15).collect();
+            let name = truncate_str(&proc.name, 15);
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{:<7}", proc.pid),

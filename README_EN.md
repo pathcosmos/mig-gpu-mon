@@ -20,7 +20,7 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 │  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% Mem:… │ ↓
 │  0 ▮▮▮▮▯▯▯  52%  33 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
 │  ...                            │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
-├─ Memory used/cached/free avl ─┤ UUID: MIG-a1b2...  Arch:Ampere CC:8.0│ │
+├─ Memory ─────────────────────┤ UUID: MIG-a1b2...  Arch:Ampere CC:8.0│ │
 │ RAM ▮▮▮▮▮▯▯ 70.1/12.5/6.6 … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │
 │ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU: 45%  Mem: 38%  SM: 45%         │ │ 50%
 │                                 │ Enc: 0%  Dec: 0%                     │ │
@@ -35,12 +35,12 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 │                                 │ 12400   pt_main_thread   4096 MB    │ ↓
 ├─ GPU Util 45% ──────────────────┬─ CPU Total 23.4% ───────────────────┤
 │ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 25%
-├─ Mem Ctrl 38% ──────────────────┼─ RAM 89.2/256.0 GiB (34.8%) ────────┤    ← Bottom 55%
-│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅ ← used+cached color│ ← 25%
-├─ VRAM 12288/20480 MB (60.0%) ──┼──────────────────────────────────────┤
-│ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             │                                     │ ← 25%
-├─ PCIe TX:12.3 RX:56.7 MB/s ────┼──────────────────────────────────────┤
-│ ▂▃▃▅▅▆▅▃▂▂▃▅▆▆▅▃              │                                     │ ← 25% (when PCIe available)
+├─ Mem Ctrl 38% ──────────────────┼─────────────────────────────────────┤    ← Bottom 55%
+│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▮ used  ▮ cached  ▮ free  RAM …     │ ← Memory legend (2 lines)
+├─ VRAM 12288/20480 MB (60.0%) ──│ 70.1G/12.5G/6.6G  avl:77.5G        │
+│ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             ├─ RAM ─────────────────────────────┤
+├─ PCIe TX:12.3 RX:56.7 MB/s ────│ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅ ← used+cached color│
+│ ▂▃▃▅▅▆▅▃▂▂▃▅▆▆▅▃              │                                     │ (when PCIe available)
 ├────────────────────────────────────────────────────────────────────────┤
 │ q Quit  Tab/↑↓ Switch GPU  [1/3]                                      │ ← Footer
 └────────────────────────────────────────────────────────────────────────┘
@@ -58,7 +58,7 @@ draw()
 │   │   ├── System Panel  50%
 │   │   │   ├── CPU Cores         Min(4)    " CPU ({N} cores) {pct}% "
 │   │   │   │   └── dynamic N-column bars   "{idx} ▮▮▯▯ {pct}%" (sorted by usage desc)
-│   │   │   └── RAM / Swap        Length(4)  " Memory used/cached/free avl "
+│   │   │   └── RAM / Swap        Length(4)  " Memory "
 │   │   │       ├── RAM line                 "RAM ▮▮▮▮▯▯ {used}/{cached}/{free} avl:{avail}/{total}G"
 │   │   │       │   └── segmented bar: used(Green/Yellow/Red) + cached(Blue) + free(DarkGray)
 │   │   │       │       numeric labels: used(color) / cached(Blue) / free(DarkGray) avl(White) / totalG(White)
@@ -89,7 +89,10 @@ draw()
 │       │   └── PCIe TX/RX MB/s       sparkline   25% (when PCIe data available)
 │       └── System Charts  50%
 │           ├── CPU Total {pct}%       sparkline   50%
-│           └── RAM {u}/{t} GiB ({p}%) segmented chart 50%
+│           ├── Memory Legend          Length(2)    2-line legend (above RAM chart)
+│           │   ├── Line 1: "▮ used  ▮ cached  ▮ free  RAM {u}/{t} GiB ({p}%)"
+│           │   └── Line 2: "{used}G/{cached}G/{free}G  avl:{avail}G"
+│           └── RAM                    segmented chart Min(3)
 │               └── segmented bar chart: used(Green/Yellow/Red) + cached(Blue), per-tick vertical bars
 └── Footer                          Length(3)
 ```
@@ -913,6 +916,9 @@ Total RSS ~4-8 MB
 | `format_pstate` zero-alloc | `nvml.rs` | `"P0".to_string()` per tick → returns `&'static str` (zero allocation) |
 | `format_architecture` zero-alloc | `nvml.rs` | Same pattern: `"Ampere".to_string()` → `&'static str` |
 | `format_throttle_reasons` Vec removal | `nvml.rs` | `Vec::new()` + `push` + `join()` → macro appends directly to `String` (eliminates Vec allocation) |
+| `GIB_F64` module constant | `metrics.rs` | Redundant `1024.0 * 1024.0 * 1024.0` computation → single `const GIB_F64` definition, reused globally |
+| `ram_breakdown()` unified calc | `metrics.rs` | Duplicate RAM decomposition in `draw_ram_swap` + `draw_memory_legend` → single `SystemMetrics::ram_breakdown()` call |
+| `truncate_str()` zero-alloc | `dashboard.rs` | `proc.name.chars().take(15).collect::<String>()` 5 allocs/frame → `&str` slicing (zero allocation) |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
