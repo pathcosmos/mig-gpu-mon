@@ -19,13 +19,14 @@ use std::os::raw::c_uint;
 
 use super::metrics::{GpuMetrics, GpuProcessInfo};
 
-/// Cached static device info that never changes at runtime
+/// Cached static device info that never changes at runtime.
+/// Uses Rc<str> for string fields to make clone() cheap (pointer bump, no heap alloc).
 #[derive(Clone)]
 struct DeviceInfo {
-    name: String,
-    uuid: String,
+    name: std::rc::Rc<str>,
+    uuid: std::rc::Rc<str>,
     architecture: Option<&'static str>,
-    compute_capability: Option<String>,
+    compute_capability: Option<std::rc::Rc<str>>,
     ecc_enabled: Option<bool>,
     temp_shutdown: Option<u32>,
     temp_slowdown: Option<u32>,
@@ -51,6 +52,9 @@ pub struct NvmlCollector {
     /// Previous GPM samples for DRAM BW util computation (keyed by device handle pointer).
     /// Each value is an allocated nvmlGpmSample_t that must be freed on drop.
     gpm_prev_samples: RefCell<HashMap<usize, nvmlGpmSample_t>>,
+    /// Cache: pid → process name. Avoids /proc/{pid}/comm I/O every tick for stable processes.
+    /// Entries are pruned each tick to remove dead PIDs.
+    proc_name_cache: RefCell<HashMap<u32, String>>,
 }
 
 impl NvmlCollector {
@@ -130,6 +134,7 @@ impl NvmlCollector {
             proc_sample_buf: RefCell::new(Vec::with_capacity(32)),
             sample_buf: RefCell::new(Vec::with_capacity(128)),
             gpm_prev_samples: RefCell::new(HashMap::new()),
+            proc_name_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -186,6 +191,22 @@ impl NvmlCollector {
         // Prune stale cache entries for removed GPUs / reconfigured MIG instances.
         // Prevents unbounded HashMap growth and frees NVML-allocated GPM samples.
         self.prune_stale_caches(&active_handles);
+
+        // Prune process name cache — keep only PIDs seen this tick
+        {
+            let mut name_cache = self.proc_name_cache.borrow_mut();
+            if !name_cache.is_empty() {
+                name_cache.retain(|pid, _| {
+                    all_metrics
+                        .iter()
+                        .any(|m| m.top_processes.iter().any(|p| p.pid == *pid))
+                });
+                let target = name_cache.len() * 2;
+                if name_cache.capacity() > name_cache.len().max(16) * 4 {
+                    name_cache.shrink_to(target);
+                }
+            }
+        }
 
         Ok(all_metrics)
     }
@@ -278,7 +299,8 @@ impl NvmlCollector {
                         }
                     }
 
-                    metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name);
+                    metrics.name =
+                        format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name).into();
                     phase1.push((mig_handle, metrics));
                 }
             }
@@ -337,11 +359,13 @@ impl NvmlCollector {
             return (0, 0);
         }
 
-        // Shrink buffer if it grew much larger than needed (prevent unbounded growth)
+        // Shrink buffer if it grew much larger than needed (prevent unbounded growth).
+        // Use capacity > threshold*4 to avoid thrashing on minor fluctuations.
         let actual = count as usize;
-        if buf.capacity() > actual.max(32) * 2 {
-            buf.truncate(actual);
-            buf.shrink_to(actual * 2);
+        let floor = actual.max(32);
+        if buf.capacity() > floor * 4 {
+            buf.truncate(floor);
+            buf.shrink_to(floor * 2);
         }
 
         let mut max_sm: u32 = 0;
@@ -398,11 +422,13 @@ impl NvmlCollector {
             return None;
         }
 
-        // Shrink buffer if it grew much larger than needed (prevent unbounded growth)
+        // Shrink buffer if it grew much larger than needed (prevent unbounded growth).
+        // Use capacity > threshold*4 to avoid thrashing on minor fluctuations.
         let actual = count as usize;
-        if buf.capacity() > actual.max(128) * 2 {
-            buf.truncate(actual);
-            buf.shrink_to(actual * 2);
+        let floor = actual.max(128);
+        if buf.capacity() > floor * 4 {
+            buf.truncate(floor);
+            buf.shrink_to(floor * 2);
         }
 
         // Use last ~5 samples for a responsive average (not all 120)
@@ -496,13 +522,19 @@ impl NvmlCollector {
         drop(cache);
 
         let info = DeviceInfo {
-            name: device.name().unwrap_or_else(|_| "Unknown GPU".to_string()),
-            uuid: device.uuid().unwrap_or_else(|_| "N/A".to_string()),
+            name: device
+                .name()
+                .unwrap_or_else(|_| "Unknown GPU".to_string())
+                .into(),
+            uuid: device
+                .uuid()
+                .unwrap_or_else(|_| "N/A".to_string())
+                .into(),
             architecture: device.architecture().ok().map(format_architecture),
             compute_capability: device
                 .cuda_compute_capability()
                 .ok()
-                .map(|cc| format!("{}.{}", cc.major, cc.minor)),
+                .map(|cc| std::rc::Rc::from(format!("{}.{}", cc.major, cc.minor))),
             ecc_enabled: device.is_ecc_enabled().ok().map(|e| e.currently_enabled),
             temp_shutdown: device
                 .temperature_threshold(TemperatureThreshold::Shutdown)
@@ -650,7 +682,7 @@ impl NvmlCollector {
                     .into_iter()
                     .map(|(pid, vram)| GpuProcessInfo {
                         pid,
-                        name: Self::process_name(pid),
+                        name: self.process_name(pid),
                         vram_used: vram,
                     })
                     .collect();
@@ -696,8 +728,21 @@ impl NvmlCollector {
         })
     }
 
-    /// Read process name from /proc/{pid}/comm (Linux) or fallback
-    fn process_name(pid: u32) -> String {
+    /// Read process name from cache or /proc/{pid}/comm (Linux).
+    /// Cached to avoid repeated /proc I/O for stable processes.
+    fn process_name(&self, pid: u32) -> String {
+        let cache = self.proc_name_cache.borrow();
+        if let Some(name) = cache.get(&pid) {
+            return name.clone();
+        }
+        drop(cache);
+
+        let name = Self::read_process_name(pid);
+        self.proc_name_cache.borrow_mut().insert(pid, name.clone());
+        name
+    }
+
+    fn read_process_name(pid: u32) -> String {
         #[cfg(target_os = "linux")]
         {
             if let Ok(name) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
@@ -730,9 +775,13 @@ impl NvmlCollector {
     /// Remove cache entries for device handles that were not seen during this tick.
     /// Prevents unbounded growth of device_cache / gpm_prev_samples on MIG reconfig or GPU hot-remove.
     fn prune_stale_caches(&self, active_handles: &[usize]) {
-        self.device_cache
-            .borrow_mut()
-            .retain(|k, _| active_handles.contains(k));
+        let mut cache = self.device_cache.borrow_mut();
+        cache.retain(|k, _| active_handles.contains(k));
+        // Defensive: shrink if hash table is far oversized vs actual entries
+        let target = cache.len() * 2;
+        if cache.capacity() > cache.len().max(16) * 4 {
+            cache.shrink_to(target);
+        }
 
         let raw_lib = &self.raw_lib;
         self.gpm_prev_samples.borrow_mut().retain(|k, sample| {

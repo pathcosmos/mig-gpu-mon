@@ -19,10 +19,10 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 │ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% Mem:… │ ↑ 20%
 │  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% Mem:… │ ↓
 │  0 ▮▮▮▮▯▯▯  52%  33 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
-│  ...                            │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
-├─ Memory ─────────────────────┤ UUID: MIG-a1b2...  Arch:Ampere CC:8.0│ │
-│ RAM ▮▮▮▮▮▯▯ 70.1/12.5/6.6 … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │
-│ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU: 45%  Mem: 38%  SM: 45%         │ │ 50%
+│ 12 ▮▮▮▯▯▯▯  38%   8 ▯▯▯▯▯  2% │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
+│  ...                            │ UUID: MIG-a1b2...  Arch:Ampere CC:8.0│ │
+│                                 │ VRAM 12288 MB / 20480 MB (60.0%)    │ │
+│                                 │ GPU: 45%  Mem: 38%  SM: 45%         │ │ 50%
 │                                 │ Enc: 0%  Dec: 0%                     │ │
 │                                 │ Clk: 1410/1410/1215 MHz  P0          │ │
 │                                 │ Temp: 62°C (↓90 ✕92)  Power:127/300W│ │
@@ -34,13 +34,13 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 │                                 │ 12345   python3          8192 MB    │ │ 30%
 │                                 │ 12400   pt_main_thread   4096 MB    │ ↓
 ├─ GPU Util 45% ──────────────────┬─ CPU Total 23.4% ───────────────────┤
-│ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 25%
-├─ Mem Ctrl 38% ──────────────────┼─────────────────────────────────────┤    ← Bottom 55%
-│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │ ▮ used  ▮ cached  ▮ free  RAM …     │ ← Memory legend (2 lines)
-├─ VRAM 12288/20480 MB (60.0%) ──│ 70.1G/12.5G/6.6G  avl:77.5G        │
-│ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             ├─ RAM ─────────────────────────────┤
-├─ PCIe TX:12.3 RX:56.7 MB/s ────│ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅ ← used+cached color│
-│ ▂▃▃▅▅▆▅▃▂▂▃▅▆▆▅▃              │                                     │ (when PCIe available)
+│ ▁▂▃▅▇█▇▅▃▂▁▂▃▅▇█▇▅            │ ▂▂▃▃▂▂▃▂▃▃▂▂▃▃▂▃                   │ ← 40%
+├─ Mem Ctrl 38% ──────────────────┤RAM ▮▮▮▮▮▮▯▯▯▯▯▯▯▯▯▯▯▯▯             │ ← RAM/SWP bars (no text)
+│ ▃▃▃▄▄▅▅▅▄▃▃▃▄▄▅▅▄             │SWP ▮▯▯▯▯▯▯▯▯▯▯▯▯▯▯▯▯▯▯             │    ← Bottom 55%
+├─ VRAM 12288/20480 MB (60.0%) ──│ ▮ used  ▮ cached  ▮ free  RAM …     │ ← Memory legend (2 lines)
+│ ▅▅▅▅▆▆▆▆▆▆▇▇▇▇▇▇▇             │ 70.1G/12.5G/6.6G  avl:77.5G        │
+├─ PCIe TX:12.3 RX:56.7 MB/s ────├─ RAM ─────────────────────────────┤
+│ ▂▃▃▅▅▆▅▃▂▂▃▅▆▆▅▃              │ ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅ ← used+cached color│ (when PCIe available)
 ├────────────────────────────────────────────────────────────────────────┤
 │ q Quit  Tab/↑↓ Switch GPU  [1/3]                                      │ ← Footer
 └────────────────────────────────────────────────────────────────────────┘
@@ -56,13 +56,8 @@ draw()
 ├── Main                            Min(10)
 │   ├── [Top 45%]  ─── Horizontal ──────────────────────────
 │   │   ├── System Panel  50%
-│   │   │   ├── CPU Cores         Min(4)    " CPU ({N} cores) {pct}% "
-│   │   │   │   └── dynamic N-column bars   "{idx} ▮▮▯▯ {pct}%" (sorted by usage desc)
-│   │   │   └── RAM / Swap        Length(4)  " Memory "
-│   │   │       ├── RAM line                 "RAM ▮▮▮▮▯▯ {used}/{cached}/{free} avl:{avail}/{total}G"
-│   │   │       │   └── segmented bar: used(Green/Yellow/Red) + cached(Blue) + free(DarkGray)
-│   │   │       │       numeric labels: used(color) / cached(Blue) / free(DarkGray) avl(White) / totalG(White)
-│   │   │       └── SWP line                 "SWP ▮▮▯▯ {used}/{total} GiB ({pct}%)"
+│   │   │   └── CPU Cores         (full area) " CPU ({N} cores) {pct}% "
+│   │   │       └── dynamic N-column bars   "{idx} ▮▮▯▯ {pct}%" (sorted by usage desc)
 │   │   └── GPU Panel     50%
 │   │       ├── Device List        20%       " Devices "
 │   │       │   └── "{>} {MIG|GPU} {idx}: {name} | GPU:{pct}% Mem:{pct}%"
@@ -88,7 +83,10 @@ draw()
 │       │   ├── VRAM {u}/{t} MB ({p}%) sparkline   25% / 34%
 │       │   └── PCIe TX/RX MB/s       sparkline   25% (when PCIe data available)
 │       └── System Charts  50%
-│           ├── CPU Total {pct}%       sparkline   50%
+│           ├── CPU Total {pct}%       sparkline   40%
+│           ├── RAM/SWP Bars           Length(2)    bars only (no text values)
+│           │   ├── RAM line                        "RAM ▮▮▮▮▯▯" (segmented: used/cached/free)
+│           │   └── SWP line                        "SWP ▮▮▯▯"
 │           ├── Memory Legend          Length(2)    2-line legend (above RAM chart)
 │           │   ├── Line 1: "▮ used  ▮ cached  ▮ free  RAM {u}/{t} GiB ({p}%)"
 │           │   └── Line 2: "{used}G/{cached}G/{free}G  avl:{avail}G"
@@ -919,6 +917,12 @@ Total RSS ~4-8 MB
 | `GIB_F64` module constant | `metrics.rs` | Redundant `1024.0 * 1024.0 * 1024.0` computation → single `const GIB_F64` definition, reused globally |
 | `ram_breakdown()` unified calc | `metrics.rs` | Duplicate RAM decomposition in `draw_ram_swap` + `draw_memory_legend` → single `SystemMetrics::ram_breakdown()` call |
 | `truncate_str()` zero-alloc | `dashboard.rs` | `proc.name.chars().take(15).collect::<String>()` 5 allocs/frame → `&str` slicing (zero allocation) |
+| `Rc<str>` string sharing | `nvml.rs`, `metrics.rs`, `app.rs` | `DeviceInfo`/`GpuMetrics` name·uuid·compute_capability changed to `Rc<str>` → eliminates heap allocation on clone (reference count bump only) |
+| `ram_breakdown()` single call | `dashboard.rs` | Duplicate calculation in `draw_ram_bars` + `draw_memory_legend` → computed once in `draw_system_charts`, passed to both |
+| Process name caching | `nvml.rs` | Per-tick `/proc/{pid}/comm` I/O → `HashMap<u32, String>` cache + automatic dead PID cleanup each tick |
+| NVML buffer shrink threshold | `nvml.rs` | `capacity > needed*2` → `capacity > floor*4` threshold, prevents unnecessary shrink thrashing on minor fluctuations |
+| `device_cache` HashMap defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |
+| Memory panel consolidated to right | `dashboard.rs` | Removed left Memory box → RAM/SWP bars integrated into right System Charts, expanding CPU core display area |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
@@ -965,8 +969,10 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | VecDeque ring buffer (300 fixed) | `metrics.rs` | GPU/system history size fixed, cannot grow unbounded |
 | GPU history auto-cleanup | `app.rs` | Orphan entries auto-deleted on MIG reconfig/GPU removal |
 | GPM sample + device cache pruning | `nvml.rs` | Per-tick active handle tracking → frees stale `nvmlGpmSample_t` + removes `DeviceInfo`, no leaks across repeated MIG reconfigs |
-| NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > needed×2, faster recovery after transient spikes |
-| DeviceInfo cache (one-time) | `nvml.rs` | Static info (arch, CC, etc.) cached on first call, zero allocation thereafter |
+| NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > floor×4, prevents unnecessary shrink thrashing on fluctuations |
+| DeviceInfo cache (one-time) + `Rc<str>` | `nvml.rs` | Static info cached on first call, clone only bumps reference count (zero heap allocation) |
+| Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached, dead PIDs not in current top-5 auto-removed each tick |
+| device_cache defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |
 | sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |
 
 ### Long-Running Memory Profile

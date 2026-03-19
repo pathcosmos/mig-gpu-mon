@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::App;
+use crate::gpu::metrics::RamBreakdown;
 
 // Reusable scratch buffer for sparkline u64 conversion.
 // Avoids allocation per draw call. Thread-local since draw is single-threaded.
@@ -100,13 +101,7 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_system_panel(f: &mut Frame, app: &App, area: Rect) {
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(4)])
-        .split(area);
-
-    draw_cpu_cores(f, app, sections[0]);
-    draw_ram_swap(f, app, sections[1]);
+    draw_cpu_cores(f, app, area);
 }
 
 fn draw_cpu_cores(f: &mut Frame, app: &App, area: Rect) {
@@ -248,102 +243,6 @@ fn make_segmented_bar(spans: &mut Vec<Span<'_>>, width: usize, segments: &[(f32,
     }
 }
 
-fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
-    let sys = match &app.system_metrics {
-        Some(s) => s,
-        None => {
-            let block = Block::default().borders(Borders::ALL).title(" Memory ");
-            f.render_widget(block, area);
-            return;
-        }
-    };
-
-    let block = Block::default().borders(Borders::ALL).title(" Memory ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
-
-    let ram_bar_width = rows[0].width.saturating_sub(30) as usize;
-
-    let rb = sys.ram_breakdown();
-    let used_color = ram_used_color(rb.used_pct);
-
-    let mut ram_spans = vec![Span::styled(
-        "RAM",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )];
-    make_segmented_bar(
-        &mut ram_spans,
-        ram_bar_width,
-        &[
-            (rb.used_pct, used_color),
-            (rb.cached_pct, Color::Blue),
-            (rb.free_pct, Color::DarkGray),
-        ],
-    );
-    ram_spans.push(Span::styled(
-        format!(" {:.1}", rb.used_gb),
-        Style::default().fg(used_color),
-    ));
-    ram_spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
-    ram_spans.push(Span::styled(
-        format!("{:.1}", rb.cached_gb),
-        Style::default().fg(Color::Blue),
-    ));
-    ram_spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
-    ram_spans.push(Span::styled(
-        format!("{:.1}", rb.free_gb),
-        Style::default().fg(Color::DarkGray),
-    ));
-    ram_spans.push(Span::styled(
-        format!(" avl:{:.1}", rb.avail_gb),
-        Style::default().fg(Color::White),
-    ));
-    ram_spans.push(Span::styled(
-        format!("/{:.1}G", rb.total_gb),
-        Style::default().fg(Color::White),
-    ));
-    f.render_widget(Paragraph::new(Line::from(ram_spans)), rows[0]);
-
-    if sys.swap_total > 0 {
-        let swap_pct = sys.swap_percent();
-        let swap_color = if swap_pct > 50.0 {
-            Color::Red
-        } else if swap_pct > 20.0 {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
-        let swap_line = Line::from(vec![
-            Span::styled(
-                "SWP",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                make_bar(swap_pct as f32, ram_bar_width),
-                Style::default().fg(swap_color),
-            ),
-            Span::styled(
-                format!(
-                    " {:.1}/{:.1} GiB ({:.1}%)",
-                    sys.swap_used_gb(),
-                    sys.swap_total_gb(),
-                    swap_pct
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(swap_line), rows[1]);
-    }
-}
 
 fn draw_gpu_panel(f: &mut Frame, app: &App, area: Rect) {
     if app.metrics.is_empty() {
@@ -408,14 +307,14 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::with_capacity(14);
 
     // Line 1: Name (with parent GPU index for MIG)
-    let name_display = if m.is_mig_instance {
+    let name_display: std::borrow::Cow<str> = if m.is_mig_instance {
         if let Some(parent) = m.parent_gpu_index {
-            format!("{} [Parent: GPU {}]", m.name, parent)
+            format!("{} [Parent: GPU {}]", m.name, parent).into()
         } else {
-            m.name.clone()
+            (&*m.name).into()
         }
     } else {
-        m.name.clone()
+        (&*m.name).into()
     };
     lines.push(Line::from(vec![
         Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
@@ -439,7 +338,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(ref cc) = m.compute_capability {
         uuid_spans.push(Span::styled("  CC: ", Style::default().fg(Color::DarkGray)));
-        uuid_spans.push(Span::styled(cc.as_str(), Style::default().fg(Color::Cyan)));
+        uuid_spans.push(Span::styled(&**cc, Style::default().fg(Color::Cyan)));
     }
     lines.push(Line::from(uuid_spans));
 
@@ -848,7 +747,8 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(50),
+            Constraint::Percentage(40),
+            Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Min(3),
         ])
@@ -874,24 +774,89 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(sparkline, rows[0]);
     });
 
+    // Pre-compute RAM breakdown once for both draw_ram_bars and draw_memory_legend
+    let rb = app
+        .system_metrics
+        .as_ref()
+        .map(|s| s.ram_breakdown());
+
+    // RAM/SWP bars (no text labels)
+    draw_ram_bars(f, app, rb, rows[1]);
+
     // Memory legend (2 lines)
-    draw_memory_legend(f, app, rows[1]);
+    draw_memory_legend(f, rb, rows[2]);
 
     // RAM segmented chart
     let ram_block = Block::default().borders(Borders::ALL).title(" RAM ");
-    let ram_inner = ram_block.inner(rows[2]);
-    f.render_widget(ram_block, rows[2]);
+    let ram_inner = ram_block.inner(rows[3]);
+    f.render_widget(ram_block, rows[3]);
 
     draw_ram_segmented_chart(f, app, ram_inner);
 }
 
-fn draw_memory_legend(f: &mut Frame, app: &App, area: Rect) {
-    let sys = match &app.system_metrics {
-        Some(s) => s,
-        None => return,
+fn draw_ram_bars(f: &mut Frame, app: &App, rb: Option<RamBreakdown>, area: Rect) {
+    let (sys, rb) = match (&app.system_metrics, rb) {
+        (Some(s), Some(rb)) => (s, rb),
+        _ => return,
     };
 
-    let rb = sys.ram_breakdown();
+    let bar_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    let bar_width = bar_rows[0].width.saturating_sub(4) as usize;
+    let used_color = ram_used_color(rb.used_pct);
+
+    // RAM bar
+    let mut ram_spans = vec![Span::styled(
+        "RAM",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    make_segmented_bar(
+        &mut ram_spans,
+        bar_width,
+        &[
+            (rb.used_pct, used_color),
+            (rb.cached_pct, Color::Blue),
+            (rb.free_pct, Color::DarkGray),
+        ],
+    );
+    f.render_widget(Paragraph::new(Line::from(ram_spans)), bar_rows[0]);
+
+    // SWP bar
+    if sys.swap_total > 0 {
+        let swap_pct = sys.swap_percent();
+        let swap_color = if swap_pct > 50.0 {
+            Color::Red
+        } else if swap_pct > 20.0 {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        let swap_line = Line::from(vec![
+            Span::styled(
+                "SWP",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                make_bar(swap_pct as f32, bar_width),
+                Style::default().fg(swap_color),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(swap_line), bar_rows[1]);
+    }
+}
+
+fn draw_memory_legend(f: &mut Frame, rb: Option<RamBreakdown>, area: Rect) {
+    let rb = match rb {
+        Some(rb) => rb,
+        None => return,
+    };
     let used_color = ram_used_color(rb.used_pct);
 
     // Line 1: color legend

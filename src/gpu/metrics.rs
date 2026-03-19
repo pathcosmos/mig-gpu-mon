@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 /// 1 GiB in bytes (as f64), used for byte-to-GiB conversions.
 pub const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -17,12 +18,14 @@ impl GpuProcessInfo {
     }
 }
 
-/// Single GPU or MIG instance metrics snapshot
+/// Single GPU or MIG instance metrics snapshot.
+/// Uses Rc<str> for name/uuid/compute_capability to avoid cloning heap strings
+/// when metrics are passed around (cheap reference count bump).
 #[derive(Debug, Clone)]
 pub struct GpuMetrics {
     pub index: u32,
-    pub name: String,
-    pub uuid: String,
+    pub name: Rc<str>,
+    pub uuid: Rc<str>,
     pub is_mig_instance: bool,
     pub parent_gpu_index: Option<u32>,
 
@@ -47,7 +50,7 @@ pub struct GpuMetrics {
 
     // --- Static info (cached, collected once) ---
     pub architecture: Option<&'static str>, // "Ampere", "Hopper" etc.
-    pub compute_capability: Option<String>, // "8.0", "9.0" etc.
+    pub compute_capability: Option<Rc<str>>, // "8.0", "9.0" etc.
     pub ecc_enabled: Option<bool>,
     pub temp_shutdown: Option<u32>, // shutdown threshold °C
     pub temp_slowdown: Option<u32>, // slowdown threshold °C
@@ -228,13 +231,6 @@ impl SystemMetrics {
         self.ram_total as f64 / GIB_F64
     }
 
-    pub fn swap_used_gb(&self) -> f64 {
-        self.swap_used as f64 / GIB_F64
-    }
-
-    pub fn swap_total_gb(&self) -> f64 {
-        self.swap_total as f64 / GIB_F64
-    }
 
     /// Decompose RAM into (used_pure_bytes, cached_bytes, free_bytes) and percentages.
     /// Returns (used_pure, cached, free, used_pct, cached_pct, free_pct, avail_gb, total_gb).

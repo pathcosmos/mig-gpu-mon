@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::gpu::metrics::{GpuMetrics, MetricsHistory, SystemHistory, SystemMetrics};
 
@@ -8,7 +9,7 @@ pub struct App {
     pub running: bool,
     pub selected_gpu: usize,
     pub metrics: Vec<GpuMetrics>,
-    pub history: HashMap<String, MetricsHistory>, // keyed by UUID
+    pub history: HashMap<Rc<str>, MetricsHistory>, // keyed by UUID
     pub driver_version: String,
     pub cuda_version: String,
     pub system_metrics: Option<SystemMetrics>,
