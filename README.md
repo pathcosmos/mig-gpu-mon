@@ -153,6 +153,7 @@ MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 
 - 시스템 RAM (세그먼트 바: used/cached/free 색상 구분 + 각 수치 색상별 표시 + available/total) / Swap 사용량
   - RAM 계산: `used = total - available` (비해제 가능), `cached = available - free` (해제 가능 캐시/버퍼), `free = MemFree`
 - GPU Util / Mem Ctrl / **VRAM** / **PCIe** / CPU Total 시계열 sparkline 그래프 + **RAM 세그먼트 차트** (used/cached 색상 구분, 타이틀에 현재값 표시)
+  - 모든 그래프 진행 방향 통일: **RightToLeft** — 최신 데이터가 오른쪽, 시간이 지남에 따라 왼쪽으로 이동 (RAM 세그먼트 차트와 동일)
 - Tab/방향키로 GPU/MIG 인스턴스 전환
 - 단일 바이너리 배포 (~1.5MB, libc 동적 링크 — 별도 런타임 설치 불필요)
 
@@ -906,6 +907,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | GPU 히스토리 자동 정리 | `app.rs` | MIG 재구성/GPU 제거 시 HashMap 엔트리 무한 증가 → `retain()`으로 사라진 UUID 자동 제거 |
 | GPM 샘플·디바이스 캐시 자동 정리 | `nvml.rs` | MIG 재구성 시 stale handle의 `nvmlGpmSample_t` + `DeviceInfo` 무한 잔류 → 매 tick active handle 추적 후 `retain()` + `nvmlGpmSampleFree()` |
 | NVML 샘플 버퍼 shrink | `nvml.rs` | grow-only 버퍼 무한 증가 가능 → capacity > needed×2 시 `shrink_to(needed×2)` 자동 축소 |
+| Sparkline RightToLeft 방향 통일 | `dashboard.rs` | 5개 Sparkline 모두 `RenderDirection::RightToLeft` 적용 → RAM 세그먼트 차트와 동일한 우측→좌측 진행 방향 |
 | RAM 차트 zero-alloc 렌더링 | `dashboard.rs` | 매 프레임 `Vec<ColSegment>` 할당 → 직접 iterator + buffer write (할당 0) |
 | RAM 계산 정확도 수정 | `dashboard.rs` | `used = ram_used - (avail-free)` (이중 차감) → `used = total - available` (정확한 비해제 가능 메모리) |
 | `format_pstate` 제로 할당 | `nvml.rs` | 매 tick `"P0".to_string()` String 할당 → `&'static str` 반환 (할당 0) |

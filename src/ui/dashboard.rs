@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
+    widgets::{Block, Borders, List, ListItem, Paragraph, RenderDirection, Sparkline},
     Frame,
 };
 
@@ -801,6 +801,7 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
             )
             .data(data)
             .max(100)
+            .direction(RenderDirection::RightToLeft)
             .style(Style::default().fg(Color::Green));
         f.render_widget(sparkline, rows[0]);
     });
@@ -823,6 +824,7 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
             )
             .data(data)
             .max(100)
+            .direction(RenderDirection::RightToLeft)
             .style(Style::default().fg(Color::Blue));
         f.render_widget(sparkline, rows[1]);
     });
@@ -852,6 +854,7 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
             )
             .data(data)
             .max(vram_max)
+            .direction(RenderDirection::RightToLeft)
             .style(Style::default().fg(Color::Magenta));
         f.render_widget(sparkline, rows[2]);
     });
@@ -874,6 +877,7 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
                         .title(pcie_title.as_str()),
                 )
                 .data(data)
+                .direction(RenderDirection::RightToLeft)
                 .style(Style::default().fg(Color::LightCyan));
             f.render_widget(sparkline, rows[3]);
         });
@@ -901,6 +905,7 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
             )
             .data(data)
             .max(100)
+            .direction(RenderDirection::RightToLeft)
             .style(Style::default().fg(Color::Cyan));
         f.render_widget(sparkline, rows[0]);
     });

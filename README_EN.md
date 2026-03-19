@@ -153,6 +153,7 @@ When all utilization APIs fail (common on driver 535.x with MIG), metrics are di
 - System RAM (segmented bar: used/cached/free color-coded with per-segment numeric values + available/total) / Swap usage
   - RAM calculation: `used = total - available` (non-reclaimable), `cached = available - free` (reclaimable cache/buffers), `free = MemFree`
 - Time-series sparkline graphs for GPU Util / Mem Ctrl / **VRAM** / **PCIe** / CPU Total + **RAM segmented chart** (used/cached color-coded, current values in title)
+  - Unified graph direction: **RightToLeft** — newest data on the right, scrolling left over time (matches RAM segmented chart)
 - Switch between GPU/MIG instances with Tab/arrow keys
 - Single binary deployment (~1.5MB, dynamically links libc — no separate runtime install needed)
 
@@ -906,6 +907,7 @@ Total RSS ~4-8 MB
 | GPU history auto-cleanup | `app.rs` | Unbounded HashMap growth on MIG reconfig/GPU removal → `retain()` removes orphan UUID entries |
 | GPM sample + device cache auto-pruning | `nvml.rs` | Stale `nvmlGpmSample_t` + `DeviceInfo` leaked on MIG reconfig → per-tick active handle tracking + `retain()` + `nvmlGpmSampleFree()` |
 | NVML sample buffer shrink | `nvml.rs` | grow-only buffer could grow unbounded → auto `shrink_to(needed×2)` when capacity > needed×2 |
+| Sparkline RightToLeft direction | `dashboard.rs` | All 5 sparklines use `RenderDirection::RightToLeft` → unified right-to-left progression matching RAM segmented chart |
 | RAM chart zero-alloc rendering | `dashboard.rs` | Per-frame `Vec<ColSegment>` allocation → direct iterator + buffer write (zero allocation) |
 | RAM calculation accuracy fix | `dashboard.rs` | `used = ram_used - (avail-free)` (double subtraction) → `used = total - available` (correct non-reclaimable memory) |
 | `format_pstate` zero-alloc | `nvml.rs` | `"P0".to_string()` per tick → returns `&'static str` (zero allocation) |
