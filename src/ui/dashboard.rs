@@ -1,7 +1,9 @@
+use std::borrow::Cow;
+
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph, RenderDirection, Sparkline},
     Frame,
 };
@@ -60,21 +62,12 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let header_text = format!(
-        " MIG GPU Monitor | Driver: {} | CUDA: {} | GPUs: {}",
-        app.driver_version,
-        app.cuda_version,
-        app.metrics.len()
-    );
     let now = chrono::Local::now()
         .format("%Y-%m-%d %I:%M:%S %p")
         .to_string();
-    let header = Paragraph::new(header_text)
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+    let header = Paragraph::new(" pathcosmos@gmail.com")
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(Color::Cyan))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -282,10 +275,8 @@ fn draw_gpu_list(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::White)
             };
-            let gpu_str = m.gpu_util.map_or("N/A".to_string(), |v| format!("{}%", v));
-            let mem_str = m
-                .memory_util
-                .map_or("N/A".to_string(), |v| format!("{}%", v));
+            let gpu_str: Cow<str> = m.gpu_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
+            let mem_str: Cow<str> = m.memory_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
             ListItem::new(format!(
                 "{} {} {}: {} | GPU:{} Mem:{}",
                 indicator, prefix, m.index, m.name, gpu_str, mem_str
@@ -307,7 +298,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::with_capacity(14);
 
     // Line 1: Name (with parent GPU index for MIG)
-    let name_display: std::borrow::Cow<str> = if m.is_mig_instance {
+    let name_display: Cow<str> = if m.is_mig_instance {
         if let Some(parent) = m.parent_gpu_index {
             format!("{} [Parent: GPU {}]", m.name, parent).into()
         } else {
@@ -384,10 +375,8 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Line 5: GPU / Mem / SM util (compact horizontal)
-    let gpu_util_str = m.gpu_util.map_or("N/A".to_string(), |v| format!("{}%", v));
-    let mem_util_str = m
-        .memory_util
-        .map_or("N/A".to_string(), |v| format!("{}%", v));
+    let gpu_util_str: Cow<str> = m.gpu_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
+    let mem_util_str: Cow<str> = m.memory_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
     let mut util_spans = vec![
         Span::styled("GPU: ", Style::default().fg(Color::Green)),
         Span::styled(
@@ -588,7 +577,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled("Processes: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}", m.process_count),
+            m.process_count.to_string(),
             Style::default().fg(Color::White),
         ),
     ]));
@@ -643,20 +632,16 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // GPU Utilization sparkline
-    let gpu_title = app
-        .selected_metrics()
-        .map(|m| {
-            m.gpu_util.map_or(" GPU Util N/A ".to_string(), |v| {
-                format!(" GPU Util {}% ", v)
-            })
-        })
-        .unwrap_or_else(|| " GPU Util ".to_string());
+    let gpu_title: Cow<str> = match app.selected_metrics().and_then(|m| m.gpu_util) {
+        Some(v) => format!(" GPU Util {}% ", v).into(),
+        None => if app.selected_metrics().is_some() { " GPU Util N/A ".into() } else { " GPU Util ".into() },
+    };
     with_spark_data_u32(&history.gpu_util, |data| {
         let sparkline = Sparkline::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(gpu_title.as_str()),
+                    .title(gpu_title.as_ref()),
             )
             .data(data)
             .max(100)
@@ -666,20 +651,16 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     });
 
     // Memory Controller Utilization sparkline
-    let mem_ctrl_title = app
-        .selected_metrics()
-        .map(|m| {
-            m.memory_util.map_or(" Mem Ctrl N/A ".to_string(), |v| {
-                format!(" Mem Ctrl {}% ", v)
-            })
-        })
-        .unwrap_or_else(|| " Mem Ctrl ".to_string());
+    let mem_ctrl_title: Cow<str> = match app.selected_metrics().and_then(|m| m.memory_util) {
+        Some(v) => format!(" Mem Ctrl {}% ", v).into(),
+        None => if app.selected_metrics().is_some() { " Mem Ctrl N/A ".into() } else { " Mem Ctrl ".into() },
+    };
     with_spark_data_u32(&history.memory_util, |data| {
         let sparkline = Sparkline::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(mem_ctrl_title.as_str()),
+                    .title(mem_ctrl_title.as_ref()),
             )
             .data(data)
             .max(100)
@@ -689,17 +670,15 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     });
 
     // VRAM Usage sparkline
-    let vram_title = app
-        .selected_metrics()
-        .map(
-            |m| match (m.memory_used_mb(), m.memory_total_mb(), m.memory_percent()) {
-                (Some(used), Some(total), Some(pct)) => {
-                    format!(" VRAM {}/{} MB ({:.1}%) ", used, total, pct)
-                }
-                _ => " VRAM N/A ".to_string(),
-            },
-        )
-        .unwrap_or_else(|| " VRAM ".to_string());
+    let vram_title: Cow<str> = match app.selected_metrics() {
+        Some(m) => match (m.memory_used_mb(), m.memory_total_mb(), m.memory_percent()) {
+            (Some(used), Some(total), Some(pct)) => {
+                format!(" VRAM {}/{} MB ({:.1}%) ", used, total, pct).into()
+            }
+            _ => " VRAM N/A ".into(),
+        },
+        None => " VRAM ".into(),
+    };
     let vram_max = app
         .selected_metrics()
         .and_then(|m| m.memory_total_mb())
@@ -709,7 +688,7 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(vram_title.as_str()),
+                    .title(vram_title.as_ref()),
             )
             .data(data)
             .max(vram_max)
@@ -720,20 +699,20 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
 
     // PCIe throughput sparkline (conditional)
     if has_pcie {
-        let pcie_title = app
+        let pcie_title: Cow<str> = app
             .selected_metrics()
             .and_then(|m| {
                 let tx = m.pcie_tx_mbps()?;
                 let rx = m.pcie_rx_mbps()?;
                 Some(format!(" PCIe TX:{:.1} RX:{:.1} MB/s ", tx, rx))
             })
-            .unwrap_or_else(|| " PCIe Throughput ".to_string());
+            .map_or(Cow::Borrowed(" PCIe Throughput "), |s| s.into());
         with_spark_data_u32(&history.pcie_tx_kbps, |data| {
             let sparkline = Sparkline::default()
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(pcie_title.as_str()),
+                        .title(pcie_title.as_ref()),
                 )
                 .data(data)
                 .direction(RenderDirection::RightToLeft)
@@ -755,17 +734,17 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     // CPU total sparkline
-    let cpu_label = app
+    let cpu_label: Cow<str> = app
         .system_metrics
         .as_ref()
         .map(|s| format!(" CPU Total {:.1}% ", s.cpu_total))
-        .unwrap_or_else(|| " CPU Total ".to_string());
+        .map_or(Cow::Borrowed(" CPU Total "), |s| s.into());
     with_spark_data_f32(&app.system_history.cpu_total, |data| {
         let sparkline = Sparkline::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(cpu_label.as_str()),
+                    .title(cpu_label.as_ref()),
             )
             .data(data)
             .max(100)
@@ -1048,7 +1027,7 @@ fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
 
     // Header row
     lines.push(Line::from(vec![Span::styled(
-        format!("{:<7} {:<15} {:>10}", "PID", "Process", "VRAM"),
+        "PID     Process               VRAM",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),

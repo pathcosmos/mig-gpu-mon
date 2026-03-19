@@ -14,7 +14,7 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 
 ```
 ┌─ mig-gpu-mon ────────────────────────────────── 2026-03-17 02:15:30 PM ┐
-│ MIG GPU Monitor | Driver: 535.129.03 | CUDA: 12.2 | GPUs: 3           │ ← Header
+│                                        pathcosmos@gmail.com           │ ← Header
 ├─ CPU (64 cores) 23.4% ─────────┬─ Devices ────────────────────────────┤
 │ 17 ▮▮▮▮▮▮▮  92%   5 ▮▮▮▯▯ 34% │ > MIG 0 (GPU 0: A100) GPU:45% Mem:… │ ↑ 20%
 │  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% Mem:… │ ↓
@@ -917,6 +917,8 @@ Total RSS ~4-8 MB
 | `format_throttle_reasons` Vec removal | `nvml.rs` | `Vec::new()` + `push` + `join()` → macro appends directly to `String` (eliminates Vec allocation) |
 | `GIB_F64` module constant | `metrics.rs` | Redundant `1024.0 * 1024.0 * 1024.0` computation → single `const GIB_F64` definition, reused globally |
 | `ram_breakdown()` unified calc | `metrics.rs` | Duplicate RAM decomposition in `draw_ram_swap` + `draw_memory_legend` → single `SystemMetrics::ram_breakdown()` call |
+| `active_handles` Vec reuse | `nvml.rs` | Per-tick `Vec::with_capacity(N)` alloc/dealloc → `RefCell<Vec<usize>>` field reuse (zero alloc per tick) |
+| Sparkline title `Cow<str>` | `dashboard.rs` | Static strings ("N/A", fallback) `to_string()` allocation → `Cow::Borrowed` zero-alloc, `format!` only for dynamic values |
 | `truncate_str()` zero-alloc | `dashboard.rs` | `proc.name.chars().take(15).collect::<String>()` 5 allocs/frame → `&str` slicing (zero allocation) |
 | `Rc<str>` string sharing | `nvml.rs`, `metrics.rs`, `app.rs` | `DeviceInfo`/`GpuMetrics` name·uuid·compute_capability changed to `Rc<str>` → eliminates heap allocation on clone (reference count bump only) |
 | `ram_breakdown()` single call | `dashboard.rs` | Duplicate calculation in `draw_ram_bars` + `draw_memory_legend` → computed once in `draw_system_charts`, passed to both |
@@ -975,6 +977,7 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached, dead PIDs not in current top-5 auto-removed each tick |
 | device_cache defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |
 | sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |
+| `active_handles` buffer reuse | `nvml.rs` | Per-tick new Vec allocation → `RefCell<Vec<usize>>` reuse, prevents allocator fragmentation on long-running execution |
 
 ### Long-Running Memory Profile
 

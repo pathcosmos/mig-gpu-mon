@@ -55,6 +55,8 @@ pub struct NvmlCollector {
     /// Cache: pid → process name. Avoids /proc/{pid}/comm I/O every tick for stable processes.
     /// Entries are pruned each tick to remove dead PIDs.
     proc_name_cache: RefCell<HashMap<u32, String>>,
+    /// Reusable buffer for tracking active device handles during collection (avoid alloc per tick)
+    active_handles: RefCell<Vec<usize>>,
 }
 
 impl NvmlCollector {
@@ -135,6 +137,7 @@ impl NvmlCollector {
             sample_buf: RefCell::new(Vec::with_capacity(128)),
             gpm_prev_samples: RefCell::new(HashMap::new()),
             proc_name_cache: RefCell::new(HashMap::new()),
+            active_handles: RefCell::new(Vec::with_capacity(32)),
         })
     }
 
@@ -170,14 +173,15 @@ impl NvmlCollector {
         let device_count = self.nvml.device_count()?;
         let mut all_metrics = Vec::with_capacity(device_count as usize * 2);
         // Track active device handles to prune stale cache entries (MIG reconfig / hot-remove)
-        let mut active_handles: Vec<usize> = Vec::with_capacity(device_count as usize * 8);
+        let mut active_handles = self.active_handles.borrow_mut();
+        active_handles.clear();
 
         for i in 0..device_count {
             let device = self.nvml.device_by_index(i)?;
             active_handles.push(unsafe { device.handle() } as usize);
 
             if self.is_mig_enabled(&device) {
-                if let Ok(mig_metrics) = self.collect_mig_instances(&device, i, &mut active_handles)
+                if let Ok(mig_metrics) = self.collect_mig_instances(&device, i, &mut *active_handles)
                 {
                     all_metrics.extend(mig_metrics);
                 }
@@ -191,6 +195,7 @@ impl NvmlCollector {
         // Prune stale cache entries for removed GPUs / reconfigured MIG instances.
         // Prevents unbounded HashMap growth and frees NVML-allocated GPM samples.
         self.prune_stale_caches(&active_handles);
+        drop(active_handles);
 
         // Prune process name cache — keep only PIDs seen this tick
         {
