@@ -141,7 +141,7 @@ When all utilization APIs fail (common on driver 535.x with MIG), metrics are di
 ## Features
 
 - Real-time per-MIG-instance GPU Util, Mem Ctrl (memory controller / DRAM BW Util via GPM on Hopper+), SM Util, and VRAM usage
-- **Top Processes** — displays top 5 processes by VRAM usage (PID, process name, MB)
+- **Top Processes** — displays top 5 processes by VRAM usage (PID, process name, MB); collects both compute and graphics processes, shows "N/A" when VRAM is unavailable
 - Parent GPU metrics (temperature, power, process count) displayed simultaneously
 - **Clock Speeds** — Graphics/SM/Memory clocks (MHz) + Performance State (P0~P15)
 - **PCIe Throughput** — Gen/Width + TX/RX transfer rates (MB/s), conditional sparkline graph
@@ -795,6 +795,131 @@ Applied uniformly to all sparkline metrics: `gpu_util`, `memory_util`, `memory_u
 
 v0.3 provides "corruption prevention" defense; v0.3.1 adds a "resilience" layer that maintains display even when corruption occurs.
 
+#### Top Processes Missing Bug Analysis & Fix (v0.3.2)
+
+##### Symptoms
+
+In MIG environments, the "Top Processes" panel shows only "No compute processes" even when processes are actively running on the GPU.
+
+##### Root Cause Analysis — 3 Issues
+
+**Issue 1: `UsedGpuMemory::Unavailable` processes completely filtered out**
+
+```rust
+// Before: processes without VRAM info were entirely excluded
+let mut entries: Vec<(u32, u64)> = procs
+    .iter()
+    .filter_map(|p| {
+        let vram = match p.used_gpu_memory {
+            UsedGpuMemory::Used(bytes) => bytes,
+            UsedGpuMemory::Unavailable => return None,  // ← process lost!
+        };
+        Some((p.pid, vram))
+    })
+    .collect();
+```
+
+In MIG environments (especially driver 535.x), NVML returns `Unavailable` for process VRAM, causing `filter_map` to drop the process entirely from the UI.
+
+**Issue 2: Only compute processes collected**
+
+```rust
+// Before: only compute processes
+let (process_count, top_processes) = match device.running_compute_processes() { ... };
+// → graphics processes (Vulkan/OpenGL) never collected
+```
+
+`running_graphics_processes()` was never called, so non-CUDA graphics processes were missing.
+
+**Issue 3: API error returns empty list silently**
+
+```rust
+// Before: error → empty list, no fallback
+Err(_) => (0, Vec::new()),
+```
+
+When `running_compute_processes()` failed, an empty list was returned, making it appear that no processes existed.
+
+##### Fix Details (3 changes)
+
+**Fix 1: `GpuProcessInfo.vram_used` → `Option<u64>`** (`metrics.rs`)
+
+```rust
+// Before: u64 — Unavailable processes excluded
+pub vram_used: u64,
+
+// After: Option<u64> — Unavailable preserved as None
+pub vram_used: Option<u64>,
+
+pub fn vram_used_mb(&self) -> Option<u64> {
+    self.vram_used.map(|v| v / (1024 * 1024))
+}
+```
+
+**Fix 2: Unified compute + graphics process collection** (`nvml.rs`)
+
+```rust
+// After: collect from both APIs, dedup by PID
+let mut seen_pids = HashSet::new();
+let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+
+// Compute processes (PyTorch, CUDA)
+if let Ok(procs) = device.running_compute_processes() {
+    for p in &procs { /* ... */ if seen_pids.insert(p.pid) { entries.push(...); } }
+}
+// Graphics processes (Vulkan, OpenGL)
+if let Ok(procs) = device.running_graphics_processes() {
+    for p in &procs { /* ... */ if seen_pids.insert(p.pid) { entries.push(...); } }
+}
+```
+
+- Both APIs use independent `if let Ok` — one failing doesn't block the other
+- `HashSet<u32>` prevents duplicate PIDs (processes in both compute and graphics)
+
+**Fix 3: VRAM "N/A" display** (`dashboard.rs`)
+
+```rust
+// After: show "N/A" when VRAM unavailable (process still displayed)
+let vram_str = match proc.vram_used_mb() {
+    Some(mb) => format!("{:>7} MB", mb),
+    None => format!("{:>10}", "N/A"),
+};
+```
+
+##### Sorting Logic Improvement
+
+```rust
+// Known VRAM descending → Unavailable at end → stable by PID
+entries.sort_by(|a, b| match (b.1, a.1) {
+    (Some(bv), Some(av)) => bv.cmp(&av),
+    (Some(_), None) => Ordering::Less,
+    (None, Some(_)) => Ordering::Greater,
+    (None, None) => a.0.cmp(&b.0),
+});
+entries.truncate(5);
+```
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/metrics.rs` | `GpuProcessInfo.vram_used` → `Option<u64>`, `vram_used_mb()` → `Option<u64>` |
+| `src/gpu/nvml.rs` | Unified compute + graphics collection, PID dedup, `Unavailable` → `None` preserved, independent error handling |
+| `src/ui/dashboard.rs` | VRAM "N/A" display, "No processes" message updated |
+
+##### Cross-Verification Matrix
+
+| Scenario | Process Display | VRAM Display | Verification |
+|----------|----------------|-------------|-------------|
+| Compute process + VRAM available | Shown | MB value | Existing behavior preserved |
+| Compute process + VRAM Unavailable | Shown | "N/A" | Fix 1: Option<u64> |
+| Graphics process only | Shown | MB or "N/A" | Fix 2: graphics added |
+| Same PID in both APIs | 1 entry only | No duplicates | HashSet dedup |
+| Compute API fails, graphics OK | Graphics only shown | MB or "N/A" | Independent if let Ok |
+| Both APIs fail | "No processes" | — | Empty entries |
+| More than 5 processes | Top 5 by VRAM | MB first, N/A last | Sort logic |
+| MIG instance | MIG-specific processes | MB or "N/A" | Collected via MIG handle |
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -847,7 +972,7 @@ Estimates for default settings (1-second interval), 1 GPU + 2 MIG instances:
 │   ├── throttle_reasons       ~0.1ms
 │   ├── encoder/decoder_util   ~0.2ms
 │   ├── ecc_errors (×2)        ~0.2ms   Corrected/Uncorrected
-│   ├── running_compute_procs  ~0.5ms   + /proc name reads for top-5 only (deferred I/O)
+│   ├── running_compute/graphics_procs ~0.5ms  compute+graphics merged + /proc name reads for top-5 only
 │   └── (MIG) process_util     ~1-3ms   Per MIG instance, fallback only
 │   └── (MIG) gpu_util_samples ~0.8ms   nvmlDeviceGetSamples fallback, parent only
 ├── sysinfo refresh       ~0.1-0.3ms
@@ -923,6 +1048,8 @@ Total RSS ~4-8 MB
 | `gpm_prev_samples` defensive shrink | `nvml.rs` | HashMap capacity could grow unbounded on repeated MIG reconfigs → auto-shrink when `capacity > len*4` (same pattern as `device_cache`) |
 | Top Processes header static `&str` | `dashboard.rs` | 3× `format!()` calls per frame for header → static `&str` Spans (eliminates 3 String allocations per frame) |
 | Top Processes column alignment fix | `dashboard.rs` | Header (hardcoded 8+22+4) vs data (`{:<7}`+`{:<15}`+`{:>10}`) width mismatch → unified format widths |
+| Compute + graphics process unification | `nvml.rs` | Compute-only collection → both compute + graphics collected + HashSet PID dedup, Unavailable VRAM processes preserved |
+| `GpuProcessInfo.vram_used` Option | `metrics.rs` | `u64` → `Option<u64>`, VRAM Unavailable processes display "N/A" (previously: filtered out entirely) |
 | `truncate_str()` zero-alloc | `dashboard.rs` | `proc.name.chars().take(15).collect::<String>()` 5 allocs/frame → `&str` slicing (zero allocation) |
 | `Rc<str>` string sharing | `nvml.rs`, `metrics.rs`, `app.rs` | `DeviceInfo`/`GpuMetrics` name·uuid·compute_capability changed to `Rc<str>` → eliminates heap allocation on clone (reference count bump only) |
 | `ram_breakdown()` single call | `dashboard.rs` | Duplicate calculation in `draw_ram_bars` + `draw_memory_legend` → computed once in `draw_system_charts`, passed to both |

@@ -9,12 +9,13 @@ pub const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
 pub struct GpuProcessInfo {
     pub pid: u32,
     pub name: String,
-    pub vram_used: u64, // bytes
+    /// VRAM usage in bytes — None when NVML reports Unavailable (common on MIG)
+    pub vram_used: Option<u64>,
 }
 
 impl GpuProcessInfo {
-    pub fn vram_used_mb(&self) -> u64 {
-        self.vram_used / (1024 * 1024)
+    pub fn vram_used_mb(&self) -> Option<u64> {
+        self.vram_used.map(|v| v / (1024 * 1024))
     }
 }
 

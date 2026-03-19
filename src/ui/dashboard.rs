@@ -1037,22 +1037,23 @@ fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
 
     if m.top_processes.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No compute processes",
+            "  No processes",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
         for proc in m.top_processes.iter().take(5) {
             let name = truncate_str(&proc.name, 15);
+            let vram_str = match proc.vram_used_mb() {
+                Some(mb) => format!("{:>7} MB", mb),
+                None => format!("{:>10}", "N/A"),
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{:<7}", proc.pid),
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(format!("{:<15}", name), Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{:>7} MB", proc.vram_used_mb()),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(vram_str, Style::default().fg(Color::Yellow)),
             ]));
         }
     }

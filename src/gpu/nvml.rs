@@ -661,40 +661,57 @@ impl NvmlCollector {
             .total_ecc_errors(MemoryError::Uncorrected, EccCounter::Volatile)
             .ok();
 
-        let (process_count, top_processes) = match device.running_compute_processes() {
-            Ok(procs) => {
-                let count = procs.len() as u32;
-                // Phase 1: collect pid + VRAM only (defer /proc reads to avoid O(n) I/O)
-                let mut entries: Vec<(u32, u64)> = procs
-                    .iter()
-                    .filter_map(|p| {
-                        let vram = match p.used_gpu_memory {
-                            UsedGpuMemory::Used(bytes) => bytes,
-                            UsedGpuMemory::Unavailable => return None,
-                        };
-                        Some((p.pid, vram))
-                    })
-                    .collect();
-                // Phase 2: partial sort for top-5 by VRAM (no /proc reads yet)
-                if entries.len() > 5 {
-                    entries.select_nth_unstable_by(4, |a, b| b.1.cmp(&a.1));
-                    entries.truncate(5);
-                    entries.sort_by(|a, b| b.1.cmp(&a.1));
-                } else {
-                    entries.sort_by(|a, b| b.1.cmp(&a.1));
+        // Collect both compute and graphics processes, dedup by PID
+        let (process_count, top_processes) = {
+            let mut seen_pids = HashSet::new();
+            let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+
+            // Compute processes (primary — PyTorch, CUDA workloads)
+            if let Ok(procs) = device.running_compute_processes() {
+                for p in &procs {
+                    let vram = match p.used_gpu_memory {
+                        UsedGpuMemory::Used(bytes) => Some(bytes),
+                        UsedGpuMemory::Unavailable => None,
+                    };
+                    if seen_pids.insert(p.pid) {
+                        entries.push((p.pid, vram));
+                    }
                 }
-                // Phase 3: read /proc names only for top-5 (not all N processes)
-                let proc_infos: Vec<GpuProcessInfo> = entries
-                    .into_iter()
-                    .map(|(pid, vram)| GpuProcessInfo {
-                        pid,
-                        name: self.process_name(pid),
-                        vram_used: vram,
-                    })
-                    .collect();
-                (count, proc_infos)
             }
-            Err(_) => (0, Vec::new()),
+
+            // Graphics processes (display servers, Vulkan/OpenGL without CUDA)
+            if let Ok(procs) = device.running_graphics_processes() {
+                for p in &procs {
+                    let vram = match p.used_gpu_memory {
+                        UsedGpuMemory::Used(bytes) => Some(bytes),
+                        UsedGpuMemory::Unavailable => None,
+                    };
+                    if seen_pids.insert(p.pid) {
+                        entries.push((p.pid, vram));
+                    }
+                }
+            }
+
+            let count = entries.len() as u32;
+
+            // Sort: known VRAM descending first, then Unavailable at the end
+            entries.sort_by(|a, b| match (b.1, a.1) {
+                (Some(bv), Some(av)) => bv.cmp(&av),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.0.cmp(&b.0), // stable by PID
+            });
+            entries.truncate(5);
+
+            let proc_infos: Vec<GpuProcessInfo> = entries
+                .into_iter()
+                .map(|(pid, vram)| GpuProcessInfo {
+                    pid,
+                    name: self.process_name(pid),
+                    vram_used: vram,
+                })
+                .collect();
+            (count, proc_infos)
         };
 
         Ok(GpuMetrics {

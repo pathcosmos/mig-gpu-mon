@@ -141,7 +141,7 @@ MIG 환경에서 `nvidia-smi`는 GPU Utilization, Memory Utilization 등 핵심 
 ## Features
 
 - MIG 인스턴스별 GPU Util, Mem Ctrl(메모리 컨트롤러 / Hopper+에서 DRAM BW Util via GPM), SM Util, VRAM 사용량 실시간 표시
-- **Top Processes** — PID, 프로세스명, VRAM 사용량(MB) 기준 상위 5개 표시
+- **Top Processes** — PID, 프로세스명, VRAM 사용량(MB) 기준 상위 5개 표시 (compute + graphics 프로세스 통합, VRAM 미지원 시 "N/A" 표시)
 - 부모 GPU 메트릭(온도, 전력, 프로세스 수) 동시 표시
 - **Clock Speeds** — Graphics/SM/Memory 클럭 (MHz) + Performance State (P0~P15)
 - **PCIe Throughput** — Gen/Width + TX/RX 전송률 (MB/s), 조건부 sparkline 그래프
@@ -795,6 +795,131 @@ fn push_or_repeat<T: Copy>(buf: &mut VecDeque<T>, val: Option<T>, max: usize) {
 
 v0.3은 "오염 자체를 차단"하는 방어, v0.3.1은 "오염이 발생해도 표시를 유지"하는 복원력(resilience) 계층.
 
+#### Top Processes 누락 버그 분석 및 수정 (v0.3.2)
+
+##### 증상
+
+MIG 환경에서 "Top Processes" 패널에 "No compute processes"만 표시되고, 실제 실행 중인 프로세스가 보이지 않는 현상.
+
+##### 근본 원인 분석 — 3가지 문제
+
+**문제 1: `UsedGpuMemory::Unavailable` 프로세스 완전 제거**
+
+```rust
+// 수정 전: VRAM 정보 없으면 프로세스 자체를 제외
+let mut entries: Vec<(u32, u64)> = procs
+    .iter()
+    .filter_map(|p| {
+        let vram = match p.used_gpu_memory {
+            UsedGpuMemory::Used(bytes) => bytes,
+            UsedGpuMemory::Unavailable => return None,  // ← 프로세스 누락!
+        };
+        Some((p.pid, vram))
+    })
+    .collect();
+```
+
+MIG 환경(특히 드라이버 535.x)에서 NVML이 프로세스의 VRAM을 `Unavailable`로 반환하면, 해당 프로세스가 `filter_map`에서 완전히 제거되어 UI에 나타나지 않았다.
+
+**문제 2: Compute 프로세스만 수집**
+
+```rust
+// 수정 전: compute 프로세스만 수집
+let (process_count, top_processes) = match device.running_compute_processes() { ... };
+// → graphics 프로세스 (Vulkan/OpenGL 등)는 수집되지 않음
+```
+
+`running_graphics_processes()`를 호출하지 않아, CUDA를 사용하지 않는 그래픽 프로세스가 누락되었다.
+
+**문제 3: API 에러 시 무조건 빈 리스트**
+
+```rust
+// 수정 전: 에러 → 빈 리스트, 원인 파악 불가
+Err(_) => (0, Vec::new()),
+```
+
+`running_compute_processes()` 실패 시 `(0, Vec::new())`를 반환하여, 프로세스가 실제로 없는 것처럼 표시되었다.
+
+##### 수정 내용 (3건)
+
+**수정 1: `GpuProcessInfo.vram_used` → `Option<u64>`** (`metrics.rs`)
+
+```rust
+// 수정 전: u64 — Unavailable 프로세스 배제
+pub vram_used: u64,
+
+// 수정 후: Option<u64> — Unavailable은 None으로 보존
+pub vram_used: Option<u64>,
+
+pub fn vram_used_mb(&self) -> Option<u64> {
+    self.vram_used.map(|v| v / (1024 * 1024))
+}
+```
+
+**수정 2: Compute + Graphics 프로세스 통합 수집** (`nvml.rs`)
+
+```rust
+// 수정 후: 양쪽 모두 수집, PID 기반 dedup
+let mut seen_pids = HashSet::new();
+let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+
+// Compute processes (PyTorch, CUDA)
+if let Ok(procs) = device.running_compute_processes() {
+    for p in &procs { /* ... */ if seen_pids.insert(p.pid) { entries.push(...); } }
+}
+// Graphics processes (Vulkan, OpenGL)
+if let Ok(procs) = device.running_graphics_processes() {
+    for p in &procs { /* ... */ if seen_pids.insert(p.pid) { entries.push(...); } }
+}
+```
+
+- 양쪽 API 모두 개별 `if let Ok` — 한쪽 실패해도 다른 쪽은 정상 수집
+- `HashSet<u32>`로 PID 중복 방지 (양쪽에 동시 존재하는 프로세스)
+
+**수정 3: VRAM "N/A" 표시** (`dashboard.rs`)
+
+```rust
+// 수정 후: VRAM 없으면 "N/A" 표시 (프로세스는 보존)
+let vram_str = match proc.vram_used_mb() {
+    Some(mb) => format!("{:>7} MB", mb),
+    None => format!("{:>10}", "N/A"),
+};
+```
+
+##### 정렬 로직 개선
+
+```rust
+// Known VRAM 내림차순 → Unavailable은 뒤로 → PID 기준 안정 정렬
+entries.sort_by(|a, b| match (b.1, a.1) {
+    (Some(bv), Some(av)) => bv.cmp(&av),
+    (Some(_), None) => Ordering::Less,
+    (None, Some(_)) => Ordering::Greater,
+    (None, None) => a.0.cmp(&b.0),
+});
+entries.truncate(5);
+```
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/metrics.rs` | `GpuProcessInfo.vram_used` → `Option<u64>`, `vram_used_mb()` → `Option<u64>` |
+| `src/gpu/nvml.rs` | compute + graphics 통합 수집, PID dedup, `Unavailable` → `None` 보존, 개별 에러 처리 |
+| `src/ui/dashboard.rs` | VRAM "N/A" 표시, "No processes" 메시지 업데이트 |
+
+##### 상호 검증 매트릭스
+
+| 시나리오 | 프로세스 표시 | VRAM 표시 | 검증 |
+|----------|-------------|-----------|------|
+| Compute 프로세스 + VRAM 정상 | 표시됨 | MB 값 | 기존 동작 유지 |
+| Compute 프로세스 + VRAM Unavailable | 표시됨 | "N/A" | 수정 1: Option<u64> |
+| Graphics 프로세스만 존재 | 표시됨 | MB 또는 "N/A" | 수정 2: graphics 추가 |
+| 양쪽 동일 PID | 1건만 표시 | 중복 없음 | HashSet dedup |
+| compute API 실패, graphics 정상 | Graphics만 표시 | MB 또는 "N/A" | 개별 if let Ok |
+| 양쪽 모두 실패 | "No processes" | — | 빈 entries |
+| 5개 초과 프로세스 | 상위 5개 (VRAM 기준) | MB 우선, N/A 후순위 | 정렬 로직 |
+| MIG 인스턴스 | 해당 MIG 프로세스 | MB 또는 "N/A" | MIG 핸들에서 수집 |
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -847,7 +972,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 │   ├── throttle_reasons       ~0.1ms
 │   ├── encoder/decoder_util   ~0.2ms
 │   ├── ecc_errors (×2)        ~0.2ms   Corrected/Uncorrected
-│   ├── running_compute_procs  ~0.5ms   + top-5만 /proc 이름 읽기 (지연 I/O)
+│   ├── running_compute/graphics_procs ~0.5ms  compute+graphics 통합 + top-5만 /proc 이름 읽기
 │   └── (MIG) process_util     ~1-3ms   MIG 인스턴스당, 폴백 시에만
 │   └── (MIG) gpu_util_samples ~0.8ms   nvmlDeviceGetSamples 폴백, 부모 GPU만
 ├── sysinfo refresh       ~0.1-0.3ms
@@ -930,6 +1055,8 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | `gpm_prev_samples` 방어적 shrink | `nvml.rs` | MIG 재구성 반복 시 HashMap capacity 무한 증가 가능 → `capacity > len*4` 시 자동 축소 (`device_cache`와 동일 패턴) |
 | Top Processes 헤더 정적 `&str` | `dashboard.rs` | 매 프레임 `format!()` 3회 호출 → 정적 문자열 `&str` Span으로 변경 (프레임당 3회 String 할당 제거) |
 | Top Processes 컬럼 정렬 수정 | `dashboard.rs` | 헤더(하드코딩 8+22+4) ↔ 데이터({:<7}+{:<15}+{:>10}) 폭 불일치 → 동일 포맷 폭으로 통일 |
+| Compute + Graphics 프로세스 통합 | `nvml.rs` | compute만 수집 → compute + graphics 양쪽 수집 + HashSet PID dedup, VRAM Unavailable 프로세스 보존 |
+| `GpuProcessInfo.vram_used` Option화 | `metrics.rs` | `u64` → `Option<u64>`, VRAM Unavailable 프로세스 "N/A" 표시 (기존: 필터링 제거) |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
