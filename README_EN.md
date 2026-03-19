@@ -910,6 +910,7 @@ Total RSS ~4-8 MB
 | NVML sample buffer shrink | `nvml.rs` | grow-only buffer could grow unbounded → auto `shrink_to(needed×2)` when capacity > needed×2 |
 | Sparkline RightToLeft direction | `dashboard.rs` | All 5 sparklines use `RenderDirection::RightToLeft` → unified right-to-left progression matching RAM segmented chart |
 | RAM chart zero-alloc rendering | `dashboard.rs` | Per-frame `Vec<ColSegment>` allocation → direct iterator + buffer write (zero allocation) |
+| RAM segmented chart stacking fix | `dashboard.rs` | Used fractional row shifted cached start point, causing cached to lose ~1 row per column → introduced `cached_base` to correctly offset cached stacking based on used fraction presence |
 | RAM calculation accuracy fix | `dashboard.rs` | `used = ram_used - (avail-free)` (double subtraction) → `used = total - available` (correct non-reclaimable memory) |
 | `format_pstate` zero-alloc | `nvml.rs` | `"P0".to_string()` per tick → returns `&'static str` (zero allocation) |
 | `format_architecture` zero-alloc | `nvml.rs` | Same pattern: `"Ampere".to_string()` → `&'static str` |

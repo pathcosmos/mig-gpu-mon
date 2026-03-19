@@ -940,6 +940,12 @@ fn draw_ram_segmented_chart(f: &mut Frame, app: &App, area: Rect) {
         let used_frac = used_h.fract();
         let cached_rows = cached_h as usize;
         let cached_frac = cached_h.fract();
+        // When used has a fractional row, cached must start above it
+        let cached_base = if used_frac > 0.05 {
+            used_rows + 1
+        } else {
+            used_rows
+        };
         let used_color = if u_pct > 80.0 {
             Color::Red
         } else if u_pct > 50.0 {
@@ -954,9 +960,9 @@ fn draw_ram_segmented_chart(f: &mut Frame, app: &App, area: Rect) {
                 ('█', used_color)
             } else if bottom_row == used_rows && used_frac > 0.05 {
                 (bar_chars[(used_frac * 8.0) as usize % 8], used_color)
-            } else if bottom_row < used_rows + cached_rows {
+            } else if bottom_row < cached_base + cached_rows {
                 ('█', Color::Blue)
-            } else if bottom_row == used_rows + cached_rows && cached_frac > 0.05 {
+            } else if bottom_row == cached_base + cached_rows && cached_frac > 0.05 {
                 (bar_chars[(cached_frac * 8.0) as usize % 8], Color::Blue)
             } else {
                 continue; // empty cell — skip buffer write

@@ -910,6 +910,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | NVML 샘플 버퍼 shrink | `nvml.rs` | grow-only 버퍼 무한 증가 가능 → capacity > needed×2 시 `shrink_to(needed×2)` 자동 축소 |
 | Sparkline RightToLeft 방향 통일 | `dashboard.rs` | 5개 Sparkline 모두 `RenderDirection::RightToLeft` 적용 → RAM 세그먼트 차트와 동일한 우측→좌측 진행 방향 |
 | RAM 차트 zero-alloc 렌더링 | `dashboard.rs` | 매 프레임 `Vec<ColSegment>` 할당 → 직접 iterator + buffer write (할당 0) |
+| RAM 세그먼트 차트 적층 보정 | `dashboard.rs` | used fractional 행이 cached 시작점을 밀어 cached가 매 컬럼 ~1행 손실 → `cached_base` 도입으로 used 소수점 행 유무에 따라 cached 기준점 정확히 산정 |
 | RAM 계산 정확도 수정 | `dashboard.rs` | `used = ram_used - (avail-free)` (이중 차감) → `used = total - available` (정확한 비해제 가능 메모리) |
 | `format_pstate` 제로 할당 | `nvml.rs` | 매 tick `"P0".to_string()` String 할당 → `&'static str` 반환 (할당 0) |
 | `format_architecture` 제로 할당 | `nvml.rs` | 동일 패턴: `"Ampere".to_string()` → `&'static str` |
