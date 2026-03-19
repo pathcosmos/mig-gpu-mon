@@ -229,7 +229,6 @@ impl SystemMetrics {
         self.ram_total as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 
-
     pub fn swap_used_gb(&self) -> f64 {
         self.swap_used as f64 / (1024.0 * 1024.0 * 1024.0)
     }

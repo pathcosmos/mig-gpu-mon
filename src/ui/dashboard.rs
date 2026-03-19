@@ -274,20 +274,18 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("/", Style::default().fg(Color::DarkGray)),
         Span::styled("cached", Style::default().fg(Color::Blue)),
         Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("free ", Style::default().fg(Color::DarkGray)),
+        Span::styled("free", Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled("avl", Style::default().fg(Color::White)),
+        Span::raw(" "),
     ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(mem_title);
+    let block = Block::default().borders(Borders::ALL).title(mem_title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
 
     let ram_bar_width = rows[0].width.saturating_sub(30) as usize;
@@ -330,13 +328,31 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
             (free_pct, Color::DarkGray),
         ],
     );
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    let used_pure_gb = used_pure as f64 / gib;
+    let cached_gb = cached_bytes as f64 / gib;
+    let free_gb = sys.ram_free as f64 / gib;
+    let avail_gb = sys.ram_available as f64 / gib;
     ram_spans.push(Span::styled(
-        format!(
-            " {:.1}/{:.1} GiB ({:.1}%)",
-            sys.ram_used_gb(),
-            sys.ram_total_gb(),
-            ram_pct
-        ),
+        format!(" {:.1}", used_pure_gb),
+        Style::default().fg(used_color),
+    ));
+    ram_spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
+    ram_spans.push(Span::styled(
+        format!("{:.1}", cached_gb),
+        Style::default().fg(Color::Blue),
+    ));
+    ram_spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
+    ram_spans.push(Span::styled(
+        format!("{:.1}", free_gb),
+        Style::default().fg(Color::DarkGray),
+    ));
+    ram_spans.push(Span::styled(
+        format!(" avl:{:.1}", avail_gb),
+        Style::default().fg(Color::White),
+    ));
+    ram_spans.push(Span::styled(
+        format!("/{:.1}G", sys.ram_total_gb()),
         Style::default().fg(Color::White),
     ));
     f.render_widget(Paragraph::new(Line::from(ram_spans)), rows[0]);

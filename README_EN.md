@@ -20,8 +20,8 @@ Displays real-time sparkline graphs in btop/nvtop style, along with per-core CPU
 │  2 ▮▮▮▮▮▯▯  65%  40 ▮▮▯▯▯ 18% │   MIG 1 (GPU 0: A100) GPU:12% Mem:… │ ↓
 │  0 ▮▮▮▮▯▯▯  52%  33 ▮▯▯▯▯  5% ├─ Detail ─────────────────────────────┤    ← Top 45%
 │  ...                            │ Name: MIG 0 (GPU 0: A100-SXM4-80GB) │ ↑
-├─ Memory used/cached/free ──────┤ UUID: MIG-a1b2...  Arch:Ampere CC:8.0│ │
-│ RAM ▮▮▮▮▮▯▯ 89.2/256.0 GiB … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │
+├─ Memory used/cached/free avl ─┤ UUID: MIG-a1b2...  Arch:Ampere CC:8.0│ │
+│ RAM ▮▮▮▮▮▯▯ 70.1/12.5/6.6 … │ VRAM 12288 MB / 20480 MB (60.0%)    │ │
 │ SWP ▮▯▯▯▯▯▯  2.1/32.0 GiB  … │ GPU: 45%  Mem: 38%  SM: 45%         │ │ 50%
 │                                 │ Enc: 0%  Dec: 0%                     │ │
 │                                 │ Clk: 1410/1410/1215 MHz  P0          │ │
@@ -58,9 +58,10 @@ draw()
 │   │   ├── System Panel  50%
 │   │   │   ├── CPU Cores         Min(4)    " CPU ({N} cores) {pct}% "
 │   │   │   │   └── dynamic N-column bars   "{idx} ▮▮▯▯ {pct}%" (sorted by usage desc)
-│   │   │   └── RAM / Swap        Length(4)  " Memory used/cached/free "
-│   │   │       ├── RAM line                 "RAM ▮▮▮▮▯▯ {used}/{total} GiB ({pct}%)"
+│   │   │   └── RAM / Swap        Length(4)  " Memory used/cached/free avl "
+│   │   │       ├── RAM line                 "RAM ▮▮▮▮▯▯ {used}/{cached}/{free} avl:{avail}/{total}G"
 │   │   │       │   └── segmented bar: used(Green/Yellow/Red) + cached(Blue) + free(DarkGray)
+│   │   │       │       numeric labels: used(color) / cached(Blue) / free(DarkGray) avl(White) / totalG(White)
 │   │   │       └── SWP line                 "SWP ▮▮▯▯ {used}/{total} GiB ({pct}%)"
 │   │   └── GPU Panel     50%
 │   │       ├── Device List        20%       " Devices "
@@ -100,6 +101,7 @@ draw()
 | RAM bar (Used segment) | Green / Yellow / Red | 0-50% / 50-80% / 80%+ (based on total usage) |
 | RAM bar (Cached segment) | Blue | Kernel cache/buffers (available - free) |
 | RAM bar (Free segment) | DarkGray | Completely unused |
+| RAM numeric (avl) | White | Available memory (usable without swapping) |
 | Swap bar | DarkGray / Yellow / Red | 0-20% / 20-50% / 50%+ |
 | GPU Util sparkline | Green | — |
 | Mem Ctrl sparkline | Blue | — |
@@ -146,7 +148,7 @@ When all utilization APIs fail (common on driver 535.x with MIG), metrics are di
 - **Throttle Reasons** — Real-time GPU throttle cause display (PwrCap, HW-Therm, etc.)
 - **Architecture & Compute Capability** — GPU architecture (Ampere, Hopper, etc.) + CUDA CC
 - Per-core CPU usage (sorted by usage descending, dynamic multi-column bar graph adapting to terminal width)
-- System RAM (segmented bar: used/cached/free color-coded) / Swap usage
+- System RAM (segmented bar: used/cached/free color-coded with per-segment numeric values + available/total) / Swap usage
 - Time-series sparkline graphs for GPU Util / Mem Ctrl / **VRAM** / **PCIe** / CPU Total / RAM (current values in title)
 - Switch between GPU/MIG instances with Tab/arrow keys
 - Single binary deployment (~1.5MB, dynamically links libc — no separate runtime install needed)
