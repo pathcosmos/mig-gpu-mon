@@ -39,6 +39,16 @@ impl App {
                     m.memory_total = prev.memory_total;
                 }
             }
+            // Carry forward last-known processes when NVML query flickers
+            // (MIG running_compute_processes() is intermittently unavailable on some drivers)
+            if m.top_processes.is_empty() {
+                if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) {
+                    if !prev.top_processes.is_empty() {
+                        m.top_processes = prev.top_processes.clone();
+                        m.process_count = prev.process_count;
+                    }
+                }
+            }
         }
 
         for m in &new_metrics {
@@ -52,9 +62,17 @@ impl App {
 
         // Remove history entries for GPUs that are no longer present
         // (prevents unbounded HashMap growth on MIG reconfigs / GPU hot-remove)
-        if self.history.len() > new_metrics.len() {
+        // Always prune — UUID changes without GPU count change (MIG reconfig) must be caught
+        if self.history.len() != new_metrics.len()
+            || self.history.keys().any(|uuid| !new_metrics.iter().any(|m| m.uuid == *uuid))
+        {
             self.history
                 .retain(|uuid, _| new_metrics.iter().any(|m| m.uuid == *uuid));
+            // Shrink capacity after bulk removal (same pattern as nvml.rs caches)
+            let target = self.history.len().max(8) * 2;
+            if self.history.capacity() > target * 2 {
+                self.history.shrink_to(target);
+            }
         }
 
         self.metrics = new_metrics;

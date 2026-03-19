@@ -1011,6 +1011,141 @@ collect_mig_instances():
 
 v0.3.2는 "MIG 핸들에서 프로세스가 반환될 때 데이터 손실 방지", v0.3.3은 "MIG 핸들에서 프로세스 API 자체가 실패할 때 부모 디바이스로 폴백".
 
+#### Top Processes 깜빡임 + 자원 감사 수정 (v0.3.4)
+
+##### 증상
+
+MIG 환경에서 Top Processes가 한 틱 나타났다가 사라지는 깜빡임 현상. 장기 운영 시 HashMap 프루닝 조건 버그로 orphan 엔트리 누적 가능.
+
+##### 근본 원인 분석 — 3가지 이슈
+
+**이슈 1: Top Processes carry-forward 없음**
+
+`memory_used`는 API 실패 시 이전 값을 유지하는 carry-forward가 있지만, `top_processes`에는 동일 보호가 없었다.
+
+```
+Tick 1: MIG 디바이스 running_compute_processes() 성공 → 프로세스 표시
+Tick 2: 같은 API 실패 → top_processes 빈 배열 → Phase 3 시도
+Phase 3: gpu_instance_id 없으면 전부 필터 → "No processes" 표시
+Tick 3: API 다시 성공 → 프로세스 깜빡임
+```
+
+**이슈 2: Phase 3 gpu_instance_id 필터 과도하게 엄격**
+
+```rust
+// 기존: gpu_instance_id가 None이면 모든 프로세스 필터됨
+.filter(|(_, _, proc_gi)| *proc_gi == gi_id && gi_id.is_some())
+```
+
+부모 GPU의 프로세스에 `gpu_instance_id`가 설정되지 않은 드라이버에서는 Phase 3 폴백이 무용지물.
+
+**이슈 3: app.rs history HashMap 프루닝 조건 버그**
+
+```rust
+// 기존: GPU 수가 동일하면 프루닝 안 됨 → MIG 재구성 시 orphan 누적
+if self.history.len() > new_metrics.len() { ... }
+```
+
+4 MIG → 다른 UUID의 4 MIG 재구성 시 old 4개 + new 4개 = 8개 엔트리 누적.
+
+##### 수정 내역 (5개 변경)
+
+**Fix 1: Top Processes carry-forward** (`app.rs`)
+
+```rust
+// NVML 프로세스 API 간헐적 실패 시 이전 틱 프로세스 유지
+if m.top_processes.is_empty() {
+    if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) {
+        if !prev.top_processes.is_empty() {
+            m.top_processes = prev.top_processes.clone();
+            m.process_count = prev.process_count;
+        }
+    }
+}
+```
+
+**Fix 2: Phase 3 gpu_instance_id 폴백 완화** (`nvml.rs`)
+
+```rust
+// 부모 프로세스 중 아무도 gpu_instance_id가 없으면 전체 프로세스 표시
+let any_gi_available = parent_procs.iter().any(|(_, _, gi)| gi.is_some());
+
+let entries = if any_gi_available && gi_id.is_some() {
+    // 정상 경로: gpu_instance_id 매칭 필터
+    parent_procs.filter(|p| p.gpu_instance_id == gi_id)
+} else {
+    // 폴백: 전체 프로세스 표시 (아무것도 안 보이는 것보다 나음)
+    parent_procs.all()
+};
+```
+
+**Fix 3: HashMap 프루닝 정확도 개선** (`app.rs`)
+
+```rust
+// 기존: len 비교만 → MIG 재구성 시 UUID 변경 감지 불가
+// 수정: UUID 불일치 시 항상 프루닝 + shrink_to() 추가
+if self.history.len() != new_metrics.len()
+    || self.history.keys().any(|uuid| !new_metrics.iter().any(|m| m.uuid == *uuid))
+{
+    self.history.retain(...);
+    // 방어적 capacity 축소
+    if self.history.capacity() > target * 2 {
+        self.history.shrink_to(target);
+    }
+}
+```
+
+**Fix 4: proc_name_cache shrink 임계값 개선** (`nvml.rs`)
+
+```rust
+// 기존: len.max(16) * 4 → 1000 PID 사라져도 capacity 유지
+// 수정: target * 2 → 더 적극적 메모리 회수
+let target = name_cache.len().max(16) * 2;
+if name_cache.capacity() > target * 2 {
+    name_cache.shrink_to(target);
+}
+```
+
+**Fix 5: datetime 포맷 캐시** (`dashboard.rs`)
+
+```rust
+// thread_local 캐시 — 초 단위 변경 시에만 재생성
+thread_local! {
+    static TIME_CACHE: RefCell<(i64, String)> = RefCell::new((0, String::new()));
+}
+// 같은 초 내 반복 호출 시 캐시 반환 → 틱당 String 할당 1회 절감
+```
+
+##### 수정 파일
+
+| 파일 | 변경 내용 |
+|------|----------|
+| `src/app.rs` | Top Processes carry-forward + HashMap 프루닝 조건 수정 + shrink_to() 추가 |
+| `src/gpu/nvml.rs` | Phase 3 gpu_instance_id 폴백 완화 + proc_name_cache shrink 임계값 개선 |
+| `src/ui/dashboard.rs` | datetime 포맷 thread_local 캐시 |
+
+##### 교차 검증 매트릭스
+
+| 시나리오 | Top Processes 표시 | 자원 영향 | 검증 |
+|----------|-------------------|----------|------|
+| MIG 프로세스 API 간헐적 실패 | 이전 틱 값 유지 (carry-forward) | Clone 1회/틱 (5 프로세스) | API 실패 시에만 동작 |
+| 부모 GPU에 gpu_instance_id 없음 | 전체 부모 프로세스 표시 | 기존과 동일 | 폴백 경로 활성화 |
+| MIG 재구성 (UUID 변경, GPU 수 동일) | — | orphan 엔트리 즉시 제거 | UUID 불일치 감지 |
+| 대량 PID 소멸 (1000→10) | — | capacity 적극적 축소 | target*2 임계값 |
+| 1초 interval 장기 운영 | 정상 | RSS ~4-8MB 안정 유지 | 모든 버퍼 bounded |
+
+##### v0.3.3 → v0.3.4 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.3: 부모 디바이스 폴백 | MIG 핸들 프로세스 API 실패 → 부모에서 수집 | `collect_mig_instances()` Phase 3 |
+| **v0.3.4: carry-forward** | **Phase 3도 빈 결과 시 이전 틱 값 유지** | `app.rs:update_metrics()` |
+| **v0.3.4: gi_id 폴백 완화** | **부모 프로세스에 gi_id 없을 때 전체 표시** | `nvml.rs` Phase 3 필터 |
+| **v0.3.4: HashMap 프루닝 정확도** | **UUID 변경 감지 + shrink** | `app.rs:update_metrics()` |
+| **v0.3.4: 자원 감사 최적화** | **proc_name_cache shrink + datetime 캐시** | `nvml.rs`, `dashboard.rs` |
+
+v0.3.3은 "프로세스 수집 폴백 경로 추가", v0.3.4는 "폴백 경로 개선 + 표시 안정성 + 장기 운영 자원 최적화".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -1149,6 +1284,11 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Compute + Graphics 프로세스 통합 | `nvml.rs` | compute만 수집 → compute + graphics 양쪽 수집 + HashSet PID dedup, VRAM Unavailable 프로세스 보존 |
 | `GpuProcessInfo.vram_used` Option화 | `metrics.rs` | `u64` → `Option<u64>`, VRAM Unavailable 프로세스 "N/A" 표시 (기존: 필터링 제거) |
 | MIG 프로세스 부모 디바이스 폴백 | `nvml.rs` | MIG 핸들 프로세스 API 실패 시 부모 GPU에서 프로세스 쿼리 → `gpu_instance_id` 필터링으로 MIG 인스턴스별 분배 (Phase 3) |
+| Top Processes carry-forward | `app.rs` | NVML 프로세스 API 간헐적 실패 시 이전 틱 프로세스 목록 유지 → 깜빡임 방지 |
+| Phase 3 gi_id 폴백 완화 | `nvml.rs` | 부모 GPU 프로세스에 `gpu_instance_id` 없을 때 전체 프로세스 표시 (기존: 전부 필터링) |
+| datetime 포맷 캐시 | `dashboard.rs` | 매 tick `chrono::format().to_string()` → `thread_local!` 캐시, 초 단위 변경 시에만 재생성 |
+| GPU history HashMap 정확한 프루닝 | `app.rs` | `len > metrics.len()` 조건 제거 → UUID 불일치 시 항상 프루닝 + `shrink_to()` 추가 (MIG 재구성 시 orphan 방지) |
+| proc_name_cache shrink 임계값 개선 | `nvml.rs` | `len.max(16) * 4` → `target * 2` 기준으로 변경, 대량 PID 소멸 시 더 적극적 메모리 회수 |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
@@ -1193,11 +1333,13 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | 보호 메커니즘 | 위치 | 설명 |
 |-------------|------|------|
 | VecDeque 링 버퍼 (300 고정) | `metrics.rs` | GPU/시스템 히스토리 크기 고정, 무한 증가 불가 |
-| GPU 히스토리 자동 정리 | `app.rs` | MIG 재구성/GPU 제거 시 orphan 엔트리 자동 삭제 |
+| GPU 히스토리 자동 정리 + shrink | `app.rs` | MIG 재구성/GPU 제거 시 UUID 불일치 감지 → orphan 엔트리 자동 삭제 + capacity 축소 |
 | GPM 샘플·디바이스 캐시 정리 | `nvml.rs` | 매 tick active handle 추적 → stale `nvmlGpmSample_t` free + `DeviceInfo` 제거, MIG 재구성 반복 시에도 누수 없음 |
 | NVML 샘플 버퍼 shrink-to-fit | `nvml.rs` | capacity > floor×4 시 자동 축소, 변동 시 불필요한 shrink 반복 방지 |
 | DeviceInfo 캐시 1회 수집 + `Rc<str>` | `nvml.rs` | 정적 정보(arch, CC 등)는 첫 호출 시 캐시, clone 시 포인터 카운트만 증가 (heap 할당 0) |
-| 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱, 매 tick 현재 top-5에 없는 PID 자동 제거 |
+| 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱, 매 tick 현재 top-5에 없는 PID 자동 제거, 개선된 shrink 임계값(`target*2`)으로 대량 PID 소멸 시 적극적 회수 |
+| Top Processes carry-forward | `app.rs` | NVML 프로세스 API 간헐적 실패 시 이전 틱 값 유지, 프로세스 표시 깜빡임 방지 |
+| datetime 포맷 캐시 | `dashboard.rs` | `thread_local!` 캐시로 초 단위 변경 시에만 `chrono::format()` 호출 (틱당 String 할당 1회 절감) |
 | device_cache 방어적 shrink | `nvml.rs` | MIG 재설정 반복 시 HashMap capacity 무한 증가 방지 → `capacity > len*4` 시 자동 축소 |
 | `gpm_prev_samples` 방어적 shrink | `nvml.rs` | GPM 샘플 HashMap에도 동일한 shrink 휴리스틱 적용 → `capacity > len*4` 시 자동 축소, MIG 재구성 반복 시 메모리 회수 |
 | proc_name_cache HashSet 기반 정리 | `nvml.rs` | 매 tick dead PID 정리 시 O(n·m) 중첩 순회 → `HashSet<u32>` 기반 O(n+m) 조회로 변경, 프로세스 수 증가 시에도 일정 성능 |

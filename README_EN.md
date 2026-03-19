@@ -1011,6 +1011,140 @@ collect_mig_instances():
 
 v0.3.2 prevents "data loss when MIG handles do return processes"; v0.3.3 handles "when MIG handle process APIs fail entirely, fall back to parent device".
 
+#### Top Processes Flicker + Resource Audit Fix (v0.3.4)
+
+##### Symptoms
+
+In MIG environments, Top Processes briefly appears for one tick then disappears (flicker). Long-running operation could accumulate orphan HashMap entries due to pruning condition bug.
+
+##### Root Cause Analysis — 3 Issues
+
+**Issue 1: No carry-forward for Top Processes**
+
+`memory_used` has carry-forward when API fails, but `top_processes` had no equivalent protection.
+
+```
+Tick 1: MIG device running_compute_processes() succeeds → processes shown
+Tick 2: Same API fails → top_processes empty → Phase 3 attempted
+Phase 3: gpu_instance_id unavailable → all processes filtered → "No processes"
+Tick 3: API succeeds again → process flicker
+```
+
+**Issue 2: Phase 3 gpu_instance_id filter overly strict**
+
+```rust
+// Before: processes with gpu_instance_id=None entirely filtered out
+.filter(|(_, _, proc_gi)| *proc_gi == gi_id && gi_id.is_some())
+```
+
+On drivers where parent GPU processes don't have `gpu_instance_id` set, Phase 3 fallback was ineffective.
+
+**Issue 3: app.rs history HashMap pruning condition bug**
+
+```rust
+// Before: only prunes when GPU count decreases → MIG reconfig with same count leaks entries
+if self.history.len() > new_metrics.len() { ... }
+```
+
+4 MIG → different 4 MIG reconfig: old 4 entries + new 4 entries = 8 entries accumulated.
+
+##### Fix Details (5 changes)
+
+**Fix 1: Top Processes carry-forward** (`app.rs`)
+
+```rust
+// Retain previous tick's processes on NVML API intermittent failure
+if m.top_processes.is_empty() {
+    if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) {
+        if !prev.top_processes.is_empty() {
+            m.top_processes = prev.top_processes.clone();
+            m.process_count = prev.process_count;
+        }
+    }
+}
+```
+
+**Fix 2: Phase 3 gpu_instance_id fallback relaxation** (`nvml.rs`)
+
+```rust
+// Show all parent processes when no gpu_instance_id available
+let any_gi_available = parent_procs.iter().any(|(_, _, gi)| gi.is_some());
+
+let entries = if any_gi_available && gi_id.is_some() {
+    // Normal path: filter by matching gpu_instance_id
+    parent_procs.filter(|p| p.gpu_instance_id == gi_id)
+} else {
+    // Fallback: show all parent processes (better than showing nothing)
+    parent_procs.all()
+};
+```
+
+**Fix 3: HashMap pruning accuracy improvement** (`app.rs`)
+
+```rust
+// Before: only len comparison → missed UUID changes with same GPU count
+// After: detect UUID mismatch + always prune + shrink_to()
+if self.history.len() != new_metrics.len()
+    || self.history.keys().any(|uuid| !new_metrics.iter().any(|m| m.uuid == *uuid))
+{
+    self.history.retain(...);
+    if self.history.capacity() > target * 2 {
+        self.history.shrink_to(target);
+    }
+}
+```
+
+**Fix 4: proc_name_cache shrink threshold improvement** (`nvml.rs`)
+
+```rust
+// Before: len.max(16) * 4 → capacity held at 4000 even with 10 PIDs remaining
+// After: target * 2 → more aggressive memory reclaim
+let target = name_cache.len().max(16) * 2;
+if name_cache.capacity() > target * 2 {
+    name_cache.shrink_to(target);
+}
+```
+
+**Fix 5: datetime format cache** (`dashboard.rs`)
+
+```rust
+// thread_local cache — re-format only when second changes
+thread_local! {
+    static TIME_CACHE: RefCell<(i64, String)> = RefCell::new((0, String::new()));
+}
+// Repeated calls within same second return cached value → saves 1 String alloc/tick
+```
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/app.rs` | Top Processes carry-forward + HashMap pruning condition fix + shrink_to() |
+| `src/gpu/nvml.rs` | Phase 3 gpu_instance_id fallback relaxation + proc_name_cache shrink threshold improvement |
+| `src/ui/dashboard.rs` | datetime format thread_local cache |
+
+##### Cross-Verification Matrix
+
+| Scenario | Top Processes Display | Resource Impact | Verification |
+|----------|----------------------|----------------|-------------|
+| MIG process API intermittent failure | Previous tick value retained (carry-forward) | 1 Clone/tick (5 processes) | Activates only on API failure |
+| Parent GPU lacks gpu_instance_id | All parent processes shown | Same as existing | Fallback path activated |
+| MIG reconfig (UUID change, same GPU count) | — | Orphan entries removed immediately | UUID mismatch detection |
+| Mass PID death (1000→10) | — | Capacity aggressively shrunk | target*2 threshold |
+| Long-running at 1s interval | Normal | RSS ~4-8MB stable | All buffers bounded |
+
+##### v0.3.3 → v0.3.4 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.3: Parent device fallback | MIG handle process API fail → collect from parent | `collect_mig_instances()` Phase 3 |
+| **v0.3.4: carry-forward** | **Phase 3 also returns empty → retain previous tick** | `app.rs:update_metrics()` |
+| **v0.3.4: gi_id fallback relaxation** | **Parent processes lack gi_id → show all** | `nvml.rs` Phase 3 filter |
+| **v0.3.4: HashMap pruning accuracy** | **UUID change detection + shrink** | `app.rs:update_metrics()` |
+| **v0.3.4: resource audit optimizations** | **proc_name_cache shrink + datetime cache** | `nvml.rs`, `dashboard.rs` |
+
+v0.3.3 adds "process collection fallback path"; v0.3.4 improves "fallback path robustness + display stability + long-running resource optimization".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -1151,6 +1285,11 @@ Total RSS ~4-8 MB
 | proc_name_cache HashSet-based pruning | `nvml.rs` | Per-tick dead PID pruning changed from O(n·m) nested iteration → `HashSet<u32>` O(n+m) lookup, consistent performance as process count grows |
 | Memory panel consolidated to right | `dashboard.rs` | Removed left Memory box → RAM/SWP bars integrated into right System Charts, expanding CPU core display area |
 | MIG process parent device fallback | `nvml.rs` | When MIG handle process API fails, query parent GPU → filter by `gpu_instance_id` to distribute processes per MIG instance (Phase 3) |
+| Top Processes carry-forward | `app.rs` | Retains previous tick's process list when NVML process API intermittently fails → prevents flicker |
+| Phase 3 gi_id fallback relaxation | `nvml.rs` | Shows all parent processes when `gpu_instance_id` unavailable (previously: all filtered out) |
+| datetime format cache | `dashboard.rs` | Per-tick `chrono::format().to_string()` → `thread_local!` cache, re-format only when second changes |
+| GPU history HashMap accurate pruning | `app.rs` | Removed `len > metrics.len()` condition → always prune on UUID mismatch + added `shrink_to()` (prevents orphans on MIG reconfig) |
+| proc_name_cache shrink threshold improvement | `nvml.rs` | `len.max(16) * 4` → `target * 2` threshold, more aggressive memory reclaim on mass PID death |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
@@ -1195,11 +1334,13 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | Protection Mechanism | Location | Description |
 |---------------------|----------|-------------|
 | VecDeque ring buffer (300 fixed) | `metrics.rs` | GPU/system history size fixed, cannot grow unbounded |
-| GPU history auto-cleanup | `app.rs` | Orphan entries auto-deleted on MIG reconfig/GPU removal |
+| GPU history auto-cleanup + shrink | `app.rs` | UUID mismatch detection on MIG reconfig/GPU removal → orphan entries auto-deleted + capacity shrink |
 | GPM sample + device cache pruning | `nvml.rs` | Per-tick active handle tracking → frees stale `nvmlGpmSample_t` + removes `DeviceInfo`, no leaks across repeated MIG reconfigs |
 | NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > floor×4, prevents unnecessary shrink thrashing on fluctuations |
 | DeviceInfo cache (one-time) + `Rc<str>` | `nvml.rs` | Static info cached on first call, clone only bumps reference count (zero heap allocation) |
-| Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached, dead PIDs not in current top-5 auto-removed each tick |
+| Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached, dead PIDs not in current top-5 auto-removed each tick, improved shrink threshold (`target*2`) for aggressive reclaim on mass PID death |
+| Top Processes carry-forward | `app.rs` | Retains previous tick's process list on NVML API intermittent failure, prevents process display flicker |
+| datetime format cache | `dashboard.rs` | `thread_local!` cache re-formats only when second changes (saves 1 String allocation/tick) |
 | device_cache defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |
 | sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |
 | `active_handles` buffer reuse | `nvml.rs` | Per-tick new Vec allocation → `RefCell<Vec<usize>>` reuse, prevents allocator fragmentation on long-running execution |

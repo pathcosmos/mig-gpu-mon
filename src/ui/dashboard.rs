@@ -16,6 +16,8 @@ use crate::gpu::metrics::RamBreakdown;
 thread_local! {
     static SPARK_BUF: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::with_capacity(300));
     static CORE_SORT_BUF: std::cell::RefCell<Vec<(usize, f32)>> = std::cell::RefCell::new(Vec::with_capacity(128));
+    // Cache datetime string — only re-format when second changes
+    static TIME_CACHE: std::cell::RefCell<(i64, String)> = std::cell::RefCell::new((0, String::new()));
 }
 
 /// Convert VecDeque<u32> to &[u64] via thread-local scratch buffer, then call f.
@@ -61,10 +63,17 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, app, chunks[2]);
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let now = chrono::Local::now()
-        .format("%Y-%m-%d %I:%M:%S %p")
-        .to_string();
+fn draw_header(f: &mut Frame, _app: &App, area: Rect) {
+    let now_dt = chrono::Local::now();
+    let now = TIME_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        let ts = now_dt.timestamp();
+        if c.0 != ts {
+            c.0 = ts;
+            c.1 = now_dt.format("%Y-%m-%d %I:%M:%S %p").to_string();
+        }
+        c.1.clone()
+    });
     let header = Paragraph::new(" pathcosmos@gmail.com")
         .alignment(Alignment::Right)
         .style(Style::default().fg(Color::Cyan))

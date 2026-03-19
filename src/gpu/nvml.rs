@@ -207,8 +207,8 @@ impl NvmlCollector {
                     .flat_map(|m| m.top_processes.iter().map(|p| p.pid))
                     .collect();
                 name_cache.retain(|pid, _| active_pids.contains(pid));
-                let target = name_cache.len() * 2;
-                if name_cache.capacity() > name_cache.len().max(16) * 4 {
+                let target = name_cache.len().max(16) * 2;
+                if name_cache.capacity() > target * 2 {
                     name_cache.shrink_to(target);
                 }
             }
@@ -357,6 +357,9 @@ impl NvmlCollector {
                     }
                 }
 
+                // Check if any parent process has a gpu_instance_id set
+                let any_gi_available = parent_procs.iter().any(|(_, _, gi)| gi.is_some());
+
                 // Distribute parent processes to MIG instances by gpu_instance_id
                 for (mig_handle, metrics) in &mut phase1 {
                     // Skip if MIG handle already has processes (some drivers do work)
@@ -368,11 +371,21 @@ impl NvmlCollector {
                     let mig_info = self.get_device_info(&mig_device, true);
                     let gi_id = mig_info.gpu_instance_id;
 
-                    let mut entries: Vec<(u32, Option<u64>)> = parent_procs
-                        .iter()
-                        .filter(|(_, _, proc_gi)| *proc_gi == gi_id && gi_id.is_some())
-                        .map(|(pid, vram, _)| (*pid, *vram))
-                        .collect();
+                    let mut entries: Vec<(u32, Option<u64>)> = if any_gi_available && gi_id.is_some() {
+                        // Normal path: filter by matching gpu_instance_id
+                        parent_procs
+                            .iter()
+                            .filter(|(_, _, proc_gi)| *proc_gi == gi_id)
+                            .map(|(pid, vram, _)| (*pid, *vram))
+                            .collect()
+                    } else {
+                        // Fallback: driver doesn't provide gpu_instance_id —
+                        // show all parent processes (better than showing nothing)
+                        parent_procs
+                            .iter()
+                            .map(|(pid, vram, _)| (*pid, *vram))
+                            .collect()
+                    };
 
                     // Sort: known VRAM descending, Unavailable at end
                     entries.sort_by(|a, b| match (b.1, a.1) {
