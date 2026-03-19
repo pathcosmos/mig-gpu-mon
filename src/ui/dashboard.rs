@@ -228,6 +228,36 @@ fn make_bar(percent: f32, width: usize) -> String {
     s
 }
 
+/// Build a segmented bar with multiple colored sections into `spans`.
+/// Each segment is (percent 0-100, color). Segments are laid out left-to-right.
+fn make_segmented_bar(spans: &mut Vec<Span<'_>>, width: usize, segments: &[(f32, Color)]) {
+    if width == 0 {
+        return;
+    }
+    spans.push(Span::raw(" "));
+    let total_pct: f32 = segments.iter().map(|(p, _)| p).sum();
+    let mut used_chars = 0usize;
+    for (i, &(pct, color)) in segments.iter().enumerate() {
+        let chars = if i == segments.len() - 1 {
+            // Last segment gets remaining chars to avoid rounding gaps
+            width.saturating_sub(used_chars)
+        } else if total_pct > 0.0 {
+            ((pct / total_pct) * width as f32).round() as usize
+        } else {
+            0
+        };
+        let chars = chars.min(width.saturating_sub(used_chars));
+        if chars > 0 {
+            let mut s = String::with_capacity(chars * 3);
+            for _ in 0..chars {
+                s.push('▮');
+            }
+            spans.push(Span::styled(s, Style::default().fg(color)));
+            used_chars += chars;
+        }
+    }
+}
+
 fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
     let sys = match &app.system_metrics {
         Some(s) => s,
@@ -238,46 +268,78 @@ fn draw_ram_swap(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let block = Block::default().borders(Borders::ALL).title(" Memory ");
+    let mem_title = Line::from(vec![
+        Span::raw(" Memory "),
+        Span::styled("used", Style::default().fg(Color::Green)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("cached", Style::default().fg(Color::Blue)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("free ", Style::default().fg(Color::DarkGray)),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(mem_title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
+    let ram_bar_width = rows[0].width.saturating_sub(30) as usize;
+
+    // Segment ratios: used (excl cache) | cached/buffers | free
+    let total = sys.ram_total as f64;
+    let cached_bytes = sys.ram_available.saturating_sub(sys.ram_free);
+    let used_pure = sys.ram_used.saturating_sub(cached_bytes); // used excluding cache
+    let (used_pct, cached_pct, free_pct) = if total > 0.0 {
+        (
+            (used_pure as f64 / total * 100.0) as f32,
+            (cached_bytes as f64 / total * 100.0) as f32,
+            (sys.ram_free as f64 / total * 100.0) as f32,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
     let ram_pct = sys.ram_percent();
-    let ram_color = if ram_pct > 80.0 {
+    let used_color = if ram_pct > 80.0 {
         Color::Red
     } else if ram_pct > 50.0 {
         Color::Yellow
     } else {
         Color::Green
     };
-    let ram_bar_width = rows[0].width.saturating_sub(30) as usize;
-    let ram_line = Line::from(vec![
-        Span::styled(
-            "RAM",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+
+    let mut ram_spans = vec![Span::styled(
+        "RAM",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    make_segmented_bar(
+        &mut ram_spans,
+        ram_bar_width,
+        &[
+            (used_pct, used_color),
+            (cached_pct, Color::Blue),
+            (free_pct, Color::DarkGray),
+        ],
+    );
+    ram_spans.push(Span::styled(
+        format!(
+            " {:.1}/{:.1} GiB ({:.1}%)",
+            sys.ram_used_gb(),
+            sys.ram_total_gb(),
+            ram_pct
         ),
-        Span::styled(
-            make_bar(ram_pct as f32, ram_bar_width),
-            Style::default().fg(ram_color),
-        ),
-        Span::styled(
-            format!(
-                " {:.1}/{:.1} GiB ({:.1}%)",
-                sys.ram_used_gb(),
-                sys.ram_total_gb(),
-                ram_pct
-            ),
-            Style::default().fg(Color::White),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(ram_line), rows[0]);
+        Style::default().fg(Color::White),
+    ));
+    f.render_widget(Paragraph::new(Line::from(ram_spans)), rows[0]);
 
     if sys.swap_total > 0 {
         let swap_pct = sys.swap_percent();

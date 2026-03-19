@@ -145,6 +145,8 @@ fn main() -> Result<()> {
             cpu_total,
             ram_used: sys.used_memory(),
             ram_total: sys.total_memory(),
+            ram_available: sys.available_memory(),
+            ram_free: sys.free_memory(),
             swap_used: sys.used_swap(),
             swap_total: sys.total_swap(),
         });

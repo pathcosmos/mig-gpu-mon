@@ -196,6 +196,10 @@ pub struct SystemMetrics {
     pub ram_used: u64,
     /// RAM total in bytes
     pub ram_total: u64,
+    /// RAM available in bytes (usable without swapping)
+    pub ram_available: u64,
+    /// RAM free in bytes (not used at all, excludes cache/buffers)
+    pub ram_free: u64,
     /// Swap used in bytes
     pub swap_used: u64,
     /// Swap total in bytes
@@ -224,6 +228,7 @@ impl SystemMetrics {
     pub fn ram_total_gb(&self) -> f64 {
         self.ram_total as f64 / (1024.0 * 1024.0 * 1024.0)
     }
+
 
     pub fn swap_used_gb(&self) -> f64 {
         self.swap_used as f64 / (1024.0 * 1024.0 * 1024.0)
