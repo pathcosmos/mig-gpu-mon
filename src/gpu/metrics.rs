@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -8,7 +9,8 @@ pub const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
 #[derive(Debug, Clone)]
 pub struct GpuProcessInfo {
     pub pid: u32,
-    pub name: String,
+    /// Process name — Rc<str> to avoid cloning from proc_name_cache every tick.
+    pub name: Rc<str>,
     /// VRAM usage in bytes — None when NVML reports Unavailable (common on MIG)
     pub vram_used: Option<u64>,
 }
@@ -65,7 +67,7 @@ pub struct GpuMetrics {
     pub pcie_gen: Option<u32>,
     pub pcie_width: Option<u32>,
     pub performance_state: Option<&'static str>, // "P0"~"P15"
-    pub throttle_reasons: Option<String>,        // "None" or "SwPwrCap, HW-Therm"
+    pub throttle_reasons: Option<Cow<'static, str>>, // "None" or "SwPwrCap, HW-Therm"
     pub encoder_util: Option<u32>,               // 0-100%
     pub decoder_util: Option<u32>,               // 0-100%
     pub ecc_errors_corrected: Option<u64>,

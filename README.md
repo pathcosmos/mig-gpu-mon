@@ -1146,6 +1146,143 @@ thread_local! {
 
 v0.3.3은 "프로세스 수집 폴백 경로 추가", v0.3.4는 "폴백 경로 개선 + 표시 안정성 + 장기 운영 자원 최적화".
 
+#### Sparkline 방향 버그 + 장기 운영 최적화 (v0.3.5)
+
+##### 증상
+
+1. Sparkline 그래프가 최신 데이터가 아닌 **가장 오래된 데이터**를 표시하며, 시간축 방향이 반전되어 있음
+2. CPU sparkline의 f32→u64 변환 시 truncation으로 정밀도 손실 (99.7% → 99)
+3. PCIe sparkline 타이틀에 TX/RX 모두 표시하지만 그래프는 TX만 렌더링 — 사용자 혼동
+4. 프로세스명 캐시에서 매 tick `String::clone()` 발생 — 장기 운영 시 불필요한 힙 할당 누적
+5. throttle_reasons가 매 tick `String` 할당 — "None" 등 빈번한 단일 값에도 힙 할당
+
+##### 근본 원인 분석
+
+**Bug 1: ratatui `RenderDirection::RightToLeft` 의미 오해 (Critical)**
+
+ratatui의 `RightToLeft` 방향은 `data[0]`을 **오른쪽 끝**에 배치한다:
+```
+data = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+RightToLeft → "xxx█▇▆▅▄▃▂▁ "
+//              data[8]←→data[0] (오른쪽 끝)
+```
+
+VecDeque에 `[oldest(0), ..., newest(N)]` 순서로 저장된 데이터를 그대로 전달하면:
+- `data[0]` (가장 오래된 값)이 오른쪽 끝(최신 위치)에 표시됨
+- `data[N]` (최신 값)이 왼쪽(과거 위치)에 표시됨
+- `max_index = min(width, data.len())` 제한으로, 300개 히스토리 중 **가장 오래된 ~80개만** 렌더되고 최신 데이터는 아예 표시되지 않음
+
+```
+VecDeque: [T0(oldest), T1, T2, ..., T299(newest)]
+Sparkline: data[0..80] = [T0, T1, ..., T79]  ← 가장 오래된 80개만!
+화면:       T79 ← T78 ← ... ← T1 ← T0(오른쪽 끝)
+```
+
+**Bug 2: f32 truncation**
+
+```rust
+// Before: truncation (99.7% → 99)
+buf.extend(src.iter().map(|&v| v as u64));
+```
+
+**Bug 3: PCIe 타이틀 모호성**
+
+타이틀 `PCIe TX:12.3 RX:56.7 MB/s`이지만 sparkline은 `history.pcie_tx_kbps`만 사용 — RX 값 변화가 그래프에 반영 안 됨.
+
+##### 수정 내용 (6개 변경)
+
+**Fix 1: Sparkline 데이터 역순 변환** (`dashboard.rs`)
+
+```rust
+// Before: oldest → newest 순서 (data[0]=oldest → 오른쪽 끝)
+buf.extend(src.iter().map(|&v| v as u64));
+
+// After: newest → oldest 순서 (data[0]=newest → 오른쪽 끝)
+buf.extend(src.iter().rev().map(|&v| v as u64));
+```
+
+`.rev()` 추가로 데이터 순서 반전:
+- `data[0]` = newest → 오른쪽 끝 ✓
+- 터미널 폭(~80) 내 최신 데이터만 표시 ✓
+- 버퍼 미충전 시 오른쪽부터 채워짐 ✓
+
+**Fix 2: f32 rounding** (`dashboard.rs`)
+
+```rust
+// Before: truncation
+buf.extend(src.iter().rev().map(|&v| v as u64));
+// After: rounding
+buf.extend(src.iter().rev().map(|&v| v.round() as u64));
+```
+
+**Fix 3: PCIe 타이틀 명확화** (`dashboard.rs`)
+
+```rust
+// Before: "PCIe TX:12.3 RX:56.7 MB/s" — 그래프가 TX+RX인 듯 오해
+// After: "PCIe TX:12.3 / RX:56.7 MB/s" + 기본 타이틀 "PCIe TX"
+```
+
+**Fix 4: `GpuProcessInfo::name` → `Rc<str>`** (`metrics.rs`, `nvml.rs`)
+
+```rust
+// Before: 매 tick String::clone() (힙 복사)
+pub name: String,
+fn process_name(&self, pid: u32) -> String { cache.get(&pid).clone() }
+
+// After: Rc<str> clone = 포인터 카운트 증가만 (힙 할당 0)
+pub name: Rc<str>,
+fn process_name(&self, pid: u32) -> Rc<str> { cache.get(&pid).clone() }
+```
+
+**Fix 5: `throttle_reasons` → `Cow<'static, str>`** (`metrics.rs`, `nvml.rs`)
+
+```rust
+// Before: 매 tick String 할당 (빈번한 "None" 포함)
+pub throttle_reasons: Option<String>,
+fn format_throttle_reasons(tr) -> String { String::from("None") }
+
+// After: 단일 플래그 fast path → Cow::Borrowed (제로 할당)
+pub throttle_reasons: Option<Cow<'static, str>>,
+fn format_throttle_reasons(tr) -> Cow<'static, str> {
+    // "None", "Idle", "SwPwrCap", "HW-Slow", "SW-Therm", "HW-Therm" → Borrowed
+    // 복합 플래그만 Cow::Owned 할당
+}
+```
+
+**Fix 6: `unused import: Text` warning 제거** (`dashboard.rs`)
+
+##### 수정 파일
+
+| 파일 | 변경 내용 |
+|------|----------|
+| `src/ui/dashboard.rs` | Sparkline 데이터 `.rev()` 역순 변환, f32 rounding, PCIe 타이틀 명확화, unused import 정리 |
+| `src/gpu/metrics.rs` | `GpuProcessInfo::name` → `Rc<str>`, `throttle_reasons` → `Cow<'static, str>` |
+| `src/gpu/nvml.rs` | `proc_name_cache` → `HashMap<u32, Rc<str>>`, `process_name()` → `Rc<str>` 반환, `format_throttle_reasons()` → `Cow<'static, str>` 반환 + 단일 플래그 fast path |
+
+##### 교차 검증 매트릭스
+
+| 시나리오 | Sparkline 표시 | 성능 영향 | 검증 |
+|----------|---------------|----------|------|
+| 히스토리 300개, 터미널 80칸 | 최신 80개 표시 (newest → right) | 변경 없음 | `.rev()` + `RightToLeft` |
+| 히스토리 10개, 터미널 80칸 | 오른쪽 끝부터 10개 채움 | 변경 없음 | `RightToLeft` 특성 유지 |
+| CPU 99.7% | sparkline에 100 표시 | 변경 없음 | `.round()` 적용 |
+| PCIe TX만 그래프 | 타이틀 "PCIe TX:" 명시 | 변경 없음 | 타이틀에서 혼동 제거 |
+| throttle "None" (90%+ 빈도) | 동일 표시 | **String 할당 제거** | `Cow::Borrowed` |
+| throttle "SwPwrCap, HW-Therm" | 동일 표시 | 기존과 동일 (Cow::Owned) | 복합 플래그 fallback |
+| 프로세스명 캐시 히트 | 동일 표시 | **String clone → Rc bump** | GPU당 5개 × tick |
+| top_processes carry-forward | 동일 표시 | **Vec<GpuProcessInfo> clone 비용 감소** | Rc<str> 이므로 name 복사 0 |
+
+##### v0.3.4 → v0.3.5 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.4: 자원 감사 최적화 | proc_name_cache shrink + datetime 캐시 | `nvml.rs`, `dashboard.rs` |
+| **v0.3.5: Sparkline 방향 수정** | **가장 오래된 데이터가 최신으로 표시되는 치명적 버그 수정** | `dashboard.rs` 전체 sparkline |
+| **v0.3.5: 프로세스명 Rc<str>** | **매 tick String 힙 복사 제거 → 포인터 카운트만** | `metrics.rs`, `nvml.rs` |
+| **v0.3.5: throttle Cow<'static, str>** | **빈번한 단일 값에 대한 힙 할당 제거** | `metrics.rs`, `nvml.rs` |
+
+v0.3.4는 "장기 운영 자원 회수 최적화", v0.3.5는 "실시간 표시 정확성 수정 + tick당 반복 힙 할당 제거".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -1289,6 +1426,12 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | datetime 포맷 캐시 | `dashboard.rs` | 매 tick `chrono::format().to_string()` → `thread_local!` 캐시, 초 단위 변경 시에만 재생성 |
 | GPU history HashMap 정확한 프루닝 | `app.rs` | `len > metrics.len()` 조건 제거 → UUID 불일치 시 항상 프루닝 + `shrink_to()` 추가 (MIG 재구성 시 orphan 방지) |
 | proc_name_cache shrink 임계값 개선 | `nvml.rs` | `len.max(16) * 4` → `target * 2` 기준으로 변경, 대량 PID 소멸 시 더 적극적 메모리 회수 |
+| Sparkline 데이터 방향 수정 | `dashboard.rs` | `data[0]=oldest`가 오른쪽 끝에 표시되는 버그 → `.rev()`로 `data[0]=newest` 변환, 최신 데이터가 오른쪽 끝에 정확히 표시 |
+| f32→u64 rounding | `dashboard.rs` | `v as u64` truncation (99.7→99) → `v.round() as u64` (99.7→100) CPU sparkline 정밀도 개선 |
+| `GpuProcessInfo::name` → `Rc<str>` | `metrics.rs`, `nvml.rs` | 매 tick `String::clone()` 힙 복사 → `Rc::clone()` 포인터 카운트만 (GPU당 프로세스 5개 × tick 힙 할당 제거) |
+| `throttle_reasons` → `Cow<'static, str>` | `metrics.rs`, `nvml.rs` | 매 tick `String` 힙 할당 → "None", "Idle" 등 단일 플래그는 `Cow::Borrowed` 제로 할당 (실 사용의 90%+ 커버) |
+| `proc_name_cache` → `HashMap<u32, Rc<str>>` | `nvml.rs` | 캐시 히트 시 `String::clone()` → `Rc::clone()` 포인터 카운트만, 프로세스명 공유 비용 제거 |
+| PCIe sparkline 타이틀 명확화 | `dashboard.rs` | 타이틀 "TX/RX" 표기가 그래프 내용(TX만)과 불일치 → "PCIe TX:N / RX:N MB/s"로 명확화 |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
@@ -1337,7 +1480,8 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | GPM 샘플·디바이스 캐시 정리 | `nvml.rs` | 매 tick active handle 추적 → stale `nvmlGpmSample_t` free + `DeviceInfo` 제거, MIG 재구성 반복 시에도 누수 없음 |
 | NVML 샘플 버퍼 shrink-to-fit | `nvml.rs` | capacity > floor×4 시 자동 축소, 변동 시 불필요한 shrink 반복 방지 |
 | DeviceInfo 캐시 1회 수집 + `Rc<str>` | `nvml.rs` | 정적 정보(arch, CC 등)는 첫 호출 시 캐시, clone 시 포인터 카운트만 증가 (heap 할당 0) |
-| 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱, 매 tick 현재 top-5에 없는 PID 자동 제거, 개선된 shrink 임계값(`target*2`)으로 대량 PID 소멸 시 적극적 회수 |
+| 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱 (`HashMap<u32, Rc<str>>`), 매 tick 현재 top-5에 없는 PID 자동 제거, 캐시 히트 시 `Rc::clone()`만 (힙 할당 0) |
+| `throttle_reasons` `Cow<'static, str>` | `nvml.rs` | "None", "Idle" 등 빈번한 단일 플래그는 `Cow::Borrowed` 제로 할당, 복합 플래그만 `Cow::Owned` |
 | Top Processes carry-forward | `app.rs` | NVML 프로세스 API 간헐적 실패 시 이전 틱 값 유지, 프로세스 표시 깜빡임 방지 |
 | datetime 포맷 캐시 | `dashboard.rs` | `thread_local!` 캐시로 초 단위 변경 시에만 `chrono::format()` 호출 (틱당 String 할당 1회 절감) |
 | device_cache 방어적 shrink | `nvml.rs` | MIG 재설정 반복 시 HashMap capacity 무한 증가 방지 → `capacity > len*4` 시 자동 축소 |

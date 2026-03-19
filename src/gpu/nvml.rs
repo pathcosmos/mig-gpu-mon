@@ -52,9 +52,9 @@ pub struct NvmlCollector {
     /// Previous GPM samples for DRAM BW util computation (keyed by device handle pointer).
     /// Each value is an allocated nvmlGpmSample_t that must be freed on drop.
     gpm_prev_samples: RefCell<HashMap<usize, nvmlGpmSample_t>>,
-    /// Cache: pid → process name. Avoids /proc/{pid}/comm I/O every tick for stable processes.
+    /// Cache: pid → process name (Rc<str> for zero-cost sharing with GpuProcessInfo).
     /// Entries are pruned each tick to remove dead PIDs.
-    proc_name_cache: RefCell<HashMap<u32, String>>,
+    proc_name_cache: RefCell<HashMap<u32, std::rc::Rc<str>>>,
     /// Reusable buffer for tracking active device handles during collection (avoid alloc per tick)
     active_handles: RefCell<Vec<usize>>,
 }
@@ -837,14 +837,14 @@ impl NvmlCollector {
 
     /// Read process name from cache or /proc/{pid}/comm (Linux).
     /// Cached to avoid repeated /proc I/O for stable processes.
-    fn process_name(&self, pid: u32) -> String {
+    fn process_name(&self, pid: u32) -> std::rc::Rc<str> {
         let cache = self.proc_name_cache.borrow();
         if let Some(name) = cache.get(&pid) {
-            return name.clone();
+            return name.clone(); // Rc clone = pointer bump, no heap alloc
         }
         drop(cache);
 
-        let name = Self::read_process_name(pid);
+        let name: std::rc::Rc<str> = Self::read_process_name(pid).into();
         self.proc_name_cache.borrow_mut().insert(pid, name.clone());
         name
     }
@@ -947,9 +947,23 @@ fn format_pstate(ps: PerformanceState) -> &'static str {
     }
 }
 
-fn format_throttle_reasons(tr: ThrottleReasons) -> String {
+fn format_throttle_reasons(tr: ThrottleReasons) -> std::borrow::Cow<'static, str> {
     if tr.is_empty() || tr == ThrottleReasons::NONE {
-        return String::from("None");
+        return std::borrow::Cow::Borrowed("None");
+    }
+
+    // Single-flag fast paths — avoid String allocation for common solo reasons
+    let single_flag_checks: &[(ThrottleReasons, &'static str)] = &[
+        (ThrottleReasons::GPU_IDLE, "Idle"),
+        (ThrottleReasons::SW_POWER_CAP, "SwPwrCap"),
+        (ThrottleReasons::HW_SLOWDOWN, "HW-Slow"),
+        (ThrottleReasons::SW_THERMAL_SLOWDOWN, "SW-Therm"),
+        (ThrottleReasons::HW_THERMAL_SLOWDOWN, "HW-Therm"),
+    ];
+    for &(flag, name) in single_flag_checks {
+        if tr == flag {
+            return std::borrow::Cow::Borrowed(name);
+        }
     }
 
     let mut s = String::with_capacity(48);
@@ -974,9 +988,9 @@ fn format_throttle_reasons(tr: ThrottleReasons) -> String {
     check!(ThrottleReasons::DISPLAY_CLOCK_SETTING, "DispClk");
 
     if s.is_empty() {
-        String::from("Unknown")
+        std::borrow::Cow::Borrowed("Unknown")
     } else {
-        s
+        std::borrow::Cow::Owned(s)
     }
 }
 

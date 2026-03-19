@@ -1145,6 +1145,143 @@ thread_local! {
 
 v0.3.3 adds "process collection fallback path"; v0.3.4 improves "fallback path robustness + display stability + long-running resource optimization".
 
+#### Sparkline Direction Bug + Long-Running Optimization (v0.3.5)
+
+##### Symptoms
+
+1. Sparkline graphs display **oldest data** instead of newest, with the time axis reversed
+2. CPU sparkline f32→u64 conversion truncates instead of rounding (99.7% → 99)
+3. PCIe sparkline title shows both TX/RX values but graph only renders TX — user confusion
+4. Process name cache returns `String::clone()` every tick — unnecessary heap allocation in long-running operation
+5. `throttle_reasons` allocates a new `String` every tick — even for frequent single values like "None"
+
+##### Root Cause Analysis
+
+**Bug 1: Misunderstanding of ratatui `RenderDirection::RightToLeft` semantics (Critical)**
+
+ratatui's `RightToLeft` direction places `data[0]` at the **right edge**:
+```
+data = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+RightToLeft → "xxx█▇▆▅▄▃▂▁ "
+//              data[8]←→data[0] (right edge)
+```
+
+With VecDeque storing `[oldest(0), ..., newest(N)]` passed directly:
+- `data[0]` (oldest value) displayed at the right edge (newest position)
+- `data[N]` (newest value) displayed on the left (oldest position)
+- `max_index = min(width, data.len())` limitation means only the **oldest ~80 entries** out of 300 are rendered, and newest data is never displayed
+
+```
+VecDeque: [T0(oldest), T1, T2, ..., T299(newest)]
+Sparkline: data[0..80] = [T0, T1, ..., T79]  ← oldest 80 only!
+Screen:     T79 ← T78 ← ... ← T1 ← T0(right edge)
+```
+
+**Bug 2: f32 truncation**
+
+```rust
+// Before: truncation (99.7% → 99)
+buf.extend(src.iter().map(|&v| v as u64));
+```
+
+**Bug 3: PCIe title ambiguity**
+
+Title `PCIe TX:12.3 RX:56.7 MB/s` but sparkline only uses `history.pcie_tx_kbps` — RX value changes not reflected in graph.
+
+##### Fix Details (6 changes)
+
+**Fix 1: Sparkline data reverse iteration** (`dashboard.rs`)
+
+```rust
+// Before: oldest → newest order (data[0]=oldest → right edge)
+buf.extend(src.iter().map(|&v| v as u64));
+
+// After: newest → oldest order (data[0]=newest → right edge)
+buf.extend(src.iter().rev().map(|&v| v as u64));
+```
+
+Adding `.rev()` reverses data order:
+- `data[0]` = newest → right edge ✓
+- Only newest data within terminal width (~80) displayed ✓
+- When buffer partially full, data fills from right ✓
+
+**Fix 2: f32 rounding** (`dashboard.rs`)
+
+```rust
+// Before: truncation
+buf.extend(src.iter().rev().map(|&v| v as u64));
+// After: rounding
+buf.extend(src.iter().rev().map(|&v| v.round() as u64));
+```
+
+**Fix 3: PCIe title clarification** (`dashboard.rs`)
+
+```rust
+// Before: "PCIe TX:12.3 RX:56.7 MB/s" — suggests graph shows TX+RX
+// After: "PCIe TX:12.3 / RX:56.7 MB/s" + default title "PCIe TX"
+```
+
+**Fix 4: `GpuProcessInfo::name` → `Rc<str>`** (`metrics.rs`, `nvml.rs`)
+
+```rust
+// Before: String::clone() per tick (heap copy)
+pub name: String,
+fn process_name(&self, pid: u32) -> String { cache.get(&pid).clone() }
+
+// After: Rc<str> clone = refcount bump only (zero heap allocation)
+pub name: Rc<str>,
+fn process_name(&self, pid: u32) -> Rc<str> { cache.get(&pid).clone() }
+```
+
+**Fix 5: `throttle_reasons` → `Cow<'static, str>`** (`metrics.rs`, `nvml.rs`)
+
+```rust
+// Before: String allocation every tick (including frequent "None")
+pub throttle_reasons: Option<String>,
+fn format_throttle_reasons(tr) -> String { String::from("None") }
+
+// After: single-flag fast path → Cow::Borrowed (zero allocation)
+pub throttle_reasons: Option<Cow<'static, str>>,
+fn format_throttle_reasons(tr) -> Cow<'static, str> {
+    // "None", "Idle", "SwPwrCap", "HW-Slow", "SW-Therm", "HW-Therm" → Borrowed
+    // Only compound flags use Cow::Owned allocation
+}
+```
+
+**Fix 6: `unused import: Text` warning cleanup** (`dashboard.rs`)
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/ui/dashboard.rs` | Sparkline data `.rev()` reverse iteration, f32 rounding, PCIe title clarification, unused import cleanup |
+| `src/gpu/metrics.rs` | `GpuProcessInfo::name` → `Rc<str>`, `throttle_reasons` → `Cow<'static, str>` |
+| `src/gpu/nvml.rs` | `proc_name_cache` → `HashMap<u32, Rc<str>>`, `process_name()` → `Rc<str>` return, `format_throttle_reasons()` → `Cow<'static, str>` return + single-flag fast path |
+
+##### Cross-Verification Matrix
+
+| Scenario | Sparkline Display | Performance Impact | Verification |
+|----------|------------------|-------------------|-------------|
+| 300 history entries, 80-wide terminal | Newest 80 shown (newest → right) | No change | `.rev()` + `RightToLeft` |
+| 10 history entries, 80-wide terminal | 10 entries filled from right edge | No change | `RightToLeft` behavior preserved |
+| CPU 99.7% | Sparkline shows 100 | No change | `.round()` applied |
+| PCIe TX-only graph | Title shows "PCIe TX:" explicitly | No change | Ambiguity removed |
+| throttle "None" (90%+ frequency) | Same display | **String alloc eliminated** | `Cow::Borrowed` |
+| throttle "SwPwrCap, HW-Therm" | Same display | Same as before (Cow::Owned) | Compound flag fallback |
+| Process name cache hit | Same display | **String clone → Rc bump** | 5 per GPU × tick |
+| top_processes carry-forward | Same display | **Vec<GpuProcessInfo> clone cost reduced** | Rc<str> name copies cost 0 |
+
+##### v0.3.4 → v0.3.5 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.4: resource audit optimizations | proc_name_cache shrink + datetime cache | `nvml.rs`, `dashboard.rs` |
+| **v0.3.5: Sparkline direction fix** | **Critical bug: oldest data displayed as newest → fixed** | `dashboard.rs` all sparklines |
+| **v0.3.5: Process name Rc<str>** | **Eliminates per-tick String heap copy → refcount bump only** | `metrics.rs`, `nvml.rs` |
+| **v0.3.5: throttle Cow<'static, str>** | **Eliminates heap alloc for frequent single-flag values** | `metrics.rs`, `nvml.rs` |
+
+v0.3.4 provides "long-running resource reclaim optimization"; v0.3.5 provides "real-time display accuracy fix + per-tick repeated heap allocation elimination".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -1290,6 +1427,12 @@ Total RSS ~4-8 MB
 | datetime format cache | `dashboard.rs` | Per-tick `chrono::format().to_string()` → `thread_local!` cache, re-format only when second changes |
 | GPU history HashMap accurate pruning | `app.rs` | Removed `len > metrics.len()` condition → always prune on UUID mismatch + added `shrink_to()` (prevents orphans on MIG reconfig) |
 | proc_name_cache shrink threshold improvement | `nvml.rs` | `len.max(16) * 4` → `target * 2` threshold, more aggressive memory reclaim on mass PID death |
+| Sparkline data direction fix | `dashboard.rs` | `data[0]=oldest` displayed at right edge bug → `.rev()` converts to `data[0]=newest`, newest data correctly at right edge |
+| f32→u64 rounding | `dashboard.rs` | `v as u64` truncation (99.7→99) → `v.round() as u64` (99.7→100), CPU sparkline precision improvement |
+| `GpuProcessInfo::name` → `Rc<str>` | `metrics.rs`, `nvml.rs` | Per-tick `String::clone()` heap copy → `Rc::clone()` refcount bump only (5 processes × GPU × tick heap alloc eliminated) |
+| `throttle_reasons` → `Cow<'static, str>` | `metrics.rs`, `nvml.rs` | Per-tick `String` heap alloc → "None", "Idle" etc. single flags use `Cow::Borrowed` zero-alloc (covers 90%+ of real usage) |
+| `proc_name_cache` → `HashMap<u32, Rc<str>>` | `nvml.rs` | Cache hit `String::clone()` → `Rc::clone()` refcount bump only, process name sharing cost eliminated |
+| PCIe sparkline title clarification | `dashboard.rs` | Title "TX/RX" label mismatched graph content (TX only) → clarified to "PCIe TX:N / RX:N MB/s" |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
@@ -1338,7 +1481,8 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | GPM sample + device cache pruning | `nvml.rs` | Per-tick active handle tracking → frees stale `nvmlGpmSample_t` + removes `DeviceInfo`, no leaks across repeated MIG reconfigs |
 | NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > floor×4, prevents unnecessary shrink thrashing on fluctuations |
 | DeviceInfo cache (one-time) + `Rc<str>` | `nvml.rs` | Static info cached on first call, clone only bumps reference count (zero heap allocation) |
-| Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached, dead PIDs not in current top-5 auto-removed each tick, improved shrink threshold (`target*2`) for aggressive reclaim on mass PID death |
+| Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached (`HashMap<u32, Rc<str>>`), dead PIDs not in current top-5 auto-removed each tick, cache hit returns `Rc::clone()` only (zero heap alloc) |
+| `throttle_reasons` `Cow<'static, str>` | `nvml.rs` | "None", "Idle" etc. frequent single flags use `Cow::Borrowed` zero-alloc, only compound flags use `Cow::Owned` |
 | Top Processes carry-forward | `app.rs` | Retains previous tick's process list on NVML API intermittent failure, prevents process display flicker |
 | datetime format cache | `dashboard.rs` | `thread_local!` cache re-formats only when second changes (saves 1 String allocation/tick) |
 | device_cache defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |

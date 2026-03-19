@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, RenderDirection, Sparkline},
     Frame,
 };
@@ -21,11 +21,13 @@ thread_local! {
 }
 
 /// Convert VecDeque<u32> to &[u64] via thread-local scratch buffer, then call f.
+/// Data is reversed so that newest (back of VecDeque) becomes data[0],
+/// which ratatui's RightToLeft places at the right edge of the sparkline.
 fn with_spark_data_u32(src: &std::collections::VecDeque<u32>, f: impl FnOnce(&[u64])) {
     SPARK_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
         buf.clear();
-        buf.extend(src.iter().map(|&v| v as u64));
+        buf.extend(src.iter().rev().map(|&v| v as u64));
         f(&buf);
     });
 }
@@ -34,7 +36,7 @@ fn with_spark_data_f32(src: &std::collections::VecDeque<f32>, f: impl FnOnce(&[u
     SPARK_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
         buf.clear();
-        buf.extend(src.iter().map(|&v| v as u64));
+        buf.extend(src.iter().rev().map(|&v| v.round() as u64));
         f(&buf);
     });
 }
@@ -43,7 +45,7 @@ fn with_spark_data_u64(src: &std::collections::VecDeque<u64>, f: impl FnOnce(&[u
     SPARK_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
         buf.clear();
-        buf.extend(src.iter().copied());
+        buf.extend(src.iter().rev().copied());
         f(&buf);
     });
 }
@@ -578,7 +580,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(vec![
             Span::styled("Throttle: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(throttle.as_str(), throttle_style),
+            Span::styled(throttle.as_ref(), throttle_style),
         ]));
     }
 
@@ -706,16 +708,16 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(sparkline, rows[2]);
     });
 
-    // PCIe throughput sparkline (conditional)
+    // PCIe throughput sparkline (conditional — shows TX; title includes both TX/RX)
     if has_pcie {
         let pcie_title: Cow<str> = app
             .selected_metrics()
             .and_then(|m| {
                 let tx = m.pcie_tx_mbps()?;
                 let rx = m.pcie_rx_mbps()?;
-                Some(format!(" PCIe TX:{:.1} RX:{:.1} MB/s ", tx, rx))
+                Some(format!(" PCIe TX:{:.1} / RX:{:.1} MB/s ", tx, rx))
             })
-            .map_or(Cow::Borrowed(" PCIe Throughput "), |s| s.into());
+            .map_or(Cow::Borrowed(" PCIe TX "), |s| s.into());
         with_spark_data_u32(&history.pcie_tx_kbps, |data| {
             let sparkline = Sparkline::default()
                 .block(
