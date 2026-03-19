@@ -919,12 +919,18 @@ Total RSS ~4-8 MB
 | `ram_breakdown()` unified calc | `metrics.rs` | Duplicate RAM decomposition in `draw_ram_swap` + `draw_memory_legend` → single `SystemMetrics::ram_breakdown()` call |
 | `active_handles` Vec reuse | `nvml.rs` | Per-tick `Vec::with_capacity(N)` alloc/dealloc → `RefCell<Vec<usize>>` field reuse (zero alloc per tick) |
 | Sparkline title `Cow<str>` | `dashboard.rs` | Static strings ("N/A", fallback) `to_string()` allocation → `Cow::Borrowed` zero-alloc, `format!` only for dynamic values |
+| proc_name_cache HashSet pruning | `nvml.rs` | O(n·m) nested iteration (`retain` with `any` × `any`) → HashSet-based O(n+m) lookup (CPU savings on systems with many processes) |
+| `gpm_prev_samples` defensive shrink | `nvml.rs` | HashMap capacity could grow unbounded on repeated MIG reconfigs → auto-shrink when `capacity > len*4` (same pattern as `device_cache`) |
+| Top Processes header static `&str` | `dashboard.rs` | 3× `format!()` calls per frame for header → static `&str` Spans (eliminates 3 String allocations per frame) |
+| Top Processes column alignment fix | `dashboard.rs` | Header (hardcoded 8+22+4) vs data (`{:<7}`+`{:<15}`+`{:>10}`) width mismatch → unified format widths |
 | `truncate_str()` zero-alloc | `dashboard.rs` | `proc.name.chars().take(15).collect::<String>()` 5 allocs/frame → `&str` slicing (zero allocation) |
 | `Rc<str>` string sharing | `nvml.rs`, `metrics.rs`, `app.rs` | `DeviceInfo`/`GpuMetrics` name·uuid·compute_capability changed to `Rc<str>` → eliminates heap allocation on clone (reference count bump only) |
 | `ram_breakdown()` single call | `dashboard.rs` | Duplicate calculation in `draw_ram_bars` + `draw_memory_legend` → computed once in `draw_system_charts`, passed to both |
 | Process name caching | `nvml.rs` | Per-tick `/proc/{pid}/comm` I/O → `HashMap<u32, String>` cache + automatic dead PID cleanup each tick |
 | NVML buffer shrink threshold | `nvml.rs` | `capacity > needed*2` → `capacity > floor*4` threshold, prevents unnecessary shrink thrashing on minor fluctuations |
 | `device_cache` HashMap defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |
+| `gpm_prev_samples` defensive shrink | `nvml.rs` | Same shrink heuristic applied to GPM sample HashMap → auto-shrink when `capacity > len*4`, reclaims memory on repeated MIG reconfigs |
+| proc_name_cache HashSet-based pruning | `nvml.rs` | Per-tick dead PID pruning changed from O(n·m) nested iteration → `HashSet<u32>` O(n+m) lookup, consistent performance as process count grows |
 | Memory panel consolidated to right | `dashboard.rs` | Removed left Memory box → RAM/SWP bars integrated into right System Charts, expanding CPU core display area |
 
 ### Optimization Details: CPU (Minimize System Calls)

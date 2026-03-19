@@ -926,6 +926,10 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Memory 패널 우측 통합 | `dashboard.rs` | 좌측 Memory 박스 제거 → 우측 System Charts에 RAM/SWP 바 통합, CPU 코어 표시 영역 확장 |
 | `active_handles` Vec 재사용 | `nvml.rs` | 매 tick `Vec::with_capacity(N)` 할당/해제 → `RefCell<Vec<usize>>` 필드로 재사용 (tick당 할당 0) |
 | Sparkline 타이틀 `Cow<str>` | `dashboard.rs` | 정적 문자열("N/A", 폴백) `to_string()` 할당 → `Cow::Borrowed` 제로 할당, 동적 값만 `format!` |
+| proc_name_cache HashSet 정리 | `nvml.rs` | O(n·m) 중첩 순회(`retain` 내 `any` × `any`) → HashSet 기반 O(n+m) 조회 (프로세스 많은 시스템에서 CPU 절감) |
+| `gpm_prev_samples` 방어적 shrink | `nvml.rs` | MIG 재구성 반복 시 HashMap capacity 무한 증가 가능 → `capacity > len*4` 시 자동 축소 (`device_cache`와 동일 패턴) |
+| Top Processes 헤더 정적 `&str` | `dashboard.rs` | 매 프레임 `format!()` 3회 호출 → 정적 문자열 `&str` Span으로 변경 (프레임당 3회 String 할당 제거) |
+| Top Processes 컬럼 정렬 수정 | `dashboard.rs` | 헤더(하드코딩 8+22+4) ↔ 데이터({:<7}+{:<15}+{:>10}) 폭 불일치 → 동일 포맷 폭으로 통일 |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
@@ -976,6 +980,8 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | DeviceInfo 캐시 1회 수집 + `Rc<str>` | `nvml.rs` | 정적 정보(arch, CC 등)는 첫 호출 시 캐시, clone 시 포인터 카운트만 증가 (heap 할당 0) |
 | 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱, 매 tick 현재 top-5에 없는 PID 자동 제거 |
 | device_cache 방어적 shrink | `nvml.rs` | MIG 재설정 반복 시 HashMap capacity 무한 증가 방지 → `capacity > len*4` 시 자동 축소 |
+| `gpm_prev_samples` 방어적 shrink | `nvml.rs` | GPM 샘플 HashMap에도 동일한 shrink 휴리스틱 적용 → `capacity > len*4` 시 자동 축소, MIG 재구성 반복 시 메모리 회수 |
+| proc_name_cache HashSet 기반 정리 | `nvml.rs` | 매 tick dead PID 정리 시 O(n·m) 중첩 순회 → `HashSet<u32>` 기반 O(n+m) 조회로 변경, 프로세스 수 증가 시에도 일정 성능 |
 | sysinfo targeted refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 호출, 프로세스 누적 없음 |
 | `active_handles` 버퍼 재사용 | `nvml.rs` | 매 tick 새 Vec 할당 → `RefCell<Vec<usize>>` 재사용, 장기 실행 시 allocator 단편화 방지 |
 

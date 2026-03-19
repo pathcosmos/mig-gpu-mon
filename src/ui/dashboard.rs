@@ -1025,13 +1025,15 @@ fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::with_capacity(6);
 
-    // Header row
-    lines.push(Line::from(vec![Span::styled(
-        "PID     Process               VRAM",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
+    // Header row — padded to match data row format widths (7 + 15 + 10 = 32)
+    let hdr_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(vec![
+        Span::styled("PID    ", hdr_style),  // 7 chars, matches {:<7}
+        Span::styled("Process        ", hdr_style),  // 15 chars, matches {:<15}
+        Span::styled("      VRAM", hdr_style),  // 10 chars, matches {:>10}
+    ]));
 
     if m.top_processes.is_empty() {
         lines.push(Line::from(Span::styled(

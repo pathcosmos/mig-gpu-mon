@@ -13,7 +13,7 @@ use nvml_wrapper_sys::bindings::{
     nvmlSample_t, NvmlLib, NVML_GPM_METRICS_GET_VERSION, NVML_GPM_SUPPORT_VERSION,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::raw::c_uint;
 
@@ -198,14 +198,15 @@ impl NvmlCollector {
         drop(active_handles);
 
         // Prune process name cache — keep only PIDs seen this tick
+        // Use HashSet for O(n+m) instead of O(n·m) nested iteration
         {
             let mut name_cache = self.proc_name_cache.borrow_mut();
             if !name_cache.is_empty() {
-                name_cache.retain(|pid, _| {
-                    all_metrics
-                        .iter()
-                        .any(|m| m.top_processes.iter().any(|p| p.pid == *pid))
-                });
+                let active_pids: HashSet<u32> = all_metrics
+                    .iter()
+                    .flat_map(|m| m.top_processes.iter().map(|p| p.pid))
+                    .collect();
+                name_cache.retain(|pid, _| active_pids.contains(pid));
                 let target = name_cache.len() * 2;
                 if name_cache.capacity() > name_cache.len().max(16) * 4 {
                     name_cache.shrink_to(target);
@@ -789,7 +790,8 @@ impl NvmlCollector {
         }
 
         let raw_lib = &self.raw_lib;
-        self.gpm_prev_samples.borrow_mut().retain(|k, sample| {
+        let mut gpm = self.gpm_prev_samples.borrow_mut();
+        gpm.retain(|k, sample| {
             if active_handles.contains(k) {
                 true
             } else {
@@ -801,6 +803,11 @@ impl NvmlCollector {
                 false
             }
         });
+        // Defensive: shrink if hash table is far oversized vs actual entries
+        let gpm_target = gpm.len() * 2;
+        if gpm.capacity() > gpm.len().max(16) * 4 {
+            gpm.shrink_to(gpm_target);
+        }
     }
 }
 
