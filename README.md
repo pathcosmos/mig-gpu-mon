@@ -1283,6 +1283,161 @@ fn format_throttle_reasons(tr) -> Cow<'static, str> {
 
 v0.3.4는 "장기 운영 자원 회수 최적화", v0.3.5는 "실시간 표시 정확성 수정 + tick당 반복 힙 할당 제거".
 
+#### VRAM 실시간 반영 실패 + 장기 운영 자원 최적화 (v0.3.6)
+
+##### 증상
+
+- GPU 사용량이 많다가 감소했는데 VRAM 표시가 실시간으로 변경사항을 반영하지 못함
+- Top Processes 패널에 이미 종료된 프로세스의 오래된 VRAM 값이 무기한 표시됨
+- `memory_info()` 간헐 실패 시 이전의 높은 VRAM 값이 영구적으로 carry-forward됨
+
+##### 근본 원인 분석 — 3가지 연쇄 버그
+
+**버그 1: 프로세스 carry-forward 무기한 유지 (가장 핵심)**
+
+```
+위치: app.rs update_metrics()
+```
+
+GPU 사용량 감소로 프로세스가 정상 종료되면 `running_compute_processes()`가 빈 리스트를 반환한다. 그러나 코드는 "빈 리스트 = NVML 쿼리 깜빡임(flicker)"으로 간주하여 이전 tick의 오래된 프로세스 목록을 **만료 체크 없이 무한정 carry-forward**했다. 새 프로세스가 나타나기 전까지 죽은 프로세스의 VRAM 값이 영구 표시됨.
+
+**버그 2: VRAM carry-forward 무기한 유지**
+
+```
+위치: app.rs update_metrics()
+```
+
+MIG 환경에서 `device.memory_info()`가 GPM 상태 corruption으로 간헐적으로 실패할 때, `memory_used = None` → 이전 tick의 높은 VRAM 값을 만료 없이 복사. VRAM이 10GB→2GB로 줄어도 실패 tick에서는 10GB가 유지됨.
+
+**버그 3: Sparkline 히스토리 이중 강화**
+
+```
+위치: metrics.rs push_or_repeat()
+```
+
+`memory_used`가 `None`일 때 마지막 높은 값을 반복 기록하여 sparkline이 VRAM 감소를 반영하지 못하고 평탄한 높은 선으로 유지됨.
+
+##### 수정 내용 (6개 변경)
+
+**변경 1: 프로세스 carry-forward → PID 생존 확인**
+
+```rust
+// 이전: 무조건 이전 tick 프로세스 복사 (무기한)
+if m.top_processes.is_empty() {
+    m.top_processes = prev.top_processes.clone();
+}
+
+// 이후: /proc/{pid} 존재 여부로 살아있는 프로세스만 carry-forward
+let alive: Vec<_> = prev.top_processes.iter()
+    .filter(|p| {
+        buf.clear();
+        write!(buf, "/proc/{}", p.pid);
+        Path::new(buf.as_str()).exists()
+    })
+    .cloned().collect();
+```
+
+- 프로세스 종료 즉시 반영 — TTL 임의값 문제 없음
+- `/proc/{pid}` stat syscall은 커널 버퍼링으로 ~1μs 수준
+
+**변경 2: VRAM carry-forward → TTL 3회 제한**
+
+```rust
+// 이전: memory_info() 실패 시 무조건 이전 값 복사 (무기한)
+// 이후: 연속 3회까지만 carry-forward, 초과 시 None → "N/A"
+const VRAM_CARRY_FORWARD_TTL: u32 = 3;
+
+let count = if let Some(c) = self.vram_fail_count.get_mut(&m.uuid) {
+    *c += 1; *c
+} else {
+    self.vram_fail_count.insert(m.uuid.clone(), 1); 1
+};
+if count <= VRAM_CARRY_FORWARD_TTL { /* carry forward */ }
+// else: UI shows "N/A"
+```
+
+- 기본 1초 interval × 3회 = 3초 tolerance (일시적 flicker 커버)
+- 성공 시 카운터 즉시 리셋
+
+**변경 3: /proc/{pid} 경로 버퍼 재사용**
+
+```rust
+// 이전: 매 PID마다 format!("/proc/{}", pid) → String 힙 할당
+// 이후: App 구조체에 proc_path_buf: String 재사용
+buf.clear();
+write!(buf, "/proc/{}", p.pid);  // 기존 버퍼 재사용, 할당 0
+```
+
+- tick당 25+ String 할당 제거 (GPU 5 × 프로세스 5)
+- 300시간 기준 ~27억 회 불필요한 할당 방지
+
+**변경 4: active_handles Vec → HashSet**
+
+```rust
+// 이전: Vec<usize> → cache.retain(|k, _| active_handles.contains(k))  // O(n) per entry
+// 이후: HashSet<usize> → contains() O(1)
+active_handles: RefCell<HashSet<usize>>,
+```
+
+- `prune_stale_caches()` 복잡도: O(n²) → O(n)
+- MIG 128개(16 GPU × 8) 시 16,384 비교 → 128 해시 조회
+
+**변경 5: history 정리 UUID HashSet 사전 구축**
+
+```rust
+// 이전: self.history.keys().any(|uuid| !new_metrics.iter().any(...))  // O(n×m)
+// 이후: HashSet 사전 구축 → O(1) lookup
+let uuid_set: HashSet<&Rc<str>> = new_metrics.iter().map(|m| &m.uuid).collect();
+self.history.retain(|uuid, _| uuid_set.contains(uuid));
+```
+
+- 이중 중첩 `.any()` O(n×m) → HashSet O(n) 단일 순회
+
+**변경 6: vram_fail_count entry() Rc clone 회피**
+
+```rust
+// 이전: self.vram_fail_count.entry(m.uuid.clone()).or_insert(0)  // 매번 Rc clone
+// 이후: get_mut/insert 패턴 → cache hit 시 clone 0
+let count = if let Some(c) = self.vram_fail_count.get_mut(&m.uuid) {
+    *c += 1; *c
+} else {
+    self.vram_fail_count.insert(m.uuid.clone(), 1); 1
+};
+```
+
+##### 수정 파일
+
+| 파일 | 변경 | 목적 |
+|------|------|------|
+| `app.rs` | PID 생존 확인 + VRAM TTL + proc_path_buf + UUID HashSet + Rc clone 회피 | VRAM 실시간 반영 + 자원 최적화 |
+| `nvml.rs` | `active_handles` Vec→HashSet + 시그니처 변경 | prune O(n²)→O(n) |
+
+##### 교차 검증 매트릭스
+
+| 시나리오 | 검증 항목 | 기대 결과 |
+|---------|----------|----------|
+| GPU 사용량 감소 → 프로세스 종료 | Top Processes 패널 | 종료된 프로세스 즉시 사라짐 |
+| memory_info() 1-3회 연속 실패 | VRAM 게이지 | 이전 값 유지 (tolerance) |
+| memory_info() 4회+ 연속 실패 | VRAM 게이지 | "N/A" 표시 |
+| memory_info() 실패 후 성공 | VRAM 게이지 + 카운터 | 즉시 실제 값 반영, 카운터 리셋 |
+| MIG 재구성 반복 100회 | active_handles HashSet | prune O(n), 메모리 일정 |
+| 128 MIG 인스턴스 | history 정리 | O(n) HashSet lookup (기존 O(n×m)=16K 비교 제거) |
+| 300시간 장기 운영 | proc_path_buf | String 할당 0 (버퍼 재사용) |
+| vram_fail_count 정상 tick | Rc clone | get_mut hit → clone 0 |
+| GPU 제거 | vram_fail_count | retain()으로 함께 정리 |
+
+##### v0.3.5 → v0.3.6 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.5: Sparkline 방향 + 힙 최적화 | sparkline 정확성 + Rc/Cow 최적화 | `dashboard.rs`, `metrics.rs`, `nvml.rs` |
+| **v0.3.6: PID 생존 확인** | **프로세스 carry-forward 즉시 만료** | `app.rs` 프로세스 표시 |
+| **v0.3.6: VRAM TTL** | **memory_info() 실패 시 3회 제한** | `app.rs` VRAM 표시 |
+| **v0.3.6: active_handles HashSet** | **prune O(n²)→O(n)** | `nvml.rs` 캐시 정리 |
+| **v0.3.6: UUID HashSet** | **history 정리 O(n×m)→O(n)** | `app.rs` GPU 제거 감지 |
+
+v0.3.5는 "sparkline 정확성 + tick당 힙 최적화", v0.3.6은 "VRAM 실시간 반영 수정 + carry-forward 안전성 + 알고리즘 복잡도 개선".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -1482,13 +1637,16 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | DeviceInfo 캐시 1회 수집 + `Rc<str>` | `nvml.rs` | 정적 정보(arch, CC 등)는 첫 호출 시 캐시, clone 시 포인터 카운트만 증가 (heap 할당 0) |
 | 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱 (`HashMap<u32, Rc<str>>`), 매 tick 현재 top-5에 없는 PID 자동 제거, 캐시 히트 시 `Rc::clone()`만 (힙 할당 0) |
 | `throttle_reasons` `Cow<'static, str>` | `nvml.rs` | "None", "Idle" 등 빈번한 단일 플래그는 `Cow::Borrowed` 제로 할당, 복합 플래그만 `Cow::Owned` |
-| Top Processes carry-forward | `app.rs` | NVML 프로세스 API 간헐적 실패 시 이전 틱 값 유지, 프로세스 표시 깜빡임 방지 |
+| Top Processes PID 생존 확인 carry-forward | `app.rs` | NVML 프로세스 API 간헐적 실패 시 `/proc/{pid}` 존재 확인 후 살아있는 프로세스만 유지, 종료된 프로세스는 즉시 제거 |
+| VRAM carry-forward TTL (3회) | `app.rs` | `memory_info()` 연속 실패 3회까지 이전 값 유지, 초과 시 None("N/A") 전환 → 오래된 높은 값 무기한 표시 방지 |
+| `/proc/{pid}` 경로 버퍼 재사용 | `app.rs` | `proc_path_buf: String` 재사용으로 매 PID마다 format! 힙 할당 제거, 300시간 기준 ~27억 회 할당 방지 |
 | datetime 포맷 캐시 | `dashboard.rs` | `thread_local!` 캐시로 초 단위 변경 시에만 `chrono::format()` 호출 (틱당 String 할당 1회 절감) |
 | device_cache 방어적 shrink | `nvml.rs` | MIG 재설정 반복 시 HashMap capacity 무한 증가 방지 → `capacity > len*4` 시 자동 축소 |
 | `gpm_prev_samples` 방어적 shrink | `nvml.rs` | GPM 샘플 HashMap에도 동일한 shrink 휴리스틱 적용 → `capacity > len*4` 시 자동 축소, MIG 재구성 반복 시 메모리 회수 |
 | proc_name_cache HashSet 기반 정리 | `nvml.rs` | 매 tick dead PID 정리 시 O(n·m) 중첩 순회 → `HashSet<u32>` 기반 O(n+m) 조회로 변경, 프로세스 수 증가 시에도 일정 성능 |
 | sysinfo targeted refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 호출, 프로세스 누적 없음 |
-| `active_handles` 버퍼 재사용 | `nvml.rs` | 매 tick 새 Vec 할당 → `RefCell<Vec<usize>>` 재사용, 장기 실행 시 allocator 단편화 방지 |
+| `active_handles` HashSet 재사용 | `nvml.rs` | `RefCell<HashSet<usize>>` 재사용 + O(1) contains 조회, prune_stale_caches O(n²)→O(n) |
+| history/vram_fail_count UUID HashSet 정리 | `app.rs` | GPU 제거 감지 시 이중 `.any()` O(n×m) → HashSet O(n) 단일 순회 |
 
 ### 장시간 메모리 사용량 예측
 

@@ -55,8 +55,8 @@ pub struct NvmlCollector {
     /// Cache: pid → process name (Rc<str> for zero-cost sharing with GpuProcessInfo).
     /// Entries are pruned each tick to remove dead PIDs.
     proc_name_cache: RefCell<HashMap<u32, std::rc::Rc<str>>>,
-    /// Reusable buffer for tracking active device handles during collection (avoid alloc per tick)
-    active_handles: RefCell<Vec<usize>>,
+    /// Reusable set for tracking active device handles during collection (O(1) lookup in prune)
+    active_handles: RefCell<HashSet<usize>>,
 }
 
 impl NvmlCollector {
@@ -137,7 +137,7 @@ impl NvmlCollector {
             sample_buf: RefCell::new(Vec::with_capacity(128)),
             gpm_prev_samples: RefCell::new(HashMap::new()),
             proc_name_cache: RefCell::new(HashMap::new()),
-            active_handles: RefCell::new(Vec::with_capacity(32)),
+            active_handles: RefCell::new(HashSet::with_capacity(32)),
         })
     }
 
@@ -178,10 +178,10 @@ impl NvmlCollector {
 
         for i in 0..device_count {
             let device = self.nvml.device_by_index(i)?;
-            active_handles.push(unsafe { device.handle() } as usize);
+            active_handles.insert(unsafe { device.handle() } as usize);
 
             if self.is_mig_enabled(&device) {
-                if let Ok(mig_metrics) = self.collect_mig_instances(&device, i, &mut *active_handles)
+                if let Ok(mig_metrics) = self.collect_mig_instances(&device, i, &mut active_handles)
                 {
                     all_metrics.extend(mig_metrics);
                 }
@@ -233,7 +233,7 @@ impl NvmlCollector {
         &self,
         parent_device: &Device,
         gpu_index: u32,
-        active_handles: &mut Vec<usize>,
+        active_handles: &mut HashSet<usize>,
     ) -> Result<Vec<GpuMetrics>> {
         let mut mig_metrics = Vec::new();
 
@@ -272,7 +272,7 @@ impl NvmlCollector {
                 if ret != 0 || mig_handle.is_null() {
                     continue;
                 }
-                active_handles.push(mig_handle as usize);
+                active_handles.insert(mig_handle as usize);
 
                 let mig_device = Device::new(mig_handle, &self.nvml);
 
@@ -881,7 +881,7 @@ impl NvmlCollector {
 
     /// Remove cache entries for device handles that were not seen during this tick.
     /// Prevents unbounded growth of device_cache / gpm_prev_samples on MIG reconfig or GPU hot-remove.
-    fn prune_stale_caches(&self, active_handles: &[usize]) {
+    fn prune_stale_caches(&self, active_handles: &HashSet<usize>) {
         let mut cache = self.device_cache.borrow_mut();
         cache.retain(|k, _| active_handles.contains(k));
         // Defensive: shrink if hash table is far oversized vs actual entries
