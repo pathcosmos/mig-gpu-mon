@@ -36,6 +36,8 @@ struct DeviceInfo {
     gpm_supported: bool,
     /// MIG GPU instance ID (for GPM MIG sampling via parent device)
     gpu_instance_id: Option<u32>,
+    /// Pre-formatted MIG display name (cached to avoid per-tick Rc<str> allocation)
+    mig_display_name: Option<std::rc::Rc<str>>,
 }
 
 pub struct NvmlCollector {
@@ -57,6 +59,8 @@ pub struct NvmlCollector {
     proc_name_cache: RefCell<HashMap<u32, std::rc::Rc<str>>>,
     /// Reusable set for tracking active device handles during collection (O(1) lookup in prune)
     active_handles: RefCell<HashSet<usize>>,
+    /// Reusable set for PID deduplication during process collection (avoids per-tick alloc)
+    proc_seen_pids: RefCell<HashSet<u32>>,
 }
 
 impl NvmlCollector {
@@ -138,6 +142,7 @@ impl NvmlCollector {
             gpm_prev_samples: RefCell::new(HashMap::new()),
             proc_name_cache: RefCell::new(HashMap::new()),
             active_handles: RefCell::new(HashSet::with_capacity(32)),
+            proc_seen_pids: RefCell::new(HashSet::with_capacity(16)),
         })
     }
 
@@ -256,14 +261,12 @@ impl NvmlCollector {
             // MaxMigDeviceCount = total number of GPU instance slices (e.g. 7 for H100)
             let total_slices = max_count;
 
-            // GPM support must be checked on the parent device (not MIG handles)
-            let parent_info = self.get_device_info(parent_device, false);
-            let parent_gpm_supported = parent_info.gpm_supported;
-
-            // === Phase 1: Collect base metrics (VRAM, utilization) for all MIG instances ===
-            // All VRAM queries happen here, BEFORE any GPM calls that could corrupt NVML state.
-            // Also collect MIG handles for phase 2.
-            let mut phase1: Vec<(nvmlDevice_t, GpuMetrics)> = Vec::new();
+            // === Collect base metrics (VRAM, utilization) for all MIG instances ===
+            // GPM (nvmlGpmMigSampleGet) is intentionally NOT used on MIG instances:
+            // it corrupts NVML driver state across ticks, causing memory_info() to fail
+            // permanently — resulting in VRAM showing "N/A" after carry-forward TTL expires.
+            // memory_util falls back to process utilization (Fallback 1) when available.
+            let mut phase1: Vec<(nvmlDevice_t, GpuMetrics)> = Vec::with_capacity(max_count as usize);
 
             for mig_idx in 0..max_count {
                 let mut mig_handle: nvmlDevice_t = std::ptr::null_mut();
@@ -307,34 +310,34 @@ impl NvmlCollector {
                         }
                     }
 
-                    metrics.name =
-                        format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name).into();
+                    // Cache MIG display name to avoid per-tick Rc<str> allocation
+                    let mig_key = mig_handle as usize;
+                    let cached_name = {
+                        let cache = self.device_cache.borrow();
+                        cache.get(&mig_key).and_then(|info| info.mig_display_name.clone())
+                    };
+                    metrics.name = match cached_name {
+                        Some(name) => name,
+                        None => {
+                            let formatted: std::rc::Rc<str> =
+                                format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name).into();
+                            if let Some(info) = self.device_cache.borrow_mut().get_mut(&mig_key) {
+                                info.mig_display_name = Some(formatted.clone());
+                            }
+                            formatted
+                        }
+                    };
                     phase1.push((mig_handle, metrics));
                 }
             }
 
-            // === Phase 2: GPM fallbacks (after all VRAM queries are done) ===
-            // GPM calls (nvmlGpmMigSampleGet) may corrupt NVML state, but all VRAM
-            // has already been collected in phase 1, so corruption won't affect it.
-            for (mig_handle, metrics) in &mut phase1 {
-                if metrics.memory_util.is_none() && parent_gpm_supported {
-                    let mig_device = Device::new(*mig_handle, &self.nvml);
-                    let mig_info = self.get_device_info(&mig_device, true);
-                    metrics.memory_util = self.get_dram_bw_util_gpm(
-                        *mig_handle,
-                        true,
-                        mig_info.gpu_instance_id,
-                        Some(parent_handle),
-                    );
-                }
-            }
-
-            // === Phase 3: Process fallback from parent device ===
+            // === Phase 2: Process fallback from parent device ===
             // MIG device handles often fail running_compute_processes() / running_graphics_processes()
             // on drivers like 535.x. Query the parent device instead and filter by gpu_instance_id.
             {
-                let mut parent_procs: Vec<(u32, Option<u64>, Option<u32>)> = Vec::new();
-                let mut seen_pids = HashSet::new();
+                let mut parent_procs: Vec<(u32, Option<u64>, Option<u32>)> = Vec::with_capacity(16);
+                let mut seen_pids = self.proc_seen_pids.borrow_mut();
+                seen_pids.clear();
 
                 if let Ok(procs) = parent_device.running_compute_processes() {
                     for p in &procs {
@@ -358,6 +361,9 @@ impl NvmlCollector {
                         }
                     }
                 }
+
+                // Release PID dedup set — no longer needed after parent process collection
+                drop(seen_pids);
 
                 // Check if any parent process has a gpu_instance_id set
                 let any_gi_available = parent_procs.iter().any(|(_, _, gi)| gi.is_some());
@@ -679,6 +685,7 @@ impl NvmlCollector {
                     None
                 }
             },
+            mig_display_name: None,
         };
 
         self.device_cache.borrow_mut().insert(key, info.clone());
@@ -750,8 +757,9 @@ impl NvmlCollector {
 
         // Collect both compute and graphics processes, dedup by PID
         let (process_count, top_processes) = {
-            let mut seen_pids = HashSet::new();
-            let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+            let mut seen_pids = self.proc_seen_pids.borrow_mut();
+            seen_pids.clear();
+            let mut entries: Vec<(u32, Option<u64>)> = Vec::with_capacity(16);
 
             // Compute processes (primary — PyTorch, CUDA workloads)
             if let Ok(procs) = device.running_compute_processes() {

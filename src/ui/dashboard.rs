@@ -17,7 +17,9 @@ thread_local! {
     static SPARK_BUF: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::with_capacity(300));
     static CORE_SORT_BUF: std::cell::RefCell<Vec<(usize, f32)>> = std::cell::RefCell::new(Vec::with_capacity(128));
     // Cache datetime string — only re-format when second changes
-    static TIME_CACHE: std::cell::RefCell<(i64, String)> = std::cell::RefCell::new((0, String::new()));
+    static TIME_CACHE: std::cell::RefCell<(i64, String)> = const { std::cell::RefCell::new((0, String::new())) };
+    /// Pre-built bar strings keyed by bar_width — zero-alloc after first draw for CPU core bars
+    static BAR_TABLE: std::cell::RefCell<(usize, Vec<String>)> = const { std::cell::RefCell::new((0, Vec::new())) };
 }
 
 /// Convert VecDeque<u32> to &[u64] via thread-local scratch buffer, then call f.
@@ -67,25 +69,26 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, _app: &App, area: Rect) {
     let now_dt = chrono::Local::now();
-    let now = TIME_CACHE.with(|cache| {
+    TIME_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         let ts = now_dt.timestamp();
         if c.0 != ts {
             c.0 = ts;
-            c.1 = now_dt.format("%Y-%m-%d %I:%M:%S %p").to_string();
+            c.1.clear();
+            use std::fmt::Write;
+            let _ = write!(c.1, " {} ", now_dt.format("%Y-%m-%d %I:%M:%S %p"));
         }
-        c.1.clone()
+        let header = Paragraph::new(" pathcosmos@gmail.com")
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(Color::Cyan))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" mig-gpu-mon ")
+                    .title(Line::from(c.1.as_str()).alignment(Alignment::Right)),
+            );
+        f.render_widget(header, area);
     });
-    let header = Paragraph::new(" pathcosmos@gmail.com")
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(Color::Cyan))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" mig-gpu-mon ")
-                .title(Line::from(format!(" {} ", now)).alignment(Alignment::Right)),
-        );
-    f.render_widget(header, area);
 }
 
 fn draw_main(f: &mut Frame, app: &App, area: Rect) {
@@ -151,41 +154,66 @@ fn draw_cpu_cores(f: &mut Frame, app: &App, area: Rect) {
         let visible_count = sorted_cores.len().min(max_visible);
 
         let rows_needed = visible_count.div_ceil(num_cols);
-        let mut lines: Vec<Line> = Vec::with_capacity(rows_needed);
 
-        for row in 0..rows_needed {
-            let mut spans = Vec::with_capacity(num_cols * 4);
-
-            for col in 0..num_cols {
-                let idx = col * rows_needed + row;
-                if idx >= visible_count {
-                    break;
+        // Use pre-built bar lookup table — zero-alloc after first draw or resize.
+        // Only rebuilds when terminal width changes (bar_width differs).
+        BAR_TABLE.with(|bt| {
+            let mut bt = bt.borrow_mut();
+            if bt.0 != bar_width {
+                bt.0 = bar_width;
+                bt.1.clear();
+                for filled in 0..=bar_width {
+                    let empty = bar_width - filled;
+                    let mut s = String::with_capacity(1 + (filled + empty) * 3);
+                    s.push(' ');
+                    for _ in 0..filled {
+                        s.push('▮');
+                    }
+                    for _ in 0..empty {
+                        s.push('▯');
+                    }
+                    bt.1.push(s);
                 }
-                let (core_idx, usage) = sorted_cores[idx];
-                let color = cpu_color(usage);
-
-                if col > 0 {
-                    spans.push(Span::raw(" "));
-                }
-                spans.push(Span::styled(
-                    format!("{:>3}", core_idx),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                spans.push(Span::styled(
-                    make_bar(usage, bar_width),
-                    Style::default().fg(color),
-                ));
-                spans.push(Span::styled(
-                    format!("{:>4.0}%", usage),
-                    Style::default().fg(color),
-                ));
             }
 
-            lines.push(Line::from(spans));
-        }
+            let mut lines: Vec<Line> = Vec::with_capacity(rows_needed);
 
-        let para = Paragraph::new(lines);
-        f.render_widget(para, inner);
+            for row in 0..rows_needed {
+                let mut spans = Vec::with_capacity(num_cols * 4);
+
+                for col in 0..num_cols {
+                    let idx = col * rows_needed + row;
+                    if idx >= visible_count {
+                        break;
+                    }
+                    let (core_idx, usage) = sorted_cores[idx];
+                    let color = cpu_color(usage);
+
+                    if col > 0 {
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.push(Span::styled(
+                        format!("{:>3}", core_idx),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    let filled = ((usage / 100.0) * bar_width as f32).round() as usize;
+                    let filled = filled.min(bar_width);
+                    spans.push(Span::styled(
+                        bt.1[filled].as_str(),
+                        Style::default().fg(color),
+                    ));
+                    spans.push(Span::styled(
+                        format!("{:>4.0}%", usage),
+                        Style::default().fg(color),
+                    ));
+                }
+
+                lines.push(Line::from(spans));
+            }
+
+            let para = Paragraph::new(lines);
+            f.render_widget(para, inner);
+        });
     });
 }
 

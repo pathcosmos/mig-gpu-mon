@@ -1438,6 +1438,142 @@ let count = if let Some(c) = self.vram_fail_count.get_mut(&m.uuid) {
 
 v0.3.5는 "sparkline 정확성 + tick당 힙 최적화", v0.3.6은 "VRAM 실시간 반영 수정 + carry-forward 안전성 + 알고리즘 복잡도 개선".
 
+#### VRAM N/A 전환 + 장기 운영 메모리 최적화 (v0.3.8)
+
+##### 증상
+
+- VRAM이 처음에는 정상 표시되다가 수 초 후 **"N/A"로 영구 전환**됨
+- MIG 환경에서 GPM(Hopper+) 사용 시에만 발생
+- 128코어 시스템에서 CPU 코어 바 렌더링 시 tick당 ~384회 String 할당
+
+##### 근본 원인 분석 — 2가지 문제
+
+**문제 1: GPM cross-tick NVML 상태 오염 (핵심)**
+
+```
+위치: nvml.rs collect_mig_instances() Phase 2
+```
+
+`nvmlGpmMigSampleGet()` 호출이 NVML 드라이버 내부 상태를 오염시키며, 이 오염이 **다음 tick까지 지속**되어 `memory_info()` 호출이 영구 실패한다.
+
+```
+Tick 1: Phase 1 memory_info() 성공 → Phase 2 GPM 호출 → 드라이버 상태 오염
+Tick 2: Phase 1 memory_info() 실패 (이전 tick 오염) → carry-forward 시작
+Tick 4: VRAM_CARRY_FORWARD_TTL(3) 초과 → memory_used = None → "N/A" 고정
+```
+
+2-phase 설계는 **같은 tick 내**에서는 VRAM을 보호하지만, **이전 tick Phase 2의 오염이 다음 tick Phase 1에 영향**을 주는 cross-tick 문제는 방어하지 못했다.
+
+**문제 2: 장기 운영 시 불필요한 per-tick 할당**
+
+| 항목 | 할당 패턴 | 영향 |
+|------|----------|------|
+| MIG display name | 매 tick `format!().into()` → 새 `Rc<str>` | MIG 인스턴스 수 × tick |
+| `phase1` Vec | `Vec::new()` → 매 tick realloc | MIG 수집 시 |
+| `seen_pids` HashSet | `HashSet::new()` → 매 tick per-device alloc | 디바이스 수 × tick |
+| CPU 바 문자열 | `make_bar()` → 코어 수 × `String` 할당 | 128코어 = 128 alloc/draw |
+| 시간 문자열 | `TIME_CACHE.clone()` + `format!()` | 2 alloc/draw |
+
+##### 수정 내용 (8개 변경)
+
+**변경 1: GPM MIG Phase 2 완전 제거** (`nvml.rs`)
+
+```rust
+// 제거: Phase 2 GPM fallback 블록 전체
+// nvmlGpmMigSampleGet() 호출 → NVML 상태 오염 원천 차단
+// memory_util은 Fallback 1(process utilization)에서 수집 가능한 경우만 표시
+```
+
+GPM으로 얻는 `memory_util`(DRAM BW) 하나 때문에 핵심 메트릭인 VRAM을 잃는 트레이드오프가 맞지 않으므로, MIG 환경에서 GPM Phase 2를 완전 스킵.
+
+**변경 2: MIG display name 캐싱** (`nvml.rs`)
+
+```rust
+// Before: 매 tick 새 Rc<str> 생성
+metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name).into();
+// After: DeviceInfo.mig_display_name 캐시, Rc::clone()만
+let cached = device_cache.get(&key).and_then(|i| i.mig_display_name.clone());
+metrics.name = cached.unwrap_or_else(|| { /* format + cache + return */ });
+```
+
+**변경 3: `phase1` Vec 사전 할당** (`nvml.rs`)
+
+```rust
+// Before: Vec::new() → push마다 realloc 가능
+// After: Vec::with_capacity(max_count) → 1회 할당
+```
+
+**변경 4: PID dedup HashSet 재사용** (`nvml.rs`)
+
+```rust
+// Before: 매 tick per-device HashSet::new()
+// After: NvmlCollector.proc_seen_pids: RefCell<HashSet<u32>> 재사용
+//        + parent_procs/entries Vec::with_capacity(16)
+```
+
+**변경 5: 시간 문자열 zero-alloc 렌더링** (`dashboard.rs`)
+
+```rust
+// Before: TIME_CACHE에서 c.1.clone() + format!(" {} ", now) → 2 alloc/draw
+// After: 렌더링을 TIME_CACHE.with 클로저 내부로 이동
+//        + write!(c.1, ...) 버퍼 재사용 + c.1.as_str() 참조 → 0 alloc/draw
+```
+
+**변경 6: CPU 바 룩업 테이블** (`dashboard.rs`)
+
+```rust
+// Before: make_bar(usage, bar_width) → 코어당 String 할당 (128코어 = 128 alloc)
+// After: BAR_TABLE thread_local! 룩업 테이블
+//        bar_width+1개 패턴 사전 빌드, bt.1[filled].as_str() 참조
+//        터미널 리사이즈 시에만 재빌드 → 0 alloc/draw (첫 draw 이후)
+```
+
+**변경 7: thread_local const 초기화** (`dashboard.rs`)
+
+```rust
+// clippy 권장: thread_local! 초기화자에 const 사용
+static TIME_CACHE: ... = const { RefCell::new(...) };
+static BAR_TABLE: ... = const { RefCell::new(...) };
+```
+
+**변경 8: entries/parent_procs 사전 할당** (`nvml.rs`)
+
+```rust
+// Before: Vec::new() → 첫 push 시 alloc
+// After: Vec::with_capacity(16) → process count에 맞는 초기 할당
+```
+
+##### 수정 파일
+
+| 파일 | 변경 | 관련 변경 |
+|------|------|----------|
+| `src/gpu/nvml.rs` | GPM Phase 2 제거 + MIG name 캐싱 + Vec/HashSet 재사용 | 변경 1, 2, 3, 4, 8 |
+| `src/ui/dashboard.rs` | 시간 문자열 zero-alloc + BAR_TABLE 룩업 + const 초기화 | 변경 5, 6, 7 |
+
+##### 교차 검증 매트릭스
+
+| 검증 항목 | 방법 | 기대 결과 |
+|----------|------|----------|
+| VRAM N/A 전환 | MIG + Hopper 환경에서 장시간 실행 | VRAM 값 유지, N/A 전환 없음 |
+| memory_util 표시 | Fallback 1(process util) 가용 시 | 정상 표시 (불가 시 N/A) |
+| MIG name 캐싱 | 2+ tick 실행 후 DeviceInfo 캐시 확인 | 첫 tick만 format, 이후 Rc::clone |
+| CPU 바 할당 | 128코어 시스템 draw | 첫 draw 후 bar String 할당 0 |
+| 시간 문자열 | draw_header per-frame | clone/format 할당 없음 |
+| cargo clippy | 경고 확인 | 신규 경고 없음 |
+
+##### v0.3.6 → v0.3.8 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.6: VRAM TTL (3회) | memory_info() 실패 시 carry-forward 제한 | `app.rs` VRAM 표시 |
+| **v0.3.8: GPM MIG 비활성화** | **cross-tick NVML 상태 오염 원천 차단** | `nvml.rs` MIG 수집 |
+| **v0.3.8: MIG name 캐싱** | **per-tick Rc<str> 할당 제거** | `nvml.rs` DeviceInfo 캐시 |
+| **v0.3.8: PID dedup 재사용** | **per-tick HashSet 할당 제거** | `nvml.rs` 프로세스 수집 |
+| **v0.3.8: BAR_TABLE 룩업** | **per-draw 128+ String 할당 제거** | `dashboard.rs` CPU 코어 바 |
+| **v0.3.8: 시간 문자열 zero-alloc** | **per-draw 2 String 할당 제거** | `dashboard.rs` 헤더 |
+
+v0.3.6은 "VRAM TTL로 정체 방지", v0.3.8은 "GPM 오염 원천 차단 + 장기 운영 per-tick 할당 최소화".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -1590,6 +1726,13 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복 → `none_counts[9]` 배열로 메트릭별 3틱 TTL 적용, 초과 시 push 중단 (스파크라인 정체 방지) |
 | `get_process_utilization` Option 반환 | `nvml.rs` | API 실패 시 `(0, 0)` 반환 → `Option<(u32, u32)>` 반환, idle 0%와 실패를 구분하여 잘못된 폴백 스케일링 방지 |
 | `collect_all()` 디바이스별 에러 격리 | `nvml.rs` | `device_by_index(i)?`로 1개 GPU 에러 시 전체 수집 실패 → `match ... continue`로 해당 GPU만 건너뛰기 |
+| GPM MIG Phase 2 제거 | `nvml.rs` | MIG에서 `nvmlGpmMigSampleGet()` 호출 → 완전 제거, cross-tick NVML 상태 오염으로 인한 VRAM N/A 방지 |
+| MIG display name 캐싱 | `nvml.rs` | 매 tick `format!().into()` 새 `Rc<str>` → `DeviceInfo.mig_display_name` 캐시, `Rc::clone()` 재사용 |
+| PID dedup HashSet 재사용 | `nvml.rs` | 매 tick `HashSet::new()` per-device → `proc_seen_pids: RefCell<HashSet<u32>>` 재사용 (tick당 할당 0) |
+| `make_bar()` 룩업 테이블 | `dashboard.rs` | 코어당 `String` 할당 → `BAR_TABLE` thread-local 룩업, `&str` 참조만 (128코어: 128 alloc → 0/draw) |
+| 시간 문자열 zero-alloc | `dashboard.rs` | `clone()` + `format!()` 2 alloc/draw → `write!` 버퍼 재사용 + `as_str()` 참조 (0 alloc/draw) |
+| `phase1` Vec 사전 할당 | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(max_count)`, MIG 수집 시 realloc 제거 |
+| entries/parent_procs 사전 할당 | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(16)`, 프로세스 수집 시 첫 push 시 alloc 제거 |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
@@ -1653,6 +1796,10 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복으로 스파크라인 정체 → `none_counts[9]` 배열로 메트릭별 3틱 제한, 초과 시 push 중단 |
 | `get_process_utilization` 실패/idle 구분 | `nvml.rs` | API 실패 `(0, 0)` = idle 0% 구분 불가 → `Option<(u32, u32)>` 반환, idle 0%는 정상 보고·실패는 다음 폴백 진행 |
 | `collect_all()` 디바이스별 에러 격리 | `nvml.rs` | 1개 GPU `device_by_index` 에러 시 전체 메트릭 수집 중단 → 해당 GPU만 skip, 나머지 GPU 정상 수집 유지 |
+| GPM MIG Phase 2 제거 | `nvml.rs` | `nvmlGpmMigSampleGet()` cross-tick 오염으로 인한 `memory_info()` 영구 실패 방지, VRAM 안정성 확보 |
+| MIG display name 캐싱 | `nvml.rs` | MIG 이름 `Rc<str>` 첫 tick만 생성, 이후 `Rc::clone()` 포인터 카운트만 (MIG 인스턴스당 tick 힙 할당 제거) |
+| PID dedup HashSet 재사용 | `nvml.rs` | `RefCell<HashSet<u32>>` 필드 재사용, 첫 tick 이후 할당 0 (clear만) |
+| BAR_TABLE 룩업 테이블 | `dashboard.rs` | `thread_local!` bar 문자열 테이블, 터미널 리사이즈 시에만 재빌드, 128코어에서도 draw당 bar 할당 0 |
 
 ### 장시간 메모리 사용량 예측
 

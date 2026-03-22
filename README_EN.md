@@ -1437,6 +1437,142 @@ let count = if let Some(c) = self.vram_fail_count.get_mut(&m.uuid) {
 
 v0.3.5 provides "sparkline accuracy + per-tick heap optimization"; v0.3.6 provides "VRAM real-time update fix + carry-forward safety + algorithmic complexity improvement".
 
+#### VRAM N/A Transition + Long-Running Memory Optimization (v0.3.8)
+
+##### Symptoms
+
+- VRAM displays normally at first, then **permanently switches to "N/A"** after a few seconds
+- Only occurs in MIG environments with GPM (Hopper+)
+- 128-core systems generate ~384 String allocations per tick for CPU core bar rendering
+
+##### Root Cause Analysis — 2 Issues
+
+**Issue 1: GPM Cross-Tick NVML State Corruption (Critical)**
+
+```
+Location: nvml.rs collect_mig_instances() Phase 2
+```
+
+`nvmlGpmMigSampleGet()` calls corrupt NVML driver internal state, and this corruption **persists across ticks**, causing `memory_info()` to fail permanently.
+
+```
+Tick 1: Phase 1 memory_info() succeeds → Phase 2 GPM call → driver state corrupted
+Tick 2: Phase 1 memory_info() fails (previous tick corruption) → carry-forward starts
+Tick 4: VRAM_CARRY_FORWARD_TTL(3) exceeded → memory_used = None → "N/A" locked
+```
+
+The 2-phase design protects VRAM **within the same tick**, but does not defend against the cross-tick problem where **previous tick's Phase 2 corruption affects next tick's Phase 1**.
+
+**Issue 2: Unnecessary Per-Tick Allocations in Long-Running Operation**
+
+| Item | Allocation Pattern | Impact |
+|------|-------------------|--------|
+| MIG display name | `format!().into()` → new `Rc<str>` per tick | MIG instances × tick |
+| `phase1` Vec | `Vec::new()` → realloc per tick | During MIG collection |
+| `seen_pids` HashSet | `HashSet::new()` → per-device alloc per tick | Devices × tick |
+| CPU bar strings | `make_bar()` → cores × `String` alloc | 128 cores = 128 alloc/draw |
+| Time string | `TIME_CACHE.clone()` + `format!()` | 2 alloc/draw |
+
+##### Fix Details (8 changes)
+
+**Change 1: Complete GPM MIG Phase 2 Removal** (`nvml.rs`)
+
+```rust
+// Removed: Entire Phase 2 GPM fallback block
+// nvmlGpmMigSampleGet() calls eliminated → NVML state corruption prevented at source
+// memory_util shown only when available via Fallback 1 (process utilization)
+```
+
+Losing a single `memory_util` (DRAM BW) metric does not justify losing the critical VRAM metric, so GPM Phase 2 is completely skipped in MIG environments.
+
+**Change 2: MIG Display Name Caching** (`nvml.rs`)
+
+```rust
+// Before: new Rc<str> every tick
+metrics.name = format!("MIG {mig_idx} (GPU {gpu_index}: {})", metrics.name).into();
+// After: cached in DeviceInfo.mig_display_name, Rc::clone() only
+let cached = device_cache.get(&key).and_then(|i| i.mig_display_name.clone());
+metrics.name = cached.unwrap_or_else(|| { /* format + cache + return */ });
+```
+
+**Change 3: `phase1` Vec Pre-allocation** (`nvml.rs`)
+
+```rust
+// Before: Vec::new() → possible realloc on each push
+// After: Vec::with_capacity(max_count) → single allocation
+```
+
+**Change 4: PID Dedup HashSet Reuse** (`nvml.rs`)
+
+```rust
+// Before: HashSet::new() per device per tick
+// After: NvmlCollector.proc_seen_pids: RefCell<HashSet<u32>> reused
+//        + parent_procs/entries Vec::with_capacity(16)
+```
+
+**Change 5: Time String Zero-Alloc Rendering** (`dashboard.rs`)
+
+```rust
+// Before: c.1.clone() from TIME_CACHE + format!(" {} ", now) → 2 alloc/draw
+// After: rendering moved inside TIME_CACHE.with closure
+//        + write!(c.1, ...) buffer reuse + c.1.as_str() reference → 0 alloc/draw
+```
+
+**Change 6: CPU Bar Lookup Table** (`dashboard.rs`)
+
+```rust
+// Before: make_bar(usage, bar_width) → String alloc per core (128 cores = 128 alloc)
+// After: BAR_TABLE thread_local! lookup table
+//        bar_width+1 patterns pre-built, bt.1[filled].as_str() reference
+//        rebuilds only on terminal resize → 0 alloc/draw (after first draw)
+```
+
+**Change 7: thread_local const Initialization** (`dashboard.rs`)
+
+```rust
+// clippy recommendation: use const for thread_local! initializers
+static TIME_CACHE: ... = const { RefCell::new(...) };
+static BAR_TABLE: ... = const { RefCell::new(...) };
+```
+
+**Change 8: entries/parent_procs Pre-allocation** (`nvml.rs`)
+
+```rust
+// Before: Vec::new() → alloc on first push
+// After: Vec::with_capacity(16) → initial allocation matching expected process count
+```
+
+##### Modified Files
+
+| File | Changes | Related |
+|------|---------|---------|
+| `src/gpu/nvml.rs` | GPM Phase 2 removal + MIG name caching + Vec/HashSet reuse | Changes 1, 2, 3, 4, 8 |
+| `src/ui/dashboard.rs` | Time string zero-alloc + BAR_TABLE lookup + const init | Changes 5, 6, 7 |
+
+##### Cross-Verification Matrix
+
+| Verification Item | Method | Expected Result |
+|-------------------|--------|-----------------|
+| VRAM N/A transition | Long-running on MIG + Hopper | VRAM values maintained, no N/A transition |
+| memory_util display | When Fallback 1 (process util) available | Normal display (N/A when unavailable) |
+| MIG name caching | Run 2+ ticks, check DeviceInfo cache | Format only on first tick, Rc::clone thereafter |
+| CPU bar allocation | 128-core system draw | Zero bar String allocations after first draw |
+| Time string | draw_header per-frame | No clone/format allocations |
+| cargo clippy | Check warnings | No new warnings |
+
+##### v0.3.6 → v0.3.8 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.6: VRAM TTL (3 attempts) | carry-forward limit on memory_info() failure | `app.rs` VRAM display |
+| **v0.3.8: GPM MIG disabled** | **cross-tick NVML state corruption prevented at source** | `nvml.rs` MIG collection |
+| **v0.3.8: MIG name caching** | **per-tick Rc<str> allocation eliminated** | `nvml.rs` DeviceInfo cache |
+| **v0.3.8: PID dedup reuse** | **per-tick HashSet allocation eliminated** | `nvml.rs` process collection |
+| **v0.3.8: BAR_TABLE lookup** | **per-draw 128+ String allocations eliminated** | `dashboard.rs` CPU core bars |
+| **v0.3.8: time string zero-alloc** | **per-draw 2 String allocations eliminated** | `dashboard.rs` header |
+
+v0.3.6 provides "VRAM TTL to prevent stagnation"; v0.3.8 provides "GPM corruption prevention at source + long-running per-tick allocation minimization".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -1589,6 +1725,13 @@ Total RSS ~4-8 MB
 | Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None → `none_counts[9]` per-metric array with 3-tick TTL, stops pushing after expiry (prevents stale sparklines) |
 | `get_process_utilization` Option return | `nvml.rs` | API failure returned `(0, 0)` → returns `Option<(u32, u32)>`, distinguishes idle 0% from failure, prevents false fallback scaling |
 | `collect_all()` per-device error isolation | `nvml.rs` | `device_by_index(i)?` failed entire collection on single GPU error → `match ... continue` skips failed GPU, remaining GPUs collected normally |
+| GPM MIG Phase 2 removal | `nvml.rs` | `nvmlGpmMigSampleGet()` calls in MIG → completely removed, prevents cross-tick NVML state corruption causing VRAM N/A |
+| MIG display name caching | `nvml.rs` | Per-tick `format!().into()` new `Rc<str>` → `DeviceInfo.mig_display_name` cache, `Rc::clone()` reuse |
+| PID dedup HashSet reuse | `nvml.rs` | Per-tick `HashSet::new()` per device → `proc_seen_pids: RefCell<HashSet<u32>>` reuse (zero alloc per tick) |
+| `make_bar()` lookup table | `dashboard.rs` | Per-core `String` alloc → `BAR_TABLE` thread-local lookup, `&str` reference only (128 cores: 128 alloc → 0/draw) |
+| Time string zero-alloc | `dashboard.rs` | `clone()` + `format!()` 2 alloc/draw → `write!` buffer reuse + `as_str()` reference (0 alloc/draw) |
+| `phase1` Vec pre-allocation | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(max_count)`, eliminates realloc during MIG collection |
+| entries/parent_procs pre-allocation | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(16)`, eliminates first-push alloc during process collection |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
@@ -1652,6 +1795,10 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None caused stale sparklines → `none_counts[9]` per-metric array with 3-tick limit, stops pushing after expiry |
 | `get_process_utilization` failure/idle distinction | `nvml.rs` | API failure `(0, 0)` indistinguishable from idle 0% → `Option<(u32, u32)>` return, idle 0% reported normally while failure proceeds to next fallback |
 | `collect_all()` per-device error isolation | `nvml.rs` | Single GPU `device_by_index` error stopped entire metric collection → skips failed GPU only, remaining GPUs collected normally |
+| GPM MIG Phase 2 removal | `nvml.rs` | `nvmlGpmMigSampleGet()` cross-tick corruption caused permanent `memory_info()` failure → eliminated, VRAM stability ensured |
+| MIG display name caching | `nvml.rs` | MIG name `Rc<str>` created only on first tick, `Rc::clone()` refcount bump thereafter (eliminates per-tick heap alloc per MIG instance) |
+| PID dedup HashSet reuse | `nvml.rs` | `RefCell<HashSet<u32>>` field reuse, zero allocation after first tick (clear only) |
+| BAR_TABLE lookup table | `dashboard.rs` | `thread_local!` bar string table, rebuilds only on terminal resize, zero bar allocations per draw even on 128 cores |
 
 ### Long-Running Memory Profile
 
