@@ -1564,7 +1564,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | `Rc<str>` 문자열 공유 | `nvml.rs`, `metrics.rs`, `app.rs` | `DeviceInfo`/`GpuMetrics`의 name·uuid·compute_capability를 `Rc<str>`로 변경 → clone 시 heap 할당 제거 (포인터 카운트 증가만) |
 | `ram_breakdown()` 1회 호출 | `dashboard.rs` | `draw_ram_bars` + `draw_memory_legend`에서 중복 계산 → `draw_system_charts`에서 1회 계산 후 두 함수에 전달 |
 | 프로세스명 캐싱 | `nvml.rs` | 매 tick `/proc/{pid}/comm` I/O → `HashMap<u32, String>` 캐시 + tick당 dead PID 자동 정리 |
-| NVML 버퍼 shrink 임계값 강화 | `nvml.rs` | `capacity > needed*2` → `capacity > floor*4` 기준으로 변경, 변동 시 불필요한 shrink 반복 방지 |
+| NVML 버퍼 shrink 임계값 강화 | `nvml.rs` | `capacity > needed*2` → `capacity > floor*8` 기준으로 변경, 프로세스/샘플 수 변동 시 shrink↔resize 쓰레싱 방지 |
 | `device_cache` HashMap 방어적 shrink | `nvml.rs` | MIG 재설정 반복 시 HashMap capacity 무한 증가 → `capacity > len*4` 시 자동 축소 |
 | Memory 패널 우측 통합 | `dashboard.rs` | 좌측 Memory 박스 제거 → 우측 System Charts에 RAM/SWP 바 통합, CPU 코어 표시 영역 확장 |
 | `active_handles` Vec 재사용 | `nvml.rs` | 매 tick `Vec::with_capacity(N)` 할당/해제 → `RefCell<Vec<usize>>` 필드로 재사용 (tick당 할당 0) |
@@ -1587,6 +1587,9 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | `throttle_reasons` → `Cow<'static, str>` | `metrics.rs`, `nvml.rs` | 매 tick `String` 힙 할당 → "None", "Idle" 등 단일 플래그는 `Cow::Borrowed` 제로 할당 (실 사용의 90%+ 커버) |
 | `proc_name_cache` → `HashMap<u32, Rc<str>>` | `nvml.rs` | 캐시 히트 시 `String::clone()` → `Rc::clone()` 포인터 카운트만, 프로세스명 공유 비용 제거 |
 | PCIe sparkline 타이틀 명확화 | `dashboard.rs` | 타이틀 "TX/RX" 표기가 그래프 내용(TX만)과 불일치 → "PCIe TX:N / RX:N MB/s"로 명확화 |
+| Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복 → `none_counts[9]` 배열로 메트릭별 3틱 TTL 적용, 초과 시 push 중단 (스파크라인 정체 방지) |
+| `get_process_utilization` Option 반환 | `nvml.rs` | API 실패 시 `(0, 0)` 반환 → `Option<(u32, u32)>` 반환, idle 0%와 실패를 구분하여 잘못된 폴백 스케일링 방지 |
+| `collect_all()` 디바이스별 에러 격리 | `nvml.rs` | `device_by_index(i)?`로 1개 GPU 에러 시 전체 수집 실패 → `match ... continue`로 해당 GPU만 건너뛰기 |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
@@ -1633,7 +1636,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | VecDeque 링 버퍼 (300 고정) | `metrics.rs` | GPU/시스템 히스토리 크기 고정, 무한 증가 불가 |
 | GPU 히스토리 자동 정리 + shrink | `app.rs` | MIG 재구성/GPU 제거 시 UUID 불일치 감지 → orphan 엔트리 자동 삭제 + capacity 축소 |
 | GPM 샘플·디바이스 캐시 정리 | `nvml.rs` | 매 tick active handle 추적 → stale `nvmlGpmSample_t` free + `DeviceInfo` 제거, MIG 재구성 반복 시에도 누수 없음 |
-| NVML 샘플 버퍼 shrink-to-fit | `nvml.rs` | capacity > floor×4 시 자동 축소, 변동 시 불필요한 shrink 반복 방지 |
+| NVML 샘플 버퍼 shrink-to-fit | `nvml.rs` | capacity > floor×8 시 자동 축소, 프로세스/샘플 수 변동 시 shrink↔resize 쓰레싱 방지 |
 | DeviceInfo 캐시 1회 수집 + `Rc<str>` | `nvml.rs` | 정적 정보(arch, CC 등)는 첫 호출 시 캐시, clone 시 포인터 카운트만 증가 (heap 할당 0) |
 | 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱 (`HashMap<u32, Rc<str>>`), 매 tick 현재 top-5에 없는 PID 자동 제거, 캐시 히트 시 `Rc::clone()`만 (힙 할당 0) |
 | `throttle_reasons` `Cow<'static, str>` | `nvml.rs` | "None", "Idle" 등 빈번한 단일 플래그는 `Cow::Borrowed` 제로 할당, 복합 플래그만 `Cow::Owned` |
@@ -1647,6 +1650,9 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | sysinfo targeted refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 호출, 프로세스 누적 없음 |
 | `active_handles` HashSet 재사용 | `nvml.rs` | `RefCell<HashSet<usize>>` 재사용 + O(1) contains 조회, prune_stale_caches O(n²)→O(n) |
 | history/vram_fail_count UUID HashSet 정리 | `app.rs` | GPU 제거 감지 시 이중 `.any()` O(n×m) → HashSet O(n) 단일 순회 |
+| Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복으로 스파크라인 정체 → `none_counts[9]` 배열로 메트릭별 3틱 제한, 초과 시 push 중단 |
+| `get_process_utilization` 실패/idle 구분 | `nvml.rs` | API 실패 `(0, 0)` = idle 0% 구분 불가 → `Option<(u32, u32)>` 반환, idle 0%는 정상 보고·실패는 다음 폴백 진행 |
+| `collect_all()` 디바이스별 에러 격리 | `nvml.rs` | 1개 GPU `device_by_index` 에러 시 전체 메트릭 수집 중단 → 해당 GPU만 skip, 나머지 GPU 정상 수집 유지 |
 
 ### 장시간 메모리 사용량 예측
 

@@ -177,7 +177,10 @@ impl NvmlCollector {
         active_handles.clear();
 
         for i in 0..device_count {
-            let device = self.nvml.device_by_index(i)?;
+            let device = match self.nvml.device_by_index(i) {
+                Ok(d) => d,
+                Err(_) => continue, // Skip failed device — don't fail all GPUs
+            };
             active_handles.insert(unsafe { device.handle() } as usize);
 
             if self.is_mig_enabled(&device) {
@@ -281,13 +284,12 @@ impl NvmlCollector {
                 {
                     // Fallback 1: process utilization (no GPM involvement)
                     if metrics.gpu_util.is_none() {
-                        let (sm, mem) = self.get_process_utilization(mig_handle);
-                        if sm > 0 {
+                        if let Some((sm, mem)) = self.get_process_utilization(mig_handle) {
                             metrics.gpu_util = Some(sm);
                             metrics.sm_util = Some(sm);
-                        }
-                        if mem > 0 {
-                            metrics.memory_util = Some(mem);
+                            if mem > 0 {
+                                metrics.memory_util = Some(mem);
+                            }
                         }
                     }
 
@@ -418,8 +420,9 @@ impl NvmlCollector {
     }
 
     /// Get aggregated process utilization via raw NVML API.
+    /// Returns None on API failure (distinguishable from idle 0%).
     /// Reuses internal buffer to avoid allocation per call.
-    unsafe fn get_process_utilization(&self, device_handle: nvmlDevice_t) -> (u32, u32) {
+    unsafe fn get_process_utilization(&self, device_handle: nvmlDevice_t) -> Option<(u32, u32)> {
         let mut count: c_uint = 0;
         let ret = self.raw_lib.nvmlDeviceGetProcessUtilization(
             device_handle,
@@ -429,7 +432,7 @@ impl NvmlCollector {
         );
 
         if ret != 7 || count == 0 {
-            return (0, 0);
+            return None;
         }
 
         let mut buf = self.proc_sample_buf.borrow_mut();
@@ -446,14 +449,14 @@ impl NvmlCollector {
         );
 
         if ret != 0 {
-            return (0, 0);
+            return None;
         }
 
         // Shrink buffer if it grew much larger than needed (prevent unbounded growth).
-        // Use capacity > threshold*4 to avoid thrashing on minor fluctuations.
+        // Use capacity > threshold*8 to avoid shrink/resize thrashing on oscillating process counts.
         let actual = count as usize;
         let floor = actual.max(32);
-        if buf.capacity() > floor * 4 {
+        if buf.capacity() > floor * 8 {
             buf.truncate(floor);
             buf.shrink_to(floor * 2);
         }
@@ -469,7 +472,7 @@ impl NvmlCollector {
             }
         }
 
-        (max_sm, max_mem)
+        Some((max_sm, max_mem))
     }
 
     /// Get GPU utilization from nvmlDeviceGetSamples (parent device only).
@@ -513,10 +516,10 @@ impl NvmlCollector {
         }
 
         // Shrink buffer if it grew much larger than needed (prevent unbounded growth).
-        // Use capacity > threshold*4 to avoid thrashing on minor fluctuations.
+        // Use capacity > threshold*8 to avoid shrink/resize thrashing on oscillating sample counts.
         let actual = count as usize;
         let floor = actual.max(128);
-        if buf.capacity() > floor * 4 {
+        if buf.capacity() > floor * 8 {
             buf.truncate(floor);
             buf.shrink_to(floor * 2);
         }

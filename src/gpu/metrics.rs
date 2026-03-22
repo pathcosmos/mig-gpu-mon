@@ -109,6 +109,10 @@ impl GpuMetrics {
     }
 }
 
+/// Max consecutive ticks to carry forward last value in sparkline history.
+/// Matches VRAM_CARRY_FORWARD_TTL in app.rs for consistent behavior.
+const SPARKLINE_CARRY_FORWARD_TTL: u32 = 3;
+
 /// Time-series history for a single GPU/MIG instance.
 /// Uses VecDeque for O(1) push/pop ring buffer instead of Vec::remove(0) O(n).
 #[derive(Debug, Clone)]
@@ -122,6 +126,8 @@ pub struct MetricsHistory {
     pub clock_graphics_mhz: VecDeque<u32>,
     pub pcie_tx_kbps: VecDeque<u32>,
     pub pcie_rx_kbps: VecDeque<u32>,
+    /// Per-metric consecutive None counts for carry-forward TTL
+    none_counts: [u32; 9],
     max_entries: usize,
 }
 
@@ -137,53 +143,67 @@ impl MetricsHistory {
             clock_graphics_mhz: VecDeque::with_capacity(max_entries),
             pcie_tx_kbps: VecDeque::with_capacity(max_entries),
             pcie_rx_kbps: VecDeque::with_capacity(max_entries),
+            none_counts: [0; 9],
             max_entries,
         }
     }
 
     pub fn push(&mut self, metrics: &GpuMetrics) {
-        Self::push_or_repeat(&mut self.gpu_util, metrics.gpu_util, self.max_entries);
-        Self::push_or_repeat(&mut self.memory_util, metrics.memory_util, self.max_entries);
-        Self::push_or_repeat(
+        Self::push_with_ttl(&mut self.gpu_util, metrics.gpu_util, self.max_entries, &mut self.none_counts[0]);
+        Self::push_with_ttl(&mut self.memory_util, metrics.memory_util, self.max_entries, &mut self.none_counts[1]);
+        Self::push_with_ttl(
             &mut self.memory_used_mb,
             metrics.memory_used_mb(),
             self.max_entries,
+            &mut self.none_counts[2],
         );
-        Self::push_or_repeat(&mut self.sm_util, metrics.sm_util, self.max_entries);
-        Self::push_or_repeat(&mut self.temperature, metrics.temperature, self.max_entries);
-        Self::push_or_repeat(
+        Self::push_with_ttl(&mut self.sm_util, metrics.sm_util, self.max_entries, &mut self.none_counts[3]);
+        Self::push_with_ttl(&mut self.temperature, metrics.temperature, self.max_entries, &mut self.none_counts[4]);
+        Self::push_with_ttl(
             &mut self.power_usage_w,
             metrics.power_usage_w(),
             self.max_entries,
+            &mut self.none_counts[5],
         );
-        Self::push_or_repeat(
+        Self::push_with_ttl(
             &mut self.clock_graphics_mhz,
             metrics.clock_graphics_mhz,
             self.max_entries,
+            &mut self.none_counts[6],
         );
-        Self::push_or_repeat(
+        Self::push_with_ttl(
             &mut self.pcie_tx_kbps,
             metrics.pcie_tx_kbps,
             self.max_entries,
+            &mut self.none_counts[7],
         );
-        Self::push_or_repeat(
+        Self::push_with_ttl(
             &mut self.pcie_rx_kbps,
             metrics.pcie_rx_kbps,
             self.max_entries,
+            &mut self.none_counts[8],
         );
     }
 
-    /// Push value if Some, otherwise repeat last known value to keep sparkline rolling.
+    /// Push value if Some; on None, repeat last value for up to SPARKLINE_CARRY_FORWARD_TTL ticks.
+    /// After TTL, stops pushing — sparkline gap signals data unavailability.
     /// Does nothing if the metric has never been observed (no data yet).
-    fn push_or_repeat<T: Copy>(buf: &mut VecDeque<T>, val: Option<T>, max: usize) {
-        let v = match val {
-            Some(v) => v,
-            None => match buf.back() {
-                Some(&last) => last,
-                None => return, // never observed — don't fabricate data
-            },
-        };
-        Self::push_ring(buf, v, max);
+    fn push_with_ttl<T: Copy>(buf: &mut VecDeque<T>, val: Option<T>, max: usize, none_count: &mut u32) {
+        match val {
+            Some(v) => {
+                *none_count = 0;
+                Self::push_ring(buf, v, max);
+            }
+            None => {
+                *none_count += 1;
+                if *none_count <= SPARKLINE_CARRY_FORWARD_TTL {
+                    if let Some(&last) = buf.back() {
+                        Self::push_ring(buf, last, max);
+                    }
+                }
+                // After TTL: skip push → sparkline stops growing, signaling data loss
+            }
+        }
     }
 
     fn push_ring<T>(buf: &mut VecDeque<T>, val: T, max: usize) {

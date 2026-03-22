@@ -1569,7 +1569,7 @@ Total RSS ~4-8 MB
 | `Rc<str>` string sharing | `nvml.rs`, `metrics.rs`, `app.rs` | `DeviceInfo`/`GpuMetrics` name·uuid·compute_capability changed to `Rc<str>` → eliminates heap allocation on clone (reference count bump only) |
 | `ram_breakdown()` single call | `dashboard.rs` | Duplicate calculation in `draw_ram_bars` + `draw_memory_legend` → computed once in `draw_system_charts`, passed to both |
 | Process name caching | `nvml.rs` | Per-tick `/proc/{pid}/comm` I/O → `HashMap<u32, String>` cache + automatic dead PID cleanup each tick |
-| NVML buffer shrink threshold | `nvml.rs` | `capacity > needed*2` → `capacity > floor*4` threshold, prevents unnecessary shrink thrashing on minor fluctuations |
+| NVML buffer shrink threshold | `nvml.rs` | `capacity > needed*2` → `capacity > floor*8` threshold, prevents shrink↔resize thrashing on oscillating process/sample counts |
 | `device_cache` HashMap defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |
 | `gpm_prev_samples` defensive shrink | `nvml.rs` | Same shrink heuristic applied to GPM sample HashMap → auto-shrink when `capacity > len*4`, reclaims memory on repeated MIG reconfigs |
 | proc_name_cache HashSet-based pruning | `nvml.rs` | Per-tick dead PID pruning changed from O(n·m) nested iteration → `HashSet<u32>` O(n+m) lookup, consistent performance as process count grows |
@@ -1586,6 +1586,9 @@ Total RSS ~4-8 MB
 | `throttle_reasons` → `Cow<'static, str>` | `metrics.rs`, `nvml.rs` | Per-tick `String` heap alloc → "None", "Idle" etc. single flags use `Cow::Borrowed` zero-alloc (covers 90%+ of real usage) |
 | `proc_name_cache` → `HashMap<u32, Rc<str>>` | `nvml.rs` | Cache hit `String::clone()` → `Rc::clone()` refcount bump only, process name sharing cost eliminated |
 | PCIe sparkline title clarification | `dashboard.rs` | Title "TX/RX" label mismatched graph content (TX only) → clarified to "PCIe TX:N / RX:N MB/s" |
+| Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None → `none_counts[9]` per-metric array with 3-tick TTL, stops pushing after expiry (prevents stale sparklines) |
+| `get_process_utilization` Option return | `nvml.rs` | API failure returned `(0, 0)` → returns `Option<(u32, u32)>`, distinguishes idle 0% from failure, prevents false fallback scaling |
+| `collect_all()` per-device error isolation | `nvml.rs` | `device_by_index(i)?` failed entire collection on single GPU error → `match ... continue` skips failed GPU, remaining GPUs collected normally |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
@@ -1632,7 +1635,7 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | VecDeque ring buffer (300 fixed) | `metrics.rs` | GPU/system history size fixed, cannot grow unbounded |
 | GPU history auto-cleanup + shrink | `app.rs` | UUID mismatch detection on MIG reconfig/GPU removal → orphan entries auto-deleted + capacity shrink |
 | GPM sample + device cache pruning | `nvml.rs` | Per-tick active handle tracking → frees stale `nvmlGpmSample_t` + removes `DeviceInfo`, no leaks across repeated MIG reconfigs |
-| NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > floor×4, prevents unnecessary shrink thrashing on fluctuations |
+| NVML sample buffer shrink-to-fit | `nvml.rs` | Auto-shrinks when capacity > floor×8, prevents shrink↔resize thrashing on oscillating process/sample counts |
 | DeviceInfo cache (one-time) + `Rc<str>` | `nvml.rs` | Static info cached on first call, clone only bumps reference count (zero heap allocation) |
 | Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached (`HashMap<u32, Rc<str>>`), dead PIDs not in current top-5 auto-removed each tick, cache hit returns `Rc::clone()` only (zero heap alloc) |
 | `throttle_reasons` `Cow<'static, str>` | `nvml.rs` | "None", "Idle" etc. frequent single flags use `Cow::Borrowed` zero-alloc, only compound flags use `Cow::Owned` |
@@ -1646,6 +1649,9 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |
 | `active_handles` HashSet reuse | `nvml.rs` | `RefCell<HashSet<usize>>` reuse + O(1) contains lookup, prune_stale_caches O(n²)→O(n) |
 | history/vram_fail_count UUID HashSet cleanup | `app.rs` | GPU removal detection changes double `.any()` O(n×m) → HashSet O(n) single pass |
+| Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None caused stale sparklines → `none_counts[9]` per-metric array with 3-tick limit, stops pushing after expiry |
+| `get_process_utilization` failure/idle distinction | `nvml.rs` | API failure `(0, 0)` indistinguishable from idle 0% → `Option<(u32, u32)>` return, idle 0% reported normally while failure proceeds to next fallback |
+| `collect_all()` per-device error isolation | `nvml.rs` | Single GPU `device_by_index` error stopped entire metric collection → skips failed GPU only, remaining GPUs collected normally |
 
 ### Long-Running Memory Profile
 
