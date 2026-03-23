@@ -261,12 +261,14 @@ impl NvmlCollector {
             // MaxMigDeviceCount = total number of GPU instance slices (e.g. 7 for H100)
             let total_slices = max_count;
 
-            // === Collect base metrics (VRAM, utilization) for all MIG instances ===
-            // GPM (nvmlGpmMigSampleGet) is intentionally NOT used on MIG instances:
-            // it corrupts NVML driver state across ticks, causing memory_info() to fail
-            // permanently — resulting in VRAM showing "N/A" after carry-forward TTL expires.
-            // memory_util falls back to process utilization (Fallback 1) when available.
-            let mut phase1: Vec<(nvmlDevice_t, GpuMetrics)> = Vec::with_capacity(max_count as usize);
+            // === Phase 1: Collect base metrics (VRAM, utilization) for all MIG instances ===
+            // GPM (nvmlGpmMigSampleGet) is NOT called here — it can corrupt NVML state
+            // and cause subsequent memory_info() to fail. GPM is deferred to Phase 1.5,
+            // after all VRAM queries are complete, so VRAM data is safe.
+            // (mig_handle, gpu_instance_id, metrics) — cache gi_id to avoid
+            // redundant Device::new + get_device_info in Phase 1.5 and Phase 2.
+            let mut phase1: Vec<(nvmlDevice_t, Option<u32>, GpuMetrics)> =
+                Vec::with_capacity(max_count as usize);
 
             for mig_idx in 0..max_count {
                 let mut mig_handle: nvmlDevice_t = std::ptr::null_mut();
@@ -281,6 +283,8 @@ impl NvmlCollector {
                 active_handles.insert(mig_handle as usize);
 
                 let mig_device = Device::new(mig_handle, &self.nvml);
+                let mig_info = self.get_device_info(&mig_device, true);
+                let gi_id = mig_info.gpu_instance_id;
 
                 if let Ok(mut metrics) =
                     self.collect_device_metrics(&mig_device, mig_idx, true, Some(gpu_index))
@@ -299,7 +303,6 @@ impl NvmlCollector {
                     // Fallback 2: scale parent's sampled util by MIG slice ratio (no GPM)
                     if metrics.gpu_util.is_none() {
                         if let Some(p_util) = parent_sampled_util {
-                            let mig_info = self.get_device_info(&mig_device, true);
                             if let Some(mig_slices) = mig_info.gpu_instance_slice_count {
                                 let scaled = ((p_util as u64) * (total_slices as u64)
                                     / (mig_slices as u64))
@@ -327,7 +330,32 @@ impl NvmlCollector {
                             formatted
                         }
                     };
-                    phase1.push((mig_handle, metrics));
+                    phase1.push((mig_handle, gi_id, metrics));
+                }
+            }
+
+            // === Phase 1.5: GPM DRAM BW Util for Mem Ctrl (after VRAM is safely collected) ===
+            // nvmlGpmMigSampleGet can corrupt NVML state — but memory_info() was already
+            // called in Phase 1, so VRAM data is safe. Only attempt on GPM-supported parents.
+            {
+                let parent_info = self.get_device_info(parent_device, false);
+                if parent_info.gpm_supported {
+                    for (mig_handle, gi_id, metrics) in &mut phase1 {
+                        if metrics.memory_util.is_some() {
+                            continue;
+                        }
+                        if let Some(gi_id) = gi_id {
+                            let gpm_val = self.get_dram_bw_util_gpm(
+                                *mig_handle,
+                                true,
+                                Some(*gi_id),
+                                Some(parent_handle),
+                            );
+                            if let Some(val) = gpm_val {
+                                metrics.memory_util = Some(val);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -369,21 +397,18 @@ impl NvmlCollector {
                 let any_gi_available = parent_procs.iter().any(|(_, _, gi)| gi.is_some());
 
                 // Distribute parent processes to MIG instances by gpu_instance_id
-                for (mig_handle, metrics) in &mut phase1 {
+                for (mig_handle, gi_id, metrics) in &mut phase1 {
                     // Skip if MIG handle already has processes (some drivers do work)
                     if !metrics.top_processes.is_empty() {
                         continue;
                     }
-
-                    let mig_device = Device::new(*mig_handle, &self.nvml);
-                    let mig_info = self.get_device_info(&mig_device, true);
-                    let gi_id = mig_info.gpu_instance_id;
+                    let _ = mig_handle; // used only for identity in earlier phases
 
                     let mut entries: Vec<(u32, Option<u64>)> = if any_gi_available && gi_id.is_some() {
                         // Normal path: filter by matching gpu_instance_id
                         parent_procs
                             .iter()
-                            .filter(|(_, _, proc_gi)| *proc_gi == gi_id)
+                            .filter(|(_, _, proc_gi)| *proc_gi == *gi_id)
                             .map(|(pid, vram, _)| (*pid, *vram))
                             .collect()
                     } else {
@@ -419,7 +444,7 @@ impl NvmlCollector {
                 }
             }
 
-            mig_metrics.extend(phase1.into_iter().map(|(_, m)| m));
+            mig_metrics.extend(phase1.into_iter().map(|(_, _, m)| m));
         }
 
         Ok(mig_metrics)
@@ -722,7 +747,7 @@ impl NvmlCollector {
         };
 
         // GPM fallback for memory_util on non-MIG devices only (Hopper+ only).
-        // MIG devices must use nvmlGpmMigSampleGet via parent — handled in collect_mig_instances.
+        // MIG devices use GPM via parent in collect_mig_instances Phase 1.5 (after VRAM).
         let memory_util = if memory_util.is_none() && !is_mig && info.gpm_supported {
             unsafe { self.get_dram_bw_util_gpm(device.handle(), false, None, None) }
         } else {

@@ -101,16 +101,11 @@ impl App {
 
         // Remove history entries for GPUs that are no longer present
         // (prevents unbounded HashMap growth on MIG reconfigs / GPU hot-remove)
-        // Pre-compute UUID set for O(1) lookups instead of O(n·m) nested iteration
-        if self.history.len() != new_metrics.len()
-            || {
-                let uuid_set: HashSet<&Rc<str>> =
-                    new_metrics.iter().map(|m| &m.uuid).collect();
-                self.history.keys().any(|uuid| !uuid_set.contains(uuid))
-            }
+        // Pre-compute UUID set once for O(1) lookups instead of O(n·m) nested iteration
+        let uuid_set: HashSet<&Rc<str>> = new_metrics.iter().map(|m| &m.uuid).collect();
+        if self.history.len() != uuid_set.len()
+            || self.history.keys().any(|uuid| !uuid_set.contains(uuid))
         {
-            let uuid_set: HashSet<&Rc<str>> =
-                new_metrics.iter().map(|m| &m.uuid).collect();
             self.history.retain(|uuid, _| uuid_set.contains(uuid));
             self.vram_fail_count
                 .retain(|uuid, _| uuid_set.contains(uuid));

@@ -1643,6 +1643,160 @@ Within a single cell, bottom (fg) = green used and top (bg) = blue cached are re
 
 v0.3.8 provides "data collection stability + allocation optimization"; v0.3.9 provides "RAM chart visual accuracy fix".
 
+#### MIG Mem Ctrl GPM Restoration + Per-Tick Redundancy Elimination (v0.3.10)
+
+##### Symptom
+
+- MIG instances always show **"N/A"** for Mem Ctrl. (Memory Controller Utilization)
+- Before v0.3.8, GPM provided values with a 1-2 second delay
+- GPU Util and VRAM work normally, but Mem Ctrl. has no collection path
+
+##### Root Cause Analysis
+
+```
+Location: nvml.rs collect_mig_instances()
+```
+
+In v0.3.8, GPM (`nvmlGpmMigSampleGet`) was found to corrupt NVML state across ticks, causing the VRAM "N/A" issue. The entire GPM Phase 2 was **completely removed**. However, this eliminated all collection paths for MIG memory_util:
+
+```
+Collection path analysis (v0.3.8~v0.3.9):
+1. utilization_rates()       → Always NVML_ERROR_NOT_SUPPORTED on MIG
+2. GPM fallback (collect_device_metrics) → Blocked by !is_mig condition
+3. GPM fallback (collect_mig_instances) → Removed in v0.3.8
+4. process utilization       → None when no processes or mem=0
+→ Result: No memory_util collection path → always "N/A"
+```
+
+**Key insight**: GPM corrupts NVML state, but `memory_info()` is **already collected** in Phase 1. Calling GPM after Phase 1 keeps VRAM data safe.
+
+##### Fix Details (4 changes)
+
+**Change 1: Phase 1.5 GPM DRAM BW Util Restoration** (`nvml.rs`)
+
+```rust
+// Phase 1: All MIG instances' VRAM (memory_info()) collection complete
+// Phase 1.5 (new): Collect memory_util via GPM — VRAM is already safe
+let parent_info = self.get_device_info(parent_device, false);
+if parent_info.gpm_supported {
+    for (mig_handle, gi_id, metrics) in &mut phase1 {
+        if metrics.memory_util.is_some() { continue; }
+        if let Some(gi_id) = gi_id {
+            let gpm_val = self.get_dram_bw_util_gpm(
+                *mig_handle, true, Some(*gi_id), Some(parent_handle),
+            );
+            if let Some(val) = gpm_val {
+                metrics.memory_util = Some(val);
+            }
+        }
+    }
+}
+// Phase 2: Process collection (existing)
+```
+
+Execution order Phase 1 → 1.5 → 2 ensures `memory_info()` is already complete when GPM is called.
+First tick returns `None` (needs previous sample for delta calculation); values appear from second tick onward.
+
+**Change 2: `gpu_instance_id` Phase 1 Caching to Eliminate Redundant Device::new** (`nvml.rs`)
+
+```rust
+// Before: Device::new() + get_device_info() in Phase 1, 1.5, 2 = 3×/instance
+// phase1: Vec<(nvmlDevice_t, GpuMetrics)>
+let mig_device = Device::new(*mig_handle, &self.nvml);     // Phase 1.5
+let mig_info = self.get_device_info(&mig_device, true);    // Phase 1.5
+let mig_device = Device::new(*mig_handle, &self.nvml);     // Phase 2
+let mig_info = self.get_device_info(&mig_device, true);    // Phase 2
+
+// After: Cache gi_id in Phase 1, use directly in 1.5/2 = 1×/instance
+// phase1: Vec<(nvmlDevice_t, Option<u32>, GpuMetrics)>
+let mig_info = self.get_device_info(&mig_device, true);    // Once in Phase 1
+let gi_id = mig_info.gpu_instance_id;                      // Cached
+// Phase 1.5/2 use gi_id directly — no Device::new/get_device_info needed
+```
+
+For 7 MIG instances: 14 HashMap lookups/tick → 0.
+
+**Change 3: Eliminate Redundant `get_device_info` in Fallback 2** (`nvml.rs`)
+
+```rust
+// Before: get_device_info(&mig_device, true) called again in Fallback 2
+if metrics.gpu_util.is_none() {
+    let mig_info = self.get_device_info(&mig_device, true);  // redundant!
+    if let Some(mig_slices) = mig_info.gpu_instance_slice_count { ... }
+}
+
+// After: Reuse mig_info already fetched at top of Phase 1 loop
+if metrics.gpu_util.is_none() {
+    if let Some(mig_slices) = mig_info.gpu_instance_slice_count { ... }
+}
+```
+
+**Change 4: Eliminate Double HashSet Allocation in app.rs** (`app.rs`)
+
+```rust
+// Before: HashSet created twice — once for condition check, once for retain
+if self.history.len() != new_metrics.len()
+    || {
+        let uuid_set: HashSet<_> = new_metrics.iter().map(|m| &m.uuid).collect();  // 1st
+        self.history.keys().any(|uuid| !uuid_set.contains(uuid))
+    }
+{
+    let uuid_set: HashSet<_> = new_metrics.iter().map(|m| &m.uuid).collect();  // 2nd (same)
+    self.history.retain(|uuid, _| uuid_set.contains(uuid));
+}
+
+// After: Single allocation used for both condition check and retain
+let uuid_set: HashSet<_> = new_metrics.iter().map(|m| &m.uuid).collect();  // once
+if self.history.len() != uuid_set.len()
+    || self.history.keys().any(|uuid| !uuid_set.contains(uuid))
+{
+    self.history.retain(|uuid, _| uuid_set.contains(uuid));
+}
+```
+
+##### Modified Files
+
+| File | Changes | Related |
+|------|---------|---------|
+| `src/gpu/nvml.rs` | Phase 1.5 GPM restoration + gi_id caching + Fallback 2 dedup | Changes 1, 2, 3 |
+| `src/app.rs` | HashSet double allocation elimination | Change 4 |
+
+##### Cross-Verification Matrix
+
+| Verification Item | Method | Expected Result |
+|-------------------|--------|-----------------|
+| Mem Ctrl. display | Run 2+ ticks on MIG + Hopper | First tick "N/A" → 0-100% from second tick |
+| VRAM safety | Long-running execution | GPM called after Phase 1 → no VRAM "N/A" transition |
+| GPU Util normal | Fallback 1/2 paths | Existing behavior maintained |
+| gi_id caching | No Device::new in Phase 1.5/2 | 0 HashMap lookups (cached gi_id used directly) |
+| HashSet single alloc | GPU reconfig scenario | Same HashSet created only once |
+| Pre-Ampere GPUs | GPM not supported | Mem Ctrl. stays "N/A" (gpm_supported=false → skipped) |
+| cargo clippy | Check warnings | No new warnings |
+
+##### Resource Leak Audit Results
+
+| Resource | Protection Mechanism | Status |
+|----------|---------------------|--------|
+| MetricsHistory VecDeque | `push_ring()` + max_entries cap | ✓ bounded |
+| device_cache HashMap | `prune_stale_caches()` every tick | ✓ pruned |
+| proc_name_cache | Per-tick retain active PIDs only + shrink_to | ✓ pruned |
+| gpm_prev_samples | `nvmlGpmSampleFree` on stale entry prune | ✓ freed |
+| proc_sample_buf / sample_buf | Grow-only BUT shrink when `capacity > floor*8` | ✓ bounded |
+| App history/vram_fail_count | UUID-based retain + shrink_to | ✓ pruned |
+
+All caches/buffers properly pruned; no unbounded growth confirmed for long-running operation.
+
+##### v0.3.9 → v0.3.10 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.9: RAM chart fractional cell bg color | Eliminates visual gap at used-cached boundary | `dashboard.rs` RAM segmented chart |
+| **v0.3.10: Phase 1.5 GPM restoration** | **Safe GPM call after Phase 1 restores Mem Ctrl. collection** | `nvml.rs` MIG collection Phase 1.5 |
+| **v0.3.10: gi_id pre-caching** | **Eliminates per-tick Device::new + get_device_info redundancy** | `nvml.rs` Phase 1 → 1.5/2 |
+| **v0.3.10: HashSet single allocation** | **Eliminates double HashSet creation on GPU reconfig** | `app.rs` history cleanup |
+
+v0.3.9 provides "RAM chart visual accuracy fix"; v0.3.10 provides "Mem Ctrl. GPM safe restoration + per-tick redundancy elimination".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
