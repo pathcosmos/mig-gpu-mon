@@ -1970,6 +1970,113 @@ if self.history.len() > new_metrics.len() { /* prune */ }
 
 v0.3.10은 "Mem Ctrl. GPM 안전 복원", v0.3.11은 "VRAM 추적 안정성 + GPM 자원 안전성 + 장기 운영 최적화".
 
+---
+
+#### v0.3.12: GPM 오염 자동 감지 + VRAM 모니터링 안정성 확보
+
+##### 문제
+
+`nvmlGpmMigSampleGet()` 호출이 NVML 드라이버 상태를 cross-tick 오염시켜 `memory_info()`가 영구 실패하는 현상. Phase 1.5 GPM → 다음 tick Phase 1 memory_info 실패 → post-probe 대상 없음(`probe_idx=None`) → GPM 계속 실행 → 재오염 무한 루프.
+
+##### 수정 내용 (3개 변경)
+
+**변경 1: GPM post-probe 오염 감지** (`nvml.rs`)
+
+Phase 1.5 GPM 호출 후 Phase 1에서 memory_info 성공했던 MIG 디바이스로 재검증. 실패 시 → `gpm_disabled_parents` HashSet에 parent 등록, 이후 tick GPM 영구 비활성화.
+
+**변경 2: `gpm_disabled_parents` 자동 정리** (`nvml.rs`)
+
+`prune_stale_caches`에서 제거된 parent GPU의 disabled 플래그 자동 정리 → GPU hot-remove/MIG 재구성 시 stale 엔트리 방지.
+
+**변경 3: CLAUDE.md GPM 오염 감지 설계 기록** (`CLAUDE.md`)
+
+GPM 호출 후 post-probe → 오염 감지 → 영구 비활성화 설계 의도를 Key Design Decisions에 추가.
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/nvml.rs` | `gpm_disabled_parents` RefCell<HashSet> 추가, Phase 1.5 post-probe 오염 감지 + GPM 영구 비활성화, `prune_stale_caches` disabled 정리 |
+| `CLAUDE.md` | GPM 오염 감지 설계 문서화 |
+
+---
+
+#### v0.3.13: GPM 오염 무한루프 차단 + 장기 운영 미세 최적화
+
+##### 문제
+
+v0.3.12의 post-probe는 **같은 tick 내 즉시 발현되는 오염**만 감지. GPM 오염이 지연 발현(다음 tick에서야 memory_info 실패)되면:
+
+1. Tick N: Phase 1 memory_info 성공 → GPM 실행 → post-probe 통과 (오염 미발현)
+2. Tick N+1: 전체 MIG memory_info 실패 → `probe_idx=None` → post-probe 스킵 → GPM 재실행 → 재오염
+3. 매 tick 반복 → carry-forward TTL 10초 후 VRAM N/A
+
+##### 수정 내용 (3개 변경)
+
+**변경 1: `probe_idx=None`일 때 GPM 스킵** (`nvml.rs`)
+
+전체 MIG memory_info 실패 시 GPM 자체를 스킵하여 오염 사이클 차단. NVML이 자체 복구(1~3 tick)되면 probe_idx가 Some으로 돌아오고, 그때 GPM 재시도 + post-probe가 정상 작동.
+
+```rust
+// 수정 전: probe_idx=None → GPM 실행 → 재오염 무한루프
+let probe_idx = phase1.iter().position(|(_, _, m)| m.memory_used.is_some());
+for (mig_handle, gi_id, metrics) in &mut phase1 { ... }  // GPM 무조건 실행
+if let Some(idx) = probe_idx { ... }                       // probe 없으면 스킵
+
+// 수정 후: probe_idx=None → GPM 전체 스킵 → NVML 복구 기회 제공
+if let Some(pidx) = probe_idx {
+    for (mig_handle, gi_id, metrics) in &mut phase1 { ... }  // GPM 실행
+    // post-probe (pidx 보장)
+    let (probe_handle, _, _) = &phase1[pidx];
+    ...
+}
+// else: skip GPM → break corruption cycle
+```
+
+**변경 2: `proc_seen_pids` 재활용으로 매 tick HashSet 할당 제거** (`nvml.rs`)
+
+`proc_name_cache` 정리 시 새 `HashSet<u32>` 할당 대신, collect phase 종료 후 유휴 상태인 `proc_seen_pids` RefCell 재활용.
+
+**변경 3: `none_count` TTL 상한 적용** (`metrics.rs`)
+
+`push_with_ttl`에서 TTL 초과 후에도 `none_count`가 무한 증가하던 문제 수정. `TTL+1`에서 cap하여 영구 N/A 메트릭에서 의미 없는 증분 방지.
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/nvml.rs` | Phase 1.5 `probe_idx=None` 시 GPM 스킵 + `proc_seen_pids` 재활용 |
+| `src/gpu/metrics.rs` | `none_count` TTL+1 cap |
+
+##### 검증 매트릭스
+
+| 검증 항목 | 방법 | 기대 결과 |
+|----------|------|----------|
+| GPM 지연 오염 시 VRAM 복구 | MIG 장시간 실행, GPM 오염 지연 발현 시나리오 | probe_idx=None → GPM 스킵 → 1~3 tick 후 NVML 복구 → VRAM 정상 |
+| proc_name_cache 정리 할당 | tick당 힙 할당 추적 | 새 HashSet 할당 0회 (proc_seen_pids 재활용) |
+| none_count 오버플로우 방지 | 영구 N/A 메트릭 장시간 | none_count ≤ TTL+1 (11) 고정 |
+| cargo clippy | 경고 확인 | 신규 경고 없음 ✓ |
+
+##### 자원 누수 감사 결과
+
+| 자원 | v0.3.12 상태 | v0.3.13 수정 |
+|------|-------------|-------------|
+| GPM 오염 무한루프 | **probe_idx=None 시 GPM 재실행 → 재오염** | ✓ GPM 스킵으로 사이클 차단 |
+| proc_name_cache 정리 HashSet | 매 tick 새 HashSet 할당 | ✓ proc_seen_pids 재활용 |
+| none_count 무한 증가 | u32 무한 증분 (실질 무해하나 불필요) | ✓ TTL+1에서 cap |
+
+##### v0.3.10 → v0.3.13 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.10: Phase 1.5 GPM 2-phase 분리 | Phase 1 VRAM 수집 후 GPM 호출 → 같은 tick VRAM 보호 | `nvml.rs` MIG 수집 |
+| v0.3.11: VRAM TTL 10초 + memory_total 캐시 | GPM 후유증 장기 실패 시에도 추적 유지 + 스케일 안정 | `app.rs` carry-forward |
+| v0.3.12: post-probe 오염 감지 + GPM 영구 비활성화 | 같은 tick 즉시 발현 오염 → GPM 차단 | `nvml.rs` Phase 1.5 |
+| **v0.3.13: probe_idx=None 시 GPM 스킵** | **지연 발현 오염 (다음 tick) → 재오염 무한루프 차단** | `nvml.rs` Phase 1.5 |
+| **v0.3.13: 매 tick 할당 최적화** | **proc_seen_pids 재활용 + none_count cap** | `nvml.rs`, `metrics.rs` |
+
+v0.3.12는 "GPM 오염 자동 감지 + 영구 비활성화", v0.3.13은 "GPM 지연 오염 무한루프 차단 + 장기 운영 미세 최적화".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -2205,6 +2312,9 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | PID dedup HashSet 재사용 | `nvml.rs` | `RefCell<HashSet<u32>>` 필드 재사용, 첫 tick 이후 할당 0 (clear만) |
 | BAR_TABLE 룩업 테이블 | `dashboard.rs` | `thread_local!` bar 문자열 테이블, 터미널 리사이즈 시에만 재빌드, 128코어에서도 draw당 bar 할당 0 |
 | RAM 차트 fractional 셀 bg 색상 | `dashboard.rs` | used fractional 문자의 빈 상단 → `cell.set_bg(Color::Blue)` 적용, used-cached 경계 시각적 밀착 보장 |
+| GPM 지연 오염 시 GPM 스킵 | `nvml.rs` | `probe_idx=None`(전체 MIG memory_info 실패) 시 GPM 실행 자체를 건너뛰어 재오염 무한루프 차단, NVML 자체 복구 후 자동 재개 |
+| proc_name_cache 정리 시 HashSet 재활용 | `nvml.rs` | `proc_seen_pids` RefCell 재활용으로 매 tick 새 HashSet 할당 제거 |
+| none_count TTL 상한 적용 | `metrics.rs` | `push_with_ttl` none_count를 TTL+1에서 cap → 영구 N/A 메트릭에서 의미 없는 u32 증분 방지 |
 
 ### 장시간 메모리 사용량 예측
 

@@ -198,7 +198,10 @@ impl MetricsHistory {
                 Self::push_ring(buf, v, max);
             }
             None => {
-                *none_count += 1;
+                // Cap at TTL+1 to avoid useless increments on permanently unavailable metrics
+                if *none_count <= SPARKLINE_CARRY_FORWARD_TTL {
+                    *none_count += 1;
+                }
                 if *none_count <= SPARKLINE_CARRY_FORWARD_TTL {
                     if let Some(&last) = buf.back() {
                         Self::push_ring(buf, last, max);

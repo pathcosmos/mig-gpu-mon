@@ -1969,6 +1969,113 @@ if self.history.len() > new_metrics.len() { /* prune */ }
 
 v0.3.10 provides "Mem Ctrl. GPM safe restoration"; v0.3.11 provides "VRAM tracking stability + GPM resource safety + long-running optimization".
 
+---
+
+#### v0.3.12: GPM Corruption Auto-Detect + VRAM Monitoring Stability
+
+##### Problem
+
+`nvmlGpmMigSampleGet()` calls corrupt NVML driver state across ticks, causing `memory_info()` to fail permanently. Phase 1.5 GPM → next tick Phase 1 memory_info fails → no probe target (`probe_idx=None`) → GPM keeps running → re-corruption infinite loop.
+
+##### Changes (3 changes)
+
+**Change 1: GPM post-probe corruption detection** (`nvml.rs`)
+
+After Phase 1.5 GPM calls, re-verify memory_info on a MIG device that succeeded in Phase 1. On failure → register parent in `gpm_disabled_parents` HashSet, permanently disable GPM for subsequent ticks.
+
+**Change 2: `gpm_disabled_parents` auto-cleanup** (`nvml.rs`)
+
+Auto-clean removed parent GPU disabled flags in `prune_stale_caches` → prevents stale entries on GPU hot-remove/MIG reconfig.
+
+**Change 3: CLAUDE.md GPM corruption detection design doc** (`CLAUDE.md`)
+
+Added GPM post-probe → corruption detection → permanent disable design intent to Key Design Decisions.
+
+##### Changed Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/nvml.rs` | Added `gpm_disabled_parents` RefCell<HashSet>, Phase 1.5 post-probe corruption detection + permanent GPM disable, `prune_stale_caches` disabled cleanup |
+| `CLAUDE.md` | GPM corruption detection design documentation |
+
+---
+
+#### v0.3.13: GPM Corruption Infinite Loop Fix + Long-Running Micro-Optimization
+
+##### Problem
+
+v0.3.12's post-probe only detects corruption that **manifests immediately within the same tick**. When GPM corruption is delayed (manifests next tick):
+
+1. Tick N: Phase 1 memory_info succeeds → GPM runs → post-probe passes (corruption not yet visible)
+2. Tick N+1: All MIG memory_info fails → `probe_idx=None` → post-probe skipped → GPM runs again → re-corruption
+3. Repeats every tick → carry-forward TTL expires after 10s → VRAM shows N/A
+
+##### Changes (3 changes)
+
+**Change 1: Skip GPM when `probe_idx=None`** (`nvml.rs`)
+
+When all MIG memory_info fails, skip GPM entirely to break the corruption cycle. Once NVML self-heals (1-3 ticks), probe_idx returns to Some, and GPM retry + post-probe operates normally.
+
+```rust
+// Before: probe_idx=None → GPM runs → re-corruption infinite loop
+let probe_idx = phase1.iter().position(|(_, _, m)| m.memory_used.is_some());
+for (mig_handle, gi_id, metrics) in &mut phase1 { ... }  // GPM always runs
+if let Some(idx) = probe_idx { ... }                       // no probe → skip
+
+// After: probe_idx=None → skip GPM entirely → NVML recovery opportunity
+if let Some(pidx) = probe_idx {
+    for (mig_handle, gi_id, metrics) in &mut phase1 { ... }  // GPM runs
+    // post-probe (pidx guaranteed)
+    let (probe_handle, _, _) = &phase1[pidx];
+    ...
+}
+// else: skip GPM → break corruption cycle
+```
+
+**Change 2: Reuse `proc_seen_pids` to eliminate per-tick HashSet allocation** (`nvml.rs`)
+
+Instead of allocating a new `HashSet<u32>` for `proc_name_cache` pruning, reuse the idle `proc_seen_pids` RefCell after collect phases complete.
+
+**Change 3: Cap `none_count` at TTL+1** (`metrics.rs`)
+
+Fixed `push_with_ttl` where `none_count` incremented indefinitely after TTL expiry. Capped at `TTL+1` to prevent pointless increments on permanently unavailable metrics.
+
+##### Changed Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/nvml.rs` | Phase 1.5 GPM skip when `probe_idx=None` + `proc_seen_pids` reuse |
+| `src/gpu/metrics.rs` | `none_count` TTL+1 cap |
+
+##### Verification Matrix
+
+| Verification Item | Method | Expected Result |
+|-------------------|--------|-----------------|
+| VRAM recovery on delayed GPM corruption | Long-running MIG, delayed corruption scenario | probe_idx=None → GPM skip → 1-3 tick NVML recovery → VRAM normal |
+| proc_name_cache cleanup allocation | Per-tick heap allocation tracking | Zero new HashSet allocations (proc_seen_pids reuse) |
+| none_count overflow prevention | Long-running permanent N/A metric | none_count ≤ TTL+1 (11) fixed |
+| cargo clippy | Check warnings | No new warnings ✓ |
+
+##### Resource Leak Audit Results
+
+| Resource | v0.3.12 Status | v0.3.13 Fix |
+|----------|---------------|-------------|
+| GPM corruption infinite loop | **probe_idx=None → GPM re-runs → re-corruption** | ✓ GPM skip breaks cycle |
+| proc_name_cache cleanup HashSet | New HashSet allocation every tick | ✓ proc_seen_pids reuse |
+| none_count unbounded increment | u32 increments indefinitely (harmless but wasteful) | ✓ Capped at TTL+1 |
+
+##### v0.3.10 → v0.3.13 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.10: Phase 1.5 GPM 2-phase separation | Phase 1 VRAM collected before GPM → same-tick VRAM protected | `nvml.rs` MIG collection |
+| v0.3.11: VRAM TTL 10s + memory_total cache | Sustained tracking through extended GPM aftereffects + stable scale | `app.rs` carry-forward |
+| v0.3.12: post-probe corruption detection + permanent GPM disable | Same-tick immediate corruption → GPM blocked | `nvml.rs` Phase 1.5 |
+| **v0.3.13: GPM skip on probe_idx=None** | **Delayed corruption (next tick) → breaks re-corruption infinite loop** | `nvml.rs` Phase 1.5 |
+| **v0.3.13: Per-tick allocation optimization** | **proc_seen_pids reuse + none_count cap** | `nvml.rs`, `metrics.rs` |
+
+v0.3.12 provides "GPM corruption auto-detect + permanent disable"; v0.3.13 provides "GPM delayed corruption infinite loop fix + long-running micro-optimization".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -2204,6 +2311,9 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | PID dedup HashSet reuse | `nvml.rs` | `RefCell<HashSet<u32>>` field reuse, zero allocation after first tick (clear only) |
 | BAR_TABLE lookup table | `dashboard.rs` | `thread_local!` bar string table, rebuilds only on terminal resize, zero bar allocations per draw even on 128 cores |
 | RAM chart fractional cell bg color | `dashboard.rs` | Used fractional character empty upper → `cell.set_bg(Color::Blue)` applied, ensures visual continuity at used-cached boundary |
+| GPM skip on delayed corruption | `nvml.rs` | When `probe_idx=None` (all MIG memory_info failed), skips GPM execution entirely to break re-corruption infinite loop, auto-resumes after NVML self-heals |
+| proc_name_cache HashSet reuse | `nvml.rs` | Reuses `proc_seen_pids` RefCell for pruning instead of allocating new HashSet each tick |
+| none_count TTL cap | `metrics.rs` | `push_with_ttl` none_count capped at TTL+1 → prevents pointless u32 increments on permanently N/A metrics |
 
 ### Long-Running Memory Profile
 

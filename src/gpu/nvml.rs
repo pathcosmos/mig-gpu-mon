@@ -211,15 +211,19 @@ impl NvmlCollector {
         self.prune_stale_caches(&active_handles);
         drop(active_handles);
 
-        // Prune process name cache — keep only PIDs seen this tick
-        // Use HashSet for O(n+m) instead of O(n·m) nested iteration
+        // Prune process name cache — keep only PIDs seen this tick.
+        // Reuse proc_seen_pids (no longer borrowed after collect phases) to avoid
+        // allocating a fresh HashSet every tick.
         {
             let mut name_cache = self.proc_name_cache.borrow_mut();
             if !name_cache.is_empty() {
-                let active_pids: HashSet<u32> = all_metrics
-                    .iter()
-                    .flat_map(|m| m.top_processes.iter().map(|p| p.pid))
-                    .collect();
+                let mut active_pids = self.proc_seen_pids.borrow_mut();
+                active_pids.clear();
+                active_pids.extend(
+                    all_metrics
+                        .iter()
+                        .flat_map(|m| m.top_processes.iter().map(|p| p.pid)),
+                );
                 name_cache.retain(|pid, _| active_pids.contains(pid));
                 let target = name_cache.len().max(16) * 2;
                 if name_cache.capacity() > target * 2 {
@@ -346,6 +350,12 @@ impl NvmlCollector {
             //
             // SAFETY: Post-GPM probe detects corruption. If memory_info() worked in Phase 1
             // but fails after GPM, the parent is permanently disabled for GPM to protect VRAM.
+            //
+            // CRITICAL: If ALL MIG devices failed memory_info in Phase 1 (probe_idx == None),
+            // skip GPM entirely for this tick. Without a probe target, corruption from a
+            // previous tick's GPM cannot be detected, and running GPM again would re-corrupt
+            // NVML state every tick — creating an infinite corruption loop where memory_info
+            // never recovers. Skipping GPM breaks the cycle and lets NVML self-heal.
             {
                 let parent_key = parent_handle as usize;
                 let parent_info = self.get_device_info(parent_device, false);
@@ -354,27 +364,28 @@ impl NvmlCollector {
                     // Find a MIG device where memory_info succeeded in Phase 1 — use as probe target
                     let probe_idx = phase1.iter().position(|(_, _, m)| m.memory_used.is_some());
 
-                    for (mig_handle, gi_id, metrics) in &mut phase1 {
-                        if metrics.memory_util.is_some() {
-                            continue;
-                        }
-                        if let Some(gi_id) = gi_id {
-                            let gpm_val = self.get_dram_bw_util_gpm(
-                                *mig_handle,
-                                true,
-                                Some(*gi_id),
-                                Some(parent_handle),
-                            );
-                            if let Some(val) = gpm_val {
-                                metrics.memory_util = Some(val);
+                    if let Some(pidx) = probe_idx {
+                        // At least one MIG device has valid VRAM — safe to run GPM
+                        for (mig_handle, gi_id, metrics) in &mut phase1 {
+                            if metrics.memory_util.is_some() {
+                                continue;
+                            }
+                            if let Some(gi_id) = gi_id {
+                                let gpm_val = self.get_dram_bw_util_gpm(
+                                    *mig_handle,
+                                    true,
+                                    Some(*gi_id),
+                                    Some(parent_handle),
+                                );
+                                if let Some(val) = gpm_val {
+                                    metrics.memory_util = Some(val);
+                                }
                             }
                         }
-                    }
 
-                    // Post-GPM corruption probe: re-try memory_info on a device that
-                    // succeeded in Phase 1. If it fails now, GPM corrupted NVML state.
-                    if let Some(idx) = probe_idx {
-                        let (probe_handle, _, _) = &phase1[idx];
+                        // Post-GPM corruption probe: re-try memory_info on a device that
+                        // succeeded in Phase 1. If it fails now, GPM corrupted NVML state.
+                        let (probe_handle, _, _) = &phase1[pidx];
                         let probe_dev = Device::new(*probe_handle, &self.nvml);
                         if probe_dev.memory_info().is_err() {
                             // GPM corrupted memory_info — disable GPM for this parent permanently
@@ -391,6 +402,8 @@ impl NvmlCollector {
                             }
                         }
                     }
+                    // else: All MIG memory_info failed — skip GPM to break corruption cycle.
+                    // NVML will self-heal within a few ticks, then probe_idx will be Some again.
                 }
             }
 
