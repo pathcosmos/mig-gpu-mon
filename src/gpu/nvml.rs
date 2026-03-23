@@ -588,8 +588,14 @@ impl NvmlCollector {
 
         // Take sample
         let ret = if is_mig {
-            let parent = parent_handle?;
-            let gi_id = gpu_instance_id?;
+            // Must free new_sample before early return — `?` would leak it
+            let (parent, gi_id) = match (parent_handle, gpu_instance_id) {
+                (Some(p), Some(g)) => (p, g),
+                _ => {
+                    self.raw_lib.nvmlGpmSampleFree(new_sample);
+                    return None;
+                }
+            };
             self.raw_lib.nvmlGpmMigSampleGet(parent, gi_id, new_sample)
         } else {
             self.raw_lib.nvmlGpmSampleGet(device_handle, new_sample)
@@ -950,8 +956,9 @@ impl NvmlCollector {
 
 impl Drop for NvmlCollector {
     fn drop(&mut self) {
-        let prev_map = self.gpm_prev_samples.borrow();
-        for &sample in prev_map.values() {
+        // Drain the map to prevent double-free if prune_stale_caches freed some samples earlier.
+        // get_mut() avoids RefCell borrow (we have &mut self in drop).
+        for (_, sample) in self.gpm_prev_samples.get_mut().drain() {
             if !sample.is_null() {
                 unsafe {
                     let _ = self.raw_lib.nvmlGpmSampleFree(sample);

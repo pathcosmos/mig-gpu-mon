@@ -54,6 +54,10 @@ src/
 - **3단계 MIG utilization 폴백**: (1) `utilization_rates()` → (2) `nvmlDeviceGetProcessUtilization()` → (3) `nvmlDeviceGetSamples(GPU_UTIL)` + MIG 슬라이스 비율 스케일링
 - 드라이버 535.x에서 모든 표준 utilization API가 MIG에서 실패 → 부모 GPU의 `nvmlDeviceGetSamples` raw 값(/10000)을 MIG `gpuInstanceSliceCount` 비율로 환산
 - `gpu_util`, `memory_util`은 `Option<u32>` — API 실패 시 0% 대신 "N/A" 표시로 오해 방지
+- **VRAM carry-forward**: `memory_used`는 TTL 10회 제한 carry-forward, `memory_total`은 정적값이므로 `last_known_vram_total` 캐시로 무제한 복원 → 스파크라인 스케일(vram_max) 안정성 보장
+- **스파크라인 TTL 후 push(0)**: carry-forward TTL 만료 시 push 중단 대신 0을 push → 그래프 동결 방지, 하강으로 데이터 소실 시각 표시
+- **GPM 샘플 수명 관리**: `get_dram_bw_util_gpm`에서 조기 리턴 전 반드시 free, Drop은 `drain()` 패턴으로 double-free 방지
+- **update_metrics O(1) 조회**: `prev_by_uuid` HashMap으로 이전 메트릭 O(1) 인덱스 참조, history는 `entry()` API로 단일 해시
 - **GPM DRAM BW Util 폴백**: Hopper+ GPU에서 `nvmlGpmMigSampleGet()` → `NVML_GPM_METRIC_DRAM_BW_UTIL`로 MIG 메모리 컨트롤러 utilization 수집. Ampere에서는 GPM 미지원 → "N/A" 유지. 이전 tick 샘플과 현재 샘플 간 delta 계산 방식 (첫 tick은 None)
 - 모든 확장 메트릭(clock, PCIe, ECC, throttle 등)은 `.ok()`로 래핑 → MIG/vGPU에서 실패 시 `None`으로 graceful 처리
 - 정적 메트릭(architecture, CC, temp thresholds, MIG slice count 등)은 `DeviceInfo` 캐시에 1회만 수집

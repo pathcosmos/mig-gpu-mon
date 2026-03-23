@@ -111,7 +111,9 @@ impl GpuMetrics {
 
 /// Max consecutive ticks to carry forward last value in sparkline history.
 /// Matches VRAM_CARRY_FORWARD_TTL in app.rs for consistent behavior.
-const SPARKLINE_CARRY_FORWARD_TTL: u32 = 3;
+/// After TTL, pushes zero instead of skipping — keeps sparkline advancing
+/// (visual drop signals data loss) rather than freezing in place.
+const SPARKLINE_CARRY_FORWARD_TTL: u32 = 10;
 
 /// Time-series history for a single GPU/MIG instance.
 /// Uses VecDeque for O(1) push/pop ring buffer instead of Vec::remove(0) O(n).
@@ -186,9 +188,10 @@ impl MetricsHistory {
     }
 
     /// Push value if Some; on None, repeat last value for up to SPARKLINE_CARRY_FORWARD_TTL ticks.
-    /// After TTL, stops pushing — sparkline gap signals data unavailability.
+    /// After TTL, pushes zero — sparkline keeps advancing with a visible drop to signal data loss,
+    /// rather than freezing in place (which looks like a hang, not a data issue).
     /// Does nothing if the metric has never been observed (no data yet).
-    fn push_with_ttl<T: Copy>(buf: &mut VecDeque<T>, val: Option<T>, max: usize, none_count: &mut u32) {
+    fn push_with_ttl<T: Copy + Default>(buf: &mut VecDeque<T>, val: Option<T>, max: usize, none_count: &mut u32) {
         match val {
             Some(v) => {
                 *none_count = 0;
@@ -200,8 +203,10 @@ impl MetricsHistory {
                     if let Some(&last) = buf.back() {
                         Self::push_ring(buf, last, max);
                     }
+                } else if !buf.is_empty() {
+                    // After TTL: push zero to keep sparkline advancing (visual drop = data loss)
+                    Self::push_ring(buf, T::default(), max);
                 }
-                // After TTL: skip push → sparkline stops growing, signaling data loss
             }
         }
     }

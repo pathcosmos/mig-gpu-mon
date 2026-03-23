@@ -1797,6 +1797,171 @@ All caches/buffers properly pruned; no unbounded growth confirmed for long-runni
 
 v0.3.9 provides "RAM chart visual accuracy fix"; v0.3.10 provides "Mem Ctrl. GPM safe restoration + per-tick redundancy elimination".
 
+#### v0.3.11 — VRAM Tracking Stability + GPM Resource Leak Fix + Long-Running Optimization
+
+##### Problem Symptoms
+
+1. **VRAM tracking stops after ~3 seconds**: On MIG, `memory_info()` succeeds initially then transitions to "N/A", sparkline freezes
+2. **Abrupt VRAM graph scale jumps**: When VRAM goes "N/A", `vram_max` collapses to 1MB → existing history rendered with distorted scale
+3. **GPM sample memory leak**: On MIG, early `?` return when `parent_handle`/`gpu_instance_id` is None leaks allocated sample
+4. **NvmlCollector Drop double-free**: `prune_stale_caches()` frees samples, then Drop frees them again
+
+##### Root Cause Analysis
+
+Phase 1.5's `nvmlGpmMigSampleGet()` corrupts NVML driver state, causing the **next tick's** Phase 1 `memory_info()` to fail. First tick succeeds (pre-GPM state), but from tick 2 onward, GPM aftereffects cause consecutive failures → 3-second carry-forward expires → dual TTL (app.rs + metrics.rs) expires simultaneously → complete VRAM freeze.
+
+Simultaneously, `memory_total` becomes `None` → `dashboard.rs` `.unwrap_or(1)` → `vram_max=1MB` → thousands of MB in history rendered at distorted scale.
+
+##### Fix Details (7 changes)
+
+**Change 1: VRAM carry-forward TTL 3→10** (`app.rs`, `metrics.rs`)
+
+```rust
+// Before: Data lost if GPM aftereffects don't recover within 3s
+const VRAM_CARRY_FORWARD_TTL: u32 = 3;
+const SPARKLINE_CARRY_FORWARD_TTL: u32 = 3;
+
+// After: 10s tolerance for GPM state recovery
+const VRAM_CARRY_FORWARD_TTL: u32 = 10;
+const SPARKLINE_CARRY_FORWARD_TTL: u32 = 10;
+```
+
+**Change 2: Indefinite `memory_total` carry-forward (no TTL)** (`app.rs`)
+
+```rust
+// memory_total is essentially static per GPU — cached indefinitely
+last_known_vram_total: HashMap<Rc<str>, u64>,
+
+// Each tick: cache valid value, restore from cache on None
+if let Some(total) = m.memory_total {
+    self.last_known_vram_total.insert(m.uuid.clone(), total);
+} else if let Some(&cached) = self.last_known_vram_total.get(&m.uuid) {
+    m.memory_total = Some(cached);
+}
+```
+
+Prevents `vram_max` from collapsing to `unwrap_or(1)`, keeping graph scale stable.
+
+**Change 3: Push zero after TTL — prevent sparkline freeze** (`metrics.rs`)
+
+```rust
+// Before: Stop pushing after TTL → sparkline freezes (looks like a hang)
+// After: Push 0 after TTL → sparkline keeps advancing (descent = data loss visual)
+fn push_with_ttl<T: Copy + Default>(...) {
+    None => {
+        if *none_count <= TTL { /* carry forward */ }
+        else if !buf.is_empty() {
+            Self::push_ring(buf, T::default(), max); // push 0
+        }
+    }
+}
+```
+
+**Change 4: GPM sample leak fix** (`nvml.rs`)
+
+```rust
+// Before: `?` operator returns None without freeing allocated new_sample
+let parent = parent_handle?;   // None leaks new_sample!
+let gi_id = gpu_instance_id?;  // Same leak
+
+// After: Explicit free before return via match
+let (parent, gi_id) = match (parent_handle, gpu_instance_id) {
+    (Some(p), Some(g)) => (p, g),
+    _ => {
+        self.raw_lib.nvmlGpmSampleFree(new_sample);
+        return None;
+    }
+};
+```
+
+**Change 5: Drop double-free fix** (`nvml.rs`)
+
+```rust
+// Before: borrow() + iterate → double-free on samples already freed by prune
+let prev_map = self.gpm_prev_samples.borrow();
+for &sample in prev_map.values() { nvmlGpmSampleFree(sample); }
+
+// After: get_mut() + drain() → empties map while freeing once
+for (_, sample) in self.gpm_prev_samples.get_mut().drain() {
+    if !sample.is_null() { nvmlGpmSampleFree(sample); }
+}
+```
+
+**Change 6: O(n²) prev metrics lookup → O(1) HashMap** (`app.rs`)
+
+```rust
+// Before: Linear scan per GPU via iter().find()
+if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) { ... }
+
+// After: Pre-built HashMap for O(1) index lookup
+let prev_by_uuid: HashMap<&Rc<str>, usize> =
+    self.metrics.iter().enumerate().map(|(i, m)| (&m.uuid, i)).collect();
+if let Some(&idx) = prev_by_uuid.get(&m.uuid) {
+    let prev = &self.metrics[idx]; ...
+}
+```
+
+**Change 7: History entry API + conditional HashSet** (`app.rs`)
+
+```rust
+// Before: contains_key + insert + get_mut (3 hash ops)
+if !self.history.contains_key(&m.uuid) {
+    self.history.insert(m.uuid.clone(), MetricsHistory::new(MAX_HISTORY));
+}
+self.history.get_mut(&m.uuid).unwrap().push(m);
+
+// After: entry API (1 hash op)
+self.history.entry(m.uuid.clone())
+    .or_insert_with(|| MetricsHistory::new(MAX_HISTORY))
+    .push(m);
+
+// Build HashSet only when stale entries exist (history.len() > new_metrics.len())
+if self.history.len() > new_metrics.len() { /* prune */ }
+```
+
+##### Modified Files
+
+| File | Changes | Related |
+|------|---------|---------|
+| `src/app.rs` | TTL 10 + memory_total cache + O(1) lookup + entry API + conditional prune | Changes 1, 2, 6, 7 |
+| `src/gpu/metrics.rs` | TTL 10 + push(0) after TTL + `Default` trait bound | Changes 1, 3 |
+| `src/gpu/nvml.rs` | GPM sample leak fix + Drop drain pattern | Changes 4, 5 |
+
+##### Cross-Verification Matrix
+
+| Verification Item | Method | Expected Result |
+|-------------------|--------|-----------------|
+| VRAM tracks beyond 10s | Long-running on MIG | GPM aftereffects → 10s carry-forward → most recoveries succeed |
+| vram_max scale stable | memory_info failure scenario | memory_total cache → unwrap_or(1) unreachable |
+| Sparkline keeps advancing | After TTL expiry | Push 0 shows descent, no freeze |
+| No GPM sample leak | MIG + parent_handle=None scenario | Free before early return confirmed |
+| No Drop double-free | Shutdown with ASAN/valgrind | drain() frees once only |
+| O(1) lookup perf | 8+ GPU environment | Linear scan eliminated vs iter().find() |
+| cargo clippy | Check warnings | No new warnings ✓ |
+
+##### Resource Leak Audit Results
+
+| Resource | v0.3.10 Status | v0.3.11 Fix |
+|----------|---------------|-------------|
+| GPM sample (MIG `?` return) | **Leak** — alloc without free on return | ✓ match pattern with explicit free |
+| GPM sample (Drop) | **Double-free risk** — freed by prune then Drop | ✓ drain() empties map, frees once |
+| memory_total cache | None — vram_max=1 collapse | ✓ last_known_vram_total indefinite cache |
+| prev metrics lookup | O(n²) linear scan | ✓ HashMap O(1) |
+| history HashMap | 3 hash ops per GPU | ✓ entry API, 1 hash op |
+| UUID HashSet | Built every tick | ✓ Built only when stale entries exist |
+
+##### v0.3.10 → v0.3.11 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.10: Phase 1.5 GPM safe restoration | GPM call after Phase 1 protects VRAM | `nvml.rs` MIG collection |
+| **v0.3.11: VRAM TTL 10s + memory_total cache** | **Sustained tracking through extended GPM aftereffects + stable scale** | `app.rs` carry-forward |
+| **v0.3.11: Sparkline push(0)** | **Graph descent instead of freeze after TTL** | `metrics.rs` push_with_ttl |
+| **v0.3.11: GPM sample safety** | **Memory leak + double-free elimination** | `nvml.rs` get_dram_bw_util_gpm + Drop |
+| **v0.3.11: O(1) lookup + entry API** | **Linear tick overhead as GPU count grows** | `app.rs` update_metrics |
+
+v0.3.10 provides "Mem Ctrl. GPM safe restoration"; v0.3.11 provides "VRAM tracking stability + GPM resource safety + long-running optimization".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -2008,7 +2173,13 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | Process name caching + dead PID cleanup | `nvml.rs` | `/proc/{pid}/comm` I/O cached (`HashMap<u32, Rc<str>>`), dead PIDs not in current top-5 auto-removed each tick, cache hit returns `Rc::clone()` only (zero heap alloc) |
 | `throttle_reasons` `Cow<'static, str>` | `nvml.rs` | "None", "Idle" etc. frequent single flags use `Cow::Borrowed` zero-alloc, only compound flags use `Cow::Owned` |
 | Top Processes PID liveness carry-forward | `app.rs` | On NVML process API intermittent failure, checks `/proc/{pid}` existence and retains only alive processes, terminated processes removed immediately |
-| VRAM carry-forward TTL (3 attempts) | `app.rs` | Retains previous VRAM on `memory_info()` up to 3 consecutive failures, switches to None("N/A") beyond that → prevents indefinite stale high value display |
+| VRAM carry-forward TTL (10 attempts) | `app.rs` | Retains previous VRAM on `memory_info()` up to 10 consecutive failures (GPM aftereffect recovery margin), switches to None("N/A") beyond that → prevents indefinite stale high value display |
+| `memory_total` indefinite cache | `app.rs` | GPU's essentially static memory_total preserved in `last_known_vram_total` indefinitely → vram_max scale stable even when memory_info() fails |
+| GPM sample early-return safe free | `nvml.rs` | Frees allocated GPM sample before returning None when MIG parent_handle/gi_id is missing → prevents per-tick leak |
+| GPM Drop drain pattern | `nvml.rs` | `get_mut().drain()` empties map while freeing once → prevents double-free after prune_stale_caches |
+| Sparkline post-TTL push(0) | `metrics.rs` | Pushes zero instead of stopping after TTL → graph keeps advancing with descent visual instead of freezing |
+| prev metrics O(1) HashMap lookup | `app.rs` | iter().find() O(n²) → HashMap index O(1), reduces tick overhead on 8+ GPU setups |
+| history entry API | `app.rs` | contains_key+insert+get_mut 3 hash ops → entry() single hash op |
 | `/proc/{pid}` path buffer reuse | `app.rs` | Reuses `proc_path_buf: String` instead of per-PID format! heap allocation, prevents ~2.7 billion allocations over 300 hours |
 | datetime format cache | `dashboard.rs` | `thread_local!` cache re-formats only when second changes (saves 1 String allocation/tick) |
 | device_cache defensive shrink | `nvml.rs` | Prevents unbounded HashMap capacity growth on repeated MIG reconfigs → auto-shrink when `capacity > len*4` |
@@ -2017,7 +2188,7 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | sysinfo targeted refresh | `main.rs` | Only `refresh_cpu_usage()` + `refresh_memory()` called, no process accumulation |
 | `active_handles` HashSet reuse | `nvml.rs` | `RefCell<HashSet<usize>>` reuse + O(1) contains lookup, prune_stale_caches O(n²)→O(n) |
 | history/vram_fail_count UUID HashSet cleanup | `app.rs` | GPU removal detection changes double `.any()` O(n×m) → HashSet O(n) single pass |
-| Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None caused stale sparklines → `none_counts[9]` per-metric array with 3-tick limit, stops pushing after expiry |
+| Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None caused stale sparklines → `none_counts[9]` per-metric array with 10-tick limit, pushes zero after expiry (descent visual instead of freeze) |
 | `get_process_utilization` failure/idle distinction | `nvml.rs` | API failure `(0, 0)` indistinguishable from idle 0% → `Option<(u32, u32)>` return, idle 0% reported normally while failure proceeds to next fallback |
 | `collect_all()` per-device error isolation | `nvml.rs` | Single GPU `device_by_index` error stopped entire metric collection → skips failed GPU only, remaining GPUs collected normally |
 | GPM MIG Phase 2 removal | `nvml.rs` | `nvmlGpmMigSampleGet()` cross-tick corruption caused permanent `memory_info()` failure → eliminated, VRAM stability ensured |

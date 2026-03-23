@@ -1798,6 +1798,171 @@ if self.history.len() != uuid_set.len()
 
 v0.3.9는 "RAM 차트 시각적 정확성 수정", v0.3.10은 "Mem Ctrl. GPM 안전 복원 + per-tick 중복 작업 제거".
 
+#### v0.3.11 — VRAM 추적 안정성 + GPM 자원 누수 수정 + 장기 운영 최적화
+
+##### 문제 현상
+
+1. **VRAM 추적 3초 후 멈춤**: MIG 환경에서 `memory_info()` 초반 몇 초 수집 후 "N/A"로 전환, 스파크라인 동결
+2. **VRAM 그래프 급격한 스케일 점프**: VRAM "N/A" 전환 시 `vram_max`가 1MB로 붕괴 → 기존 히스토리 렌더링 왜곡
+3. **GPM 샘플 메모리 누수**: MIG에서 `parent_handle?`/`gpu_instance_id?` 조기 리턴 시 할당된 샘플 미해제
+4. **NvmlCollector Drop double-free**: `prune_stale_caches()`에서 free 후 Drop에서 재 free
+
+##### 근본 원인 분석
+
+Phase 1.5의 `nvmlGpmMigSampleGet()`이 NVML 드라이버 상태를 오염시켜 **다음 tick**의 Phase 1 `memory_info()`가 실패. 첫 tick은 GPM 이전 상태이므로 성공하지만, 2번째 tick부터 GPM 후유증으로 연속 실패 시작 → 3초 carry-forward 만료 → 이중 TTL(app.rs + metrics.rs) 동시 만료로 VRAM 완전 멈춤.
+
+동시에 `memory_total`도 `None` → `dashboard.rs`의 `.unwrap_or(1)` → `vram_max=1MB` → 기존 수천 MB 히스토리가 스케일 왜곡.
+
+##### 수정 내용 (7개 변경)
+
+**변경 1: VRAM carry-forward TTL 3→10 확대** (`app.rs`, `metrics.rs`)
+
+```rust
+// Before: GPM 후유증 3초 내 미복구 시 데이터 소실
+const VRAM_CARRY_FORWARD_TTL: u32 = 3;
+const SPARKLINE_CARRY_FORWARD_TTL: u32 = 3;
+
+// After: GPM 상태 복구에 충분한 10초 여유
+const VRAM_CARRY_FORWARD_TTL: u32 = 10;
+const SPARKLINE_CARRY_FORWARD_TTL: u32 = 10;
+```
+
+**변경 2: `memory_total` 무제한 carry-forward (TTL 없음)** (`app.rs`)
+
+```rust
+// memory_total은 GPU당 사실상 정적값 — 별도 캐시로 무제한 복원
+last_known_vram_total: HashMap<Rc<str>, u64>,
+
+// 매 tick: 유효값 캐시, None 시 캐시에서 복원
+if let Some(total) = m.memory_total {
+    self.last_known_vram_total.insert(m.uuid.clone(), total);
+} else if let Some(&cached) = self.last_known_vram_total.get(&m.uuid) {
+    m.memory_total = Some(cached);
+}
+```
+
+`vram_max`가 `unwrap_or(1)`로 붕괴하지 않아 그래프 스케일 안정.
+
+**변경 3: TTL 만료 후 push(0) — 스파크라인 동결 방지** (`metrics.rs`)
+
+```rust
+// Before: TTL 후 push 중단 → 스파크라인 동결 (정체처럼 보임)
+// After: TTL 후 0 push → 스파크라인 계속 전진 (하강 = 데이터 소실 시각 표시)
+fn push_with_ttl<T: Copy + Default>(...) {
+    None => {
+        if *none_count <= TTL { /* carry forward */ }
+        else if !buf.is_empty() {
+            Self::push_ring(buf, T::default(), max); // 0 push
+        }
+    }
+}
+```
+
+**변경 4: GPM 샘플 누수 수정** (`nvml.rs`)
+
+```rust
+// Before: `?` 연산자로 조기 리턴 시 allocated new_sample 누수
+let parent = parent_handle?;   // None이면 new_sample 미해제!
+let gi_id = gpu_instance_id?;  // 동일 누수
+
+// After: match로 명시적 free 후 리턴
+let (parent, gi_id) = match (parent_handle, gpu_instance_id) {
+    (Some(p), Some(g)) => (p, g),
+    _ => {
+        self.raw_lib.nvmlGpmSampleFree(new_sample);
+        return None;
+    }
+};
+```
+
+**변경 5: Drop double-free 수정** (`nvml.rs`)
+
+```rust
+// Before: borrow() + iterate → prune_stale_caches에서 이미 free된 포인터 재 free
+let prev_map = self.gpm_prev_samples.borrow();
+for &sample in prev_map.values() { nvmlGpmSampleFree(sample); }
+
+// After: get_mut() + drain() → 맵 비우면서 1회만 free
+for (_, sample) in self.gpm_prev_samples.get_mut().drain() {
+    if !sample.is_null() { nvmlGpmSampleFree(sample); }
+}
+```
+
+**변경 6: O(n²) prev 메트릭 조회 → O(1) HashMap** (`app.rs`)
+
+```rust
+// Before: 매 GPU마다 iter().find() 선형 탐색
+if let Some(prev) = self.metrics.iter().find(|p| p.uuid == m.uuid) { ... }
+
+// After: 사전 빌드 HashMap으로 O(1) 인덱스 조회
+let prev_by_uuid: HashMap<&Rc<str>, usize> =
+    self.metrics.iter().enumerate().map(|(i, m)| (&m.uuid, i)).collect();
+if let Some(&idx) = prev_by_uuid.get(&m.uuid) {
+    let prev = &self.metrics[idx]; ...
+}
+```
+
+**변경 7: history entry API + 조건부 HashSet** (`app.rs`)
+
+```rust
+// Before: contains_key + insert + get_mut (3회 해시)
+if !self.history.contains_key(&m.uuid) {
+    self.history.insert(m.uuid.clone(), MetricsHistory::new(MAX_HISTORY));
+}
+self.history.get_mut(&m.uuid).unwrap().push(m);
+
+// After: entry API (1회 해시)
+self.history.entry(m.uuid.clone())
+    .or_insert_with(|| MetricsHistory::new(MAX_HISTORY))
+    .push(m);
+
+// GPU 제거 시에만 HashSet 빌드 (history.len() > new_metrics.len())
+if self.history.len() > new_metrics.len() { /* prune */ }
+```
+
+##### 수정 파일
+
+| 파일 | 변경 | 관련 변경 |
+|------|------|----------|
+| `src/app.rs` | TTL 10 + memory_total 캐시 + O(1) lookup + entry API + 조건부 prune | 변경 1, 2, 6, 7 |
+| `src/gpu/metrics.rs` | TTL 10 + push(0) 후 TTL 만료 + `Default` trait bound | 변경 1, 3 |
+| `src/gpu/nvml.rs` | GPM 샘플 누수 수정 + Drop drain 패턴 | 변경 4, 5 |
+
+##### 교차 검증 매트릭스
+
+| 검증 항목 | 방법 | 기대 결과 |
+|----------|------|----------|
+| VRAM 10초 이상 추적 | MIG 환경 장시간 실행 | GPM 후유증 10초 carry-forward → 대부분 복구 |
+| vram_max 스케일 안정 | memory_info 실패 시나리오 | memory_total 캐시 → unwrap_or(1) 도달 불가 |
+| 스파크라인 계속 전진 | TTL 만료 후 확인 | 0 push로 하강 표시, 동결 없음 |
+| GPM 샘플 누수 없음 | MIG + parent_handle=None 시나리오 | 조기 리턴 전 free 확인 |
+| Drop double-free 없음 | 종료 시 ASAN/valgrind | drain()으로 1회만 free |
+| O(1) lookup 성능 | GPU 8개 이상 환경 | iter().find() 대비 선형 스캔 제거 |
+| cargo clippy | 경고 확인 | 신규 경고 없음 ✓ |
+
+##### 자원 누수 감사 결과
+
+| 자원 | v0.3.10 상태 | v0.3.11 수정 |
+|------|-------------|-------------|
+| GPM 샘플 (MIG `?` 리턴) | **누수** — 할당 후 free 없이 리턴 | ✓ match 패턴으로 명시적 free |
+| GPM 샘플 (Drop) | **double-free 위험** — prune 후 재 free | ✓ drain()으로 맵 비우며 1회 free |
+| memory_total 캐시 | 없음 — None 시 vram_max=1 | ✓ last_known_vram_total 무제한 캐시 |
+| prev 메트릭 조회 | O(n²) 선형 스캔 | ✓ HashMap O(1) |
+| history HashMap | 3회 해시 per GPU | ✓ entry API 1회 해시 |
+| UUID HashSet | 매 tick 빌드 | ✓ stale 엔트리 존재 시에만 빌드 |
+
+##### v0.3.10 → v0.3.11 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.10: Phase 1.5 GPM 안전 복원 | Phase 1 이후 GPM 호출로 VRAM 보호 | `nvml.rs` MIG 수집 |
+| **v0.3.11: VRAM TTL 10초 + memory_total 캐시** | **GPM 후유증 장기 실패 시에도 추적 유지 + 스케일 안정** | `app.rs` carry-forward |
+| **v0.3.11: 스파크라인 push(0)** | **TTL 만료 후 그래프 동결 대신 하강 표시** | `metrics.rs` push_with_ttl |
+| **v0.3.11: GPM 샘플 안전성** | **메모리 누수 + double-free 제거** | `nvml.rs` get_dram_bw_util_gpm + Drop |
+| **v0.3.11: O(1) 조회 + entry API** | **GPU 수 증가 시 tick 오버헤드 선형 유지** | `app.rs` update_metrics |
+
+v0.3.10은 "Mem Ctrl. GPM 안전 복원", v0.3.11은 "VRAM 추적 안정성 + GPM 자원 안전성 + 장기 운영 최적화".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -2009,7 +2174,13 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | 프로세스명 캐싱 + dead PID 정리 | `nvml.rs` | `/proc/{pid}/comm` I/O 캐싱 (`HashMap<u32, Rc<str>>`), 매 tick 현재 top-5에 없는 PID 자동 제거, 캐시 히트 시 `Rc::clone()`만 (힙 할당 0) |
 | `throttle_reasons` `Cow<'static, str>` | `nvml.rs` | "None", "Idle" 등 빈번한 단일 플래그는 `Cow::Borrowed` 제로 할당, 복합 플래그만 `Cow::Owned` |
 | Top Processes PID 생존 확인 carry-forward | `app.rs` | NVML 프로세스 API 간헐적 실패 시 `/proc/{pid}` 존재 확인 후 살아있는 프로세스만 유지, 종료된 프로세스는 즉시 제거 |
-| VRAM carry-forward TTL (3회) | `app.rs` | `memory_info()` 연속 실패 3회까지 이전 값 유지, 초과 시 None("N/A") 전환 → 오래된 높은 값 무기한 표시 방지 |
+| VRAM carry-forward TTL (10회) | `app.rs` | `memory_info()` 연속 실패 10회까지 이전 값 유지 (GPM 후유증 복구 여유), 초과 시 None("N/A") 전환 → 오래된 높은 값 무기한 표시 방지 |
+| `memory_total` 무제한 캐시 | `app.rs` | GPU당 정적값인 memory_total을 `last_known_vram_total`에 무제한 보존 → memory_info() 실패 시에도 vram_max 스케일 안정 |
+| GPM 샘플 조기 리턴 안전 해제 | `nvml.rs` | MIG GPM에서 parent_handle/gi_id None 시 할당된 샘플을 free 후 리턴 → 매 tick 누수 방지 |
+| GPM Drop drain 패턴 | `nvml.rs` | `get_mut().drain()`으로 맵 비우며 1회만 free → prune_stale_caches 후 double-free 방지 |
+| 스파크라인 TTL 후 push(0) | `metrics.rs` | TTL 만료 후 push 중단 대신 0 push → 그래프 동결 방지, 하강으로 데이터 소실 시각 표시 |
+| prev 메트릭 O(1) HashMap 조회 | `app.rs` | iter().find() O(n²) → HashMap 인덱스 O(1), GPU 8+ 환경에서 tick 오버헤드 감소 |
+| history entry API | `app.rs` | contains_key+insert+get_mut 3회 해시 → entry() 1회 해시로 통합 |
 | `/proc/{pid}` 경로 버퍼 재사용 | `app.rs` | `proc_path_buf: String` 재사용으로 매 PID마다 format! 힙 할당 제거, 300시간 기준 ~27억 회 할당 방지 |
 | datetime 포맷 캐시 | `dashboard.rs` | `thread_local!` 캐시로 초 단위 변경 시에만 `chrono::format()` 호출 (틱당 String 할당 1회 절감) |
 | device_cache 방어적 shrink | `nvml.rs` | MIG 재설정 반복 시 HashMap capacity 무한 증가 방지 → `capacity > len*4` 시 자동 축소 |
@@ -2018,7 +2189,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | sysinfo targeted refresh | `main.rs` | `refresh_cpu_usage()` + `refresh_memory()`만 호출, 프로세스 누적 없음 |
 | `active_handles` HashSet 재사용 | `nvml.rs` | `RefCell<HashSet<usize>>` 재사용 + O(1) contains 조회, prune_stale_caches O(n²)→O(n) |
 | history/vram_fail_count UUID HashSet 정리 | `app.rs` | GPU 제거 감지 시 이중 `.any()` O(n×m) → HashSet O(n) 단일 순회 |
-| Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복으로 스파크라인 정체 → `none_counts[9]` 배열로 메트릭별 3틱 제한, 초과 시 push 중단 |
+| Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복으로 스파크라인 정체 → `none_counts[9]` 배열로 메트릭별 10틱 제한, 초과 시 0 push (동결 대신 하강 표시) |
 | `get_process_utilization` 실패/idle 구분 | `nvml.rs` | API 실패 `(0, 0)` = idle 0% 구분 불가 → `Option<(u32, u32)>` 반환, idle 0%는 정상 보고·실패는 다음 폴백 진행 |
 | `collect_all()` 디바이스별 에러 격리 | `nvml.rs` | 1개 GPU `device_by_index` 에러 시 전체 메트릭 수집 중단 → 해당 GPU만 skip, 나머지 GPU 정상 수집 유지 |
 | GPM MIG Phase 2 제거 | `nvml.rs` | `nvmlGpmMigSampleGet()` cross-tick 오염으로 인한 `memory_info()` 영구 실패 방지, VRAM 안정성 확보 |
