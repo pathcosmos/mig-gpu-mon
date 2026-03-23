@@ -12,6 +12,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
@@ -19,6 +20,9 @@ use app::App;
 use event::{AppEvent, EventHandler};
 use gpu::metrics::SystemMetrics;
 use gpu::nvml::NvmlCollector;
+
+/// Global debug flag — checked by nvml.rs to emit diagnostic logs
+pub static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +37,10 @@ struct Cli {
     /// Custom path to libnvidia-ml.so (override automatic detection)
     #[arg(long, value_name = "PATH")]
     nvml_path: Option<String>,
+
+    /// Enable debug logging to /tmp/mig-gpu-mon-debug.log
+    #[arg(long)]
+    debug: bool,
 }
 
 fn is_wsl() -> bool {
@@ -43,6 +51,13 @@ fn is_wsl() -> bool {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.debug {
+        DEBUG_MODE.store(true, Ordering::Relaxed);
+        // Truncate log file at startup
+        let _ = std::fs::write("/tmp/mig-gpu-mon-debug.log", "");
+        eprintln!("Debug mode ON → /tmp/mig-gpu-mon-debug.log");
+    }
 
     // Initialize NVML
     let collector = match NvmlCollector::new(cli.nvml_path.as_deref()) {

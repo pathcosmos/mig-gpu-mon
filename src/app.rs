@@ -6,8 +6,8 @@ use crate::gpu::metrics::{GpuMetrics, MetricsHistory, SystemHistory, SystemMetri
 const MAX_HISTORY: usize = 300; // 300 ticks = 5 min at 1000ms default interval
 
 /// Max consecutive ticks to carry forward VRAM *used* when memory_info() fails.
-/// GPM (nvmlGpmMigSampleGet) can corrupt NVML state, causing memory_info() to fail
-/// for extended periods (>3s). 10 ticks at 1s interval = 10s tolerance.
+/// memory_info() can fail temporarily on some driver/MIG configurations.
+/// 10 ticks at 1s interval = 10s tolerance.
 /// memory_total is essentially static per GPU and is carried forward indefinitely.
 const VRAM_CARRY_FORWARD_TTL: u32 = 10;
 
