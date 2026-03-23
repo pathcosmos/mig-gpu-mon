@@ -1573,6 +1573,76 @@ static BAR_TABLE: ... = const { RefCell::new(...) };
 
 v0.3.6 provides "VRAM TTL to prevent stagnation"; v0.3.8 provides "GPM corruption prevention at source + long-running per-tick allocation minimization".
 
+#### RAM Segmented Chart Visual Gap Fix (v0.3.9)
+
+##### Symptom
+
+- In the RAM segmented chart, green (used) and blue (cached) areas appear **visually separated**
+- When green proportion decreases, blue does not stay attached to green — a gap appears between the two segments
+- Particularly noticeable when used ratio is low (< 20%)
+
+##### Root Cause Analysis
+
+```
+Location: dashboard.rs draw_ram_segmented_chart()
+```
+
+When used (green) ends with a fractional block character (`▁▂▃▄▅▆▇`), the character only fills the **bottom portion** of the cell. The remaining upper portion of the cell is left as background color (black). Cached (blue) starts from the **next cell** with `█` (full block), so the empty upper portion of the green fractional cell creates a visible gap.
+
+```
+Before (gap present):
+│█│ ← cached (blue, full block)
+│▃│ ← used (green, 3/8 block) — upper 5/8 is empty background
+│█│ ← used (green, full block)
+
+After (seamless):
+│█│ ← cached (blue, full block)
+│▃│ ← used (green fg, blue bg) — lower 3/8 green, upper 5/8 blue
+│█│ ← used (green, full block)
+```
+
+##### Fix Details (1 change)
+
+**Change 1: Apply cached background color to fractional used cell** (`dashboard.rs`)
+
+```rust
+// Before: only fg set, bg defaults to black
+} else if bottom_row == used_rows && used_frac > 0.05 {
+    (bar_chars[(used_frac * 8.0) as usize % 8], used_color)
+
+// After: fg=used_color, bg=Color::Blue (when cached exists)
+} else if bottom_row == used_rows && used_frac > 0.05 {
+    let bg = if has_cached { Color::Blue } else { Color::Reset };
+    (bar_chars[(used_frac * 8.0) as usize % 8], used_color, bg)
+```
+
+Within a single cell, bottom (fg) = green used and top (bg) = blue cached are rendered simultaneously, ensuring visual continuity.
+
+##### Modified Files
+
+| File | Change | Related |
+|------|--------|---------|
+| `src/ui/dashboard.rs` | Fractional used cell bg color + 3-tuple return structure | Change 1 |
+
+##### Cross-Verification Matrix
+
+| Verification Item | Method | Expected Result |
+|-------------------|--------|----------------|
+| used+cached seamless | used 10-30% + cached 50%+ scenario | No gap between green and blue |
+| used 0% (cached only) | Only cached present | Blue rendered from bottom |
+| cached 0% (used only) | Only used present | Green from bottom, bg=Reset |
+| 100% usage | used + cached = 100% | Chart fully filled, no empty space |
+| cargo clippy | Check warnings | No new warnings |
+
+##### v0.3.8 → v0.3.9 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.8: GPM MIG disabled + per-tick alloc minimization | cross-tick corruption prevention + long-running memory | `nvml.rs`, `dashboard.rs` |
+| **v0.3.9: RAM chart fractional cell bg color** | **Eliminates visual gap at used-cached boundary** | `dashboard.rs` RAM segmented chart |
+
+v0.3.8 provides "data collection stability + allocation optimization"; v0.3.9 provides "RAM chart visual accuracy fix".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -1689,6 +1759,7 @@ Total RSS ~4-8 MB
 | Sparkline RightToLeft direction | `dashboard.rs` | All 5 sparklines use `RenderDirection::RightToLeft` → unified right-to-left progression matching RAM segmented chart |
 | RAM chart zero-alloc rendering | `dashboard.rs` | Per-frame `Vec<ColSegment>` allocation → direct iterator + buffer write (zero allocation) |
 | RAM segmented chart stacking fix | `dashboard.rs` | Used fractional row shifted cached start point, causing cached to lose ~1 row per column → introduced `cached_base` to correctly offset cached stacking based on used fraction presence |
+| RAM chart fractional cell bg color | `dashboard.rs` | Used fractional character (`▃▄` etc.) left upper cell portion as background → `cell.set_bg(Color::Blue)` applied, bottom=used(fg) top=cached(bg) seamless display within single cell |
 | RAM calculation accuracy fix | `dashboard.rs` | `used = ram_used - (avail-free)` (double subtraction) → `used = total - available` (correct non-reclaimable memory) |
 | `format_pstate` zero-alloc | `nvml.rs` | `"P0".to_string()` per tick → returns `&'static str` (zero allocation) |
 | `format_architecture` zero-alloc | `nvml.rs` | Same pattern: `"Ampere".to_string()` → `&'static str` |
@@ -1799,6 +1870,7 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | MIG display name caching | `nvml.rs` | MIG name `Rc<str>` created only on first tick, `Rc::clone()` refcount bump thereafter (eliminates per-tick heap alloc per MIG instance) |
 | PID dedup HashSet reuse | `nvml.rs` | `RefCell<HashSet<u32>>` field reuse, zero allocation after first tick (clear only) |
 | BAR_TABLE lookup table | `dashboard.rs` | `thread_local!` bar string table, rebuilds only on terminal resize, zero bar allocations per draw even on 128 cores |
+| RAM chart fractional cell bg color | `dashboard.rs` | Used fractional character empty upper → `cell.set_bg(Color::Blue)` applied, ensures visual continuity at used-cached boundary |
 
 ### Long-Running Memory Profile
 

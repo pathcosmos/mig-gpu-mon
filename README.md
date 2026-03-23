@@ -1574,6 +1574,76 @@ static BAR_TABLE: ... = const { RefCell::new(...) };
 
 v0.3.6은 "VRAM TTL로 정체 방지", v0.3.8은 "GPM 오염 원천 차단 + 장기 운영 per-tick 할당 최소화".
 
+#### RAM 세그먼트 차트 시각적 갭 수정 (v0.3.9)
+
+##### 증상
+
+- RAM 세그먼트 차트에서 녹색(used)과 파란색(cached) 영역이 **분리되어 표시**됨
+- 녹색 비중이 줄어들어도 파란색이 녹색에 밀착되지 않고, 두 영역 사이에 빈 공간 발생
+- 특히 used 비율이 낮을 때(< 20%) 갭이 두드러짐
+
+##### 근본 원인 분석
+
+```
+위치: dashboard.rs draw_ram_segmented_chart()
+```
+
+used(녹색)가 fractional block 문자(`▁▂▃▄▅▆▇`)로 끝나는 셀에서, 해당 문자는 셀의 **아래쪽 일부만** 채운다. 셀의 나머지 위쪽 부분은 배경색(검정)으로 남아 빈 공간이 된다. cached(파란색)는 그 **다음 셀**부터 `█`(전체 블록)으로 시작하므로, 녹색 fractional 셀의 빈 위쪽 공간이 시각적 갭으로 보인다.
+
+```
+수정 전 (갭 발생):
+│█│ ← cached (blue, full block)
+│▃│ ← used (green, 3/8 block) — 위쪽 5/8이 빈 배경색
+│█│ ← used (green, full block)
+
+수정 후 (밀착):
+│█│ ← cached (blue, full block)
+│▃│ ← used (green fg, blue bg) — 아래 3/8 녹색, 위 5/8 파란색
+│█│ ← used (green, full block)
+```
+
+##### 수정 내용 (1개 변경)
+
+**변경 1: fractional used 셀에 cached 배경색 적용** (`dashboard.rs`)
+
+```rust
+// Before: fg만 설정, bg는 기본(검정)
+} else if bottom_row == used_rows && used_frac > 0.05 {
+    (bar_chars[(used_frac * 8.0) as usize % 8], used_color)
+
+// After: fg=used_color, bg=Color::Blue (cached 존재 시)
+} else if bottom_row == used_rows && used_frac > 0.05 {
+    let bg = if has_cached { Color::Blue } else { Color::Reset };
+    (bar_chars[(used_frac * 8.0) as usize % 8], used_color, bg)
+```
+
+하나의 셀 안에서 하단(fg) = 녹색 used, 상단(bg) = 파란색 cached를 동시에 표현하여 시각적 연속성을 보장한다.
+
+##### 수정 파일
+
+| 파일 | 변경 | 관련 변경 |
+|------|------|----------|
+| `src/ui/dashboard.rs` | fractional used 셀 bg 색상 + 3-tuple 반환 구조 | 변경 1 |
+
+##### 교차 검증 매트릭스
+
+| 검증 항목 | 방법 | 기대 결과 |
+|----------|------|----------|
+| used+cached 밀착 | used 10-30% + cached 50%+ 시나리오 | 녹색-파란색 사이 갭 없음 |
+| used 0% (cached만) | cached만 존재 시 | 파란색만 하단부터 표시 |
+| cached 0% (used만) | used만 존재 시 | 녹색만 하단부터, bg=Reset |
+| 100% 사용 | used + cached = 100% | 차트 전체 채움, 빈 공간 없음 |
+| cargo clippy | 경고 확인 | 신규 경고 없음 |
+
+##### v0.3.8 → v0.3.9 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.8: GPM MIG 비활성화 + per-tick 할당 최소화 | cross-tick 오염 차단 + 장기 운영 메모리 | `nvml.rs`, `dashboard.rs` |
+| **v0.3.9: RAM 차트 fractional 셀 bg 색상** | **used-cached 경계 시각적 갭 제거** | `dashboard.rs` RAM 세그먼트 차트 |
+
+v0.3.8은 "데이터 수집 안정성 + 할당 최적화", v0.3.9는 "RAM 차트 시각적 정확성 수정".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -1690,6 +1760,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Sparkline RightToLeft 방향 통일 | `dashboard.rs` | 5개 Sparkline 모두 `RenderDirection::RightToLeft` 적용 → RAM 세그먼트 차트와 동일한 우측→좌측 진행 방향 |
 | RAM 차트 zero-alloc 렌더링 | `dashboard.rs` | 매 프레임 `Vec<ColSegment>` 할당 → 직접 iterator + buffer write (할당 0) |
 | RAM 세그먼트 차트 적층 보정 | `dashboard.rs` | used fractional 행이 cached 시작점을 밀어 cached가 매 컬럼 ~1행 손실 → `cached_base` 도입으로 used 소수점 행 유무에 따라 cached 기준점 정확히 산정 |
+| RAM 차트 fractional 셀 bg 색상 | `dashboard.rs` | used fractional 문자(`▃▄` 등)의 빈 상단이 배경색으로 남아 cached와 시각적 갭 → `cell.set_bg(Color::Blue)` 적용, 셀 내 하단=used(fg) 상단=cached(bg) 밀착 표시 |
 | RAM 계산 정확도 수정 | `dashboard.rs` | `used = ram_used - (avail-free)` (이중 차감) → `used = total - available` (정확한 비해제 가능 메모리) |
 | `format_pstate` 제로 할당 | `nvml.rs` | 매 tick `"P0".to_string()` String 할당 → `&'static str` 반환 (할당 0) |
 | `format_architecture` 제로 할당 | `nvml.rs` | 동일 패턴: `"Ampere".to_string()` → `&'static str` |
@@ -1800,6 +1871,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | MIG display name 캐싱 | `nvml.rs` | MIG 이름 `Rc<str>` 첫 tick만 생성, 이후 `Rc::clone()` 포인터 카운트만 (MIG 인스턴스당 tick 힙 할당 제거) |
 | PID dedup HashSet 재사용 | `nvml.rs` | `RefCell<HashSet<u32>>` 필드 재사용, 첫 tick 이후 할당 0 (clear만) |
 | BAR_TABLE 룩업 테이블 | `dashboard.rs` | `thread_local!` bar 문자열 테이블, 터미널 리사이즈 시에만 재빌드, 128코어에서도 draw당 bar 할당 0 |
+| RAM 차트 fractional 셀 bg 색상 | `dashboard.rs` | used fractional 문자의 빈 상단 → `cell.set_bg(Color::Blue)` 적용, used-cached 경계 시각적 밀착 보장 |
 
 ### 장시간 메모리 사용량 예측
 

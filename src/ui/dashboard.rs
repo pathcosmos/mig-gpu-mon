@@ -972,23 +972,30 @@ fn draw_ram_segmented_chart(f: &mut Frame, app: &App, area: Rect) {
             Color::Green
         };
 
+        let has_cached = cached_rows > 0 || cached_frac > 0.05;
+
         for row in 0..height {
             let bottom_row = height - 1 - row;
-            let (ch, color) = if bottom_row < used_rows {
-                ('█', used_color)
+            let (ch, fg, bg) = if bottom_row < used_rows {
+                ('█', used_color, Color::Reset)
             } else if bottom_row == used_rows && used_frac > 0.05 {
-                (bar_chars[(used_frac * 8.0) as usize % 8], used_color)
+                // Transition cell: lower part = used (fg), upper part = cached (bg)
+                let bg = if has_cached { Color::Blue } else { Color::Reset };
+                (bar_chars[(used_frac * 8.0) as usize % 8], used_color, bg)
             } else if bottom_row < cached_base + cached_rows {
-                ('█', Color::Blue)
+                ('█', Color::Blue, Color::Reset)
             } else if bottom_row == cached_base + cached_rows && cached_frac > 0.05 {
-                (bar_chars[(cached_frac * 8.0) as usize % 8], Color::Blue)
+                (bar_chars[(cached_frac * 8.0) as usize % 8], Color::Blue, Color::Reset)
             } else {
                 continue; // empty cell — skip buffer write
             };
 
             let cell = &mut buf[(x, area.y + row as u16)];
             cell.set_char(ch);
-            cell.set_fg(color);
+            cell.set_fg(fg);
+            if bg != Color::Reset {
+                cell.set_bg(bg);
+            }
         }
     }
 }
