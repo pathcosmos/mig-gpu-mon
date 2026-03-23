@@ -151,16 +151,36 @@ impl MetricsHistory {
     }
 
     pub fn push(&mut self, metrics: &GpuMetrics) {
-        Self::push_with_ttl(&mut self.gpu_util, metrics.gpu_util, self.max_entries, &mut self.none_counts[0]);
-        Self::push_with_ttl(&mut self.memory_util, metrics.memory_util, self.max_entries, &mut self.none_counts[1]);
+        Self::push_with_ttl(
+            &mut self.gpu_util,
+            metrics.gpu_util,
+            self.max_entries,
+            &mut self.none_counts[0],
+        );
+        Self::push_with_ttl(
+            &mut self.memory_util,
+            metrics.memory_util,
+            self.max_entries,
+            &mut self.none_counts[1],
+        );
         Self::push_with_ttl(
             &mut self.memory_used_mb,
             metrics.memory_used_mb(),
             self.max_entries,
             &mut self.none_counts[2],
         );
-        Self::push_with_ttl(&mut self.sm_util, metrics.sm_util, self.max_entries, &mut self.none_counts[3]);
-        Self::push_with_ttl(&mut self.temperature, metrics.temperature, self.max_entries, &mut self.none_counts[4]);
+        Self::push_with_ttl(
+            &mut self.sm_util,
+            metrics.sm_util,
+            self.max_entries,
+            &mut self.none_counts[3],
+        );
+        Self::push_with_ttl(
+            &mut self.temperature,
+            metrics.temperature,
+            self.max_entries,
+            &mut self.none_counts[4],
+        );
         Self::push_with_ttl(
             &mut self.power_usage_w,
             metrics.power_usage_w(),
@@ -191,7 +211,12 @@ impl MetricsHistory {
     /// After TTL, pushes zero — sparkline keeps advancing with a visible drop to signal data loss,
     /// rather than freezing in place (which looks like a hang, not a data issue).
     /// Does nothing if the metric has never been observed (no data yet).
-    fn push_with_ttl<T: Copy + Default>(buf: &mut VecDeque<T>, val: Option<T>, max: usize, none_count: &mut u32) {
+    fn push_with_ttl<T: Copy + Default>(
+        buf: &mut VecDeque<T>,
+        val: Option<T>,
+        max: usize,
+        none_count: &mut u32,
+    ) {
         match val {
             Some(v) => {
                 *none_count = 0;
@@ -261,7 +286,6 @@ impl SystemMetrics {
     pub fn ram_total_gb(&self) -> f64 {
         self.ram_total as f64 / GIB_F64
     }
-
 
     /// Decompose RAM into (used_pure_bytes, cached_bytes, free_bytes) and percentages.
     /// Returns (used_pure, cached, free, used_pct, cached_pct, free_pct, avail_gb, total_gb).

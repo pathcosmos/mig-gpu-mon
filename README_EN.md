@@ -2085,6 +2085,138 @@ Fixed `push_with_ttl` where `none_count` incremented indefinitely after TTL expi
 
 v0.3.12 provides "GPM corruption auto-detect + permanent disable"; v0.3.13 provides "GPM delayed corruption infinite loop fix + long-running micro-optimization".
 
+---
+
+#### v0.3.14: MIG Mem Ctrl Fundamental Fix + Startup GPM Probe + Rendering Optimization
+
+##### Problem
+
+All GPM defense layers up to v0.3.13 (post-probe, infinite loop prevention) are **reactive responses to GPM corruption**. The root cause is the GPM call itself — if Mem Ctrl can be displayed without GPM, GPM calls become unnecessary and corruption is eliminated at the source.
+
+##### Changes (3 changes)
+
+**Change 1: Parent Memory Samples Mem Ctrl Fallback** (`nvml.rs`)
+
+Scale parent GPU's `nvmlDeviceGetSamples(MEMORY_UTILIZATION)` raw values (/10000) by MIG slice ratio → display Mem Ctrl without GPM. Setting `memory_util` in Phase 1 naturally suppresses Phase 1.5 GPM calls.
+
+**Change 2: Startup GPM Safety Probe** (`nvml.rs`)
+
+One-time GPM safety verification per MIG-enabled parent GPU in `NvmlCollector::new()`. Calls `nvmlGpmMigSampleGet()` then re-checks `memory_info()` → on failure, immediately registers in `gpm_disabled_parents`, preventing runtime corruption.
+
+**Change 3: Rendering Optimization** (`dashboard.rs`)
+
+Cache `selected_metrics()` (7 redundant calls → 1), Cow::Borrowed static titles, Vec::with_capacity for Span vectors.
+
+##### Changed Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/nvml.rs` | `get_mem_util_from_samples()` added + Phase 1 Mem Ctrl fallback + Startup GPM Probe |
+| `src/ui/dashboard.rs` | Rendering dedup + static titles + Vec pre-allocation |
+
+---
+
+#### v0.3.15: Mem Ctrl Multi-Fallback + GPM Defense-in-Depth
+
+##### Problem
+
+v0.3.14's Mem Ctrl fundamental fix assumed `nvmlDeviceGetSamples(type=1 MEM_UTIL)` always works. However, some drivers/architectures don't support this sample type, causing `parent_sampled_mem_util = None` → GPM suppression chain breaks:
+
+```
+nvmlDeviceGetSamples(type=1) fails → parent_sampled_mem_util = None
+  → Phase 1 Mem Ctrl fallback skipped → memory_util = None (Mem Ctrl N/A)
+    → Phase 1.5 GPM suppression fails → GPM runs → NVML state corruption
+      → memory_info() cascading failures → VRAM N/A after 10 ticks
+```
+
+##### Root Cause
+
+Both symptoms (Mem Ctrl N/A from start, VRAM N/A after 10s) are a single causal chain:
+1. `nvmlDeviceGetSamples(type=1)` unsupported → no Mem Ctrl value source
+2. `memory_util` remains None → Phase 1.5 GPM suppression fails
+3. GPM corrupts NVML state → `memory_info()` fails → carry-forward TTL expires → VRAM N/A
+
+##### Changes (4 changes)
+
+**Change 1: Add parent `utilization_rates().memory` fallback** (`nvml.rs`)
+
+Query parent device's standard `utilization_rates()` API for memory util before Phase 1 loop. Wider driver support than `nvmlDeviceGetSamples(type=1)`.
+
+```rust
+let parent_util_rates_mem: Option<u32> =
+    parent_device.utilization_rates().ok().map(|u| u.memory);
+```
+
+**Change 2: Dual Mem Ctrl fallback branch** (`nvml.rs`)
+
+When `parent_sampled_mem_util` is None, fall back to `parent_util_rates_mem` with slice ratio scaling. Filling memory_util → Phase 1.5 GPM auto-suppressed.
+
+```rust
+if metrics.memory_util.is_none() {
+    if let Some(p_mem_util) = parent_sampled_mem_util {
+        // (a) raw samples scaling (existing)
+    } else if let Some(p_rates_mem) = parent_util_rates_mem {
+        // (b) utilization_rates().memory scaling (NEW)
+    }
+}
+```
+
+**Change 3: GPM defense-in-depth guard** (`nvml.rs`)
+
+When `parent_sampled_mem_util` is None, the driver's extended API surface is unreliable → block GPM entry entirely.
+
+```rust
+let parent_mem_samples_ok = parent_sampled_mem_util.is_some();
+if parent_info.gpm_supported && !gpm_disabled && parent_mem_samples_ok {
+```
+
+**Change 4: Startup GPM Probe 2-round** (`nvml.rs`)
+
+Some drivers corrupt NVML state only on the 2nd+ GPM call, not the first. Two-round probing catches delayed corruption.
+
+##### Changed Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/nvml.rs` | `parent_util_rates_mem` added + Mem Ctrl `else if` fallback + GPM `parent_mem_samples_ok` guard + Startup Probe 2-round |
+| `CLAUDE.md` | 6-stage fallback chain documentation update |
+
+##### Verification Matrix
+
+| Verification Item | Method | Expected Result |
+|-------------------|--------|-----------------|
+| Mem Ctrl display (samples-unsupported driver) | Run in MIG environment | `utilization_rates().memory` fallback shows Mem Ctrl value |
+| VRAM long-term stability | 10+ min continuous run | No VRAM N/A transition (GPM not called) |
+| GPM suppression confirmation | When `parent_sampled_mem_util=None` | Phase 1.5 GPM entry blocked |
+| Startup Probe delayed corruption detection | Driver that corrupts on 2nd GPM call | 2-round probing detects → `gpm_disabled_parents` registered |
+| cargo clippy + fmt | Static analysis | No new warnings ✓ |
+
+##### Resource Leak Audit Results (Full Codebase)
+
+| Resource | Status | Bound |
+|----------|--------|-------|
+| `proc_name_cache` | ✓ Per-tick retain active PIDs + shrink | GPU count × 5 |
+| `device_cache` | ✓ `prune_stale_caches()` per tick | Active GPU count |
+| `gpm_prev_samples` | ✓ retain + free + Drop drain | Active MIG count |
+| VecDeque history | ✓ Fixed 300 ring buffer | 300 × 9 metrics |
+| `sample_buf` | ✓ Grow-only + shrink when >8x | ~2KB |
+| `vram_fail_count` | ✓ Retain on GPU removal | Active GPU count |
+| Per-frame format!() | ~46/frame, < 0.1% vs GPU collection (100-500ms) | No optimization needed |
+
+##### v0.3.10 → v0.3.15 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.10: Phase 1.5 GPM 2-phase separation | Phase 1 VRAM collected before GPM → same-tick VRAM protected | `nvml.rs` MIG collection |
+| v0.3.11: VRAM TTL 10s + memory_total cache | Sustained tracking through extended GPM aftereffects + stable scale | `app.rs` carry-forward |
+| v0.3.12: post-probe corruption detection + permanent GPM disable | Same-tick immediate corruption → GPM blocked | `nvml.rs` Phase 1.5 |
+| v0.3.13: GPM skip on probe_idx=None | Delayed corruption (next tick) → breaks re-corruption infinite loop | `nvml.rs` Phase 1.5 |
+| v0.3.14: Parent Memory Samples + Startup Probe | Mem Ctrl without GPM → GPM calls naturally suppressed + startup corruption detection | `nvml.rs` Phase 1, `new()` |
+| **v0.3.15: utilization_rates() fallback + GPM defense-in-depth** | **Alternative source when samples unsupported + block GPM entry entirely (defense-in-depth)** | `nvml.rs` Phase 1, Phase 1.5 |
+| **v0.3.15: Startup Probe 2-round** | **Delayed corruption driver detection at startup** | `nvml.rs` `new()` |
+
+v0.3.14 provides "Mem Ctrl fundamental fix without GPM"; v0.3.15 provides "samples-unsupported driver coverage + GPM defense-in-depth hardening".
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -2324,7 +2456,9 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | proc_name_cache HashSet reuse | `nvml.rs` | Reuses `proc_seen_pids` RefCell for pruning instead of allocating new HashSet each tick |
 | none_count TTL cap | `metrics.rs` | `push_with_ttl` none_count capped at TTL+1 → prevents pointless u32 increments on permanently N/A metrics |
 | Parent Memory Samples Mem Ctrl fallback | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → parent GPU memory controller util scaled by MIG slice ratio, enables Mem Ctrl display on ALL architectures (Ampere/Hopper) without GPM, sets memory_util in Phase 1 → naturally suppresses Phase 1.5 GPM calls → eliminates root cause of NVML state corruption |
-| Startup GPM Safety Probe | `nvml.rs` | One-time GPM safety test in `NvmlCollector::new()` per MIG parent (memory_info→GPM→memory_info re-check), registers corrupting parents in `gpm_disabled_parents` at startup → prevents runtime VRAM interruption |
+| Parent `utilization_rates().memory` fallback | `nvml.rs` | Alternative Mem Ctrl source for drivers where `nvmlDeviceGetSamples(type=1)` is unsupported → standard API with wider driver support → maintains GPM suppression chain |
+| GPM defense-in-depth (`parent_mem_samples_ok`) | `nvml.rs` | Blocks Phase 1.5 GPM entry when `parent_sampled_mem_util=None` → prevents GPM from running when extended API surface is unreliable |
+| Startup GPM Safety Probe (2-round) | `nvml.rs` | Two-round GPM safety test in `NvmlCollector::new()` per MIG parent (catches delayed corruption on 2nd+ call), registers corrupting parents in `gpm_disabled_parents` at startup → prevents runtime VRAM interruption |
 | `selected_metrics()` caching | `dashboard.rs` | 7 redundant calls → 1 cached call in `draw_gpu_charts()`, eliminates 6 HashMap lookups per frame |
 | Cow::Borrowed static titles | `dashboard.rs` | Chart title literals changed from `.into()` (Cow::Owned) → `Cow::Borrowed` directly, eliminates 6-8 unnecessary String heap allocations per frame |
 | Vec::with_capacity Span vectors | `dashboard.rs` | `Vec::new()` → `Vec::with_capacity(4-6)`, eliminates 3 reallocs on first push |
@@ -2345,8 +2479,10 @@ After 5 min:    No change (ring buffer → steady state maintained)
 | Drift-corrected timer | `main.rs` | `Instant`-based elapsed measurement → subtracts work time from interval, prevents cumulative drift |
 | Option-based graceful failure | `nvml.rs` | All extended metrics wrapped with `.ok()` → `None` ("N/A") on MIG/vGPU failure, no panics |
 | `saturating_sub` time calc | `main.rs` | Even if work_time > interval, no negative values — immediately proceeds to next tick |
-| Startup GPM Safety Probe | `nvml.rs` | One-time GPM safety test before first metrics collection → disables corrupting parents at startup, prevents runtime VRAM interruption |
-| Parent Memory Samples fallback | `nvml.rs` | Enables Mem Ctrl display without GPM → GPM calls naturally suppressed → eliminates root cause of NVML state corruption |
+| Startup GPM Safety Probe (2-round) | `nvml.rs` | Two-round GPM safety test before first metrics collection (catches delayed corruption) → disables corrupting parents at startup |
+| Parent Memory Samples fallback | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → MIG slice scaling for Mem Ctrl without GPM → GPM calls naturally suppressed |
+| Parent `utilization_rates().memory` fallback | `nvml.rs` | Alternative Mem Ctrl source for drivers not supporting `nvmlDeviceGetSamples(type=1)` → maintains GPM suppression chain |
+| GPM defense-in-depth (`parent_mem_samples_ok`) | `nvml.rs` | Blocks Phase 1.5 GPM entry when `parent_sampled_mem_util=None` → protects VRAM when extended APIs are unreliable |
 
 ## Why Rust
 

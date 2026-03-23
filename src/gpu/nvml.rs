@@ -246,15 +246,18 @@ impl NvmlCollector {
                         None => continue,
                     };
 
-                    // Step 2: Take a GPM sample (may corrupt NVML state)
-                    let mut sample: nvmlGpmSample_t = std::ptr::null_mut();
-                    if self.raw_lib.nvmlGpmSampleAlloc(&mut sample) != 0 || sample.is_null() {
-                        continue;
-                    }
-                    let _ret =
-                        self.raw_lib
+                    // Step 2: Take TWO GPM samples — some drivers corrupt NVML state
+                    // only on the 2nd+ call, not the first. Two rounds catch delayed corruption.
+                    for _ in 0..2 {
+                        let mut sample: nvmlGpmSample_t = std::ptr::null_mut();
+                        if self.raw_lib.nvmlGpmSampleAlloc(&mut sample) != 0 || sample.is_null() {
+                            break;
+                        }
+                        let _ret = self
+                            .raw_lib
                             .nvmlGpmMigSampleGet(parent_handle, gi_id, sample);
-                    self.raw_lib.nvmlGpmSampleFree(sample);
+                        self.raw_lib.nvmlGpmSampleFree(sample);
+                    }
 
                     // Step 3: Re-check memory_info — if it fails now, GPM corrupts this parent
                     if mig_device.memory_info().is_err() {
@@ -360,6 +363,10 @@ impl NvmlCollector {
             // Pre-fetch parent-level utilization via samples (for slice-ratio fallback)
             let parent_sampled_util = self.get_gpu_util_from_samples(parent_handle);
             let parent_sampled_mem_util = self.get_mem_util_from_samples(parent_handle);
+            // Fallback: parent's standard utilization_rates().memory (works on drivers
+            // where nvmlDeviceGetSamples(type=1) is unsupported)
+            let parent_util_rates_mem: Option<u32> =
+                parent_device.utilization_rates().ok().map(|u| u.memory);
             // MaxMigDeviceCount = total number of GPU instance slices (e.g. 7 for H100)
             let total_slices = max_count;
 
@@ -415,16 +422,23 @@ impl NvmlCollector {
                         }
                     }
 
-                    // Fallback for Mem Ctrl: scale parent's sampled memory controller util
-                    // by MIG slice ratio. Works on ALL architectures (Ampere, Hopper, etc.)
-                    // without GPM dependency — fundamental fix for "Mem Ctrl N/A" on MIG.
-                    // Also naturally suppresses Phase 1.5 GPM calls (memory_util already set
-                    // → skip), eliminating the root cause of GPM→NVML state corruption that
-                    // was breaking VRAM monitoring.
+                    // Fallback for Mem Ctrl: scale parent's memory controller util
+                    // by MIG slice ratio. Two sources tried in order:
+                    //   (a) nvmlDeviceGetSamples(MEM_UTIL) raw samples — most accurate
+                    //   (b) utilization_rates().memory — standard API, wider driver support
+                    // Filling memory_util here naturally suppresses Phase 1.5 GPM calls
+                    // (memory_util already set → skip), preventing GPM→NVML state corruption.
                     if metrics.memory_util.is_none() {
                         if let Some(p_mem_util) = parent_sampled_mem_util {
                             if let Some(mig_slices) = mig_info.gpu_instance_slice_count {
                                 let scaled = ((p_mem_util as u64) * (total_slices as u64)
+                                    / (mig_slices as u64))
+                                    .min(100) as u32;
+                                metrics.memory_util = Some(scaled);
+                            }
+                        } else if let Some(p_rates_mem) = parent_util_rates_mem {
+                            if let Some(mig_slices) = mig_info.gpu_instance_slice_count {
+                                let scaled = ((p_rates_mem as u64) * (total_slices as u64)
                                     / (mig_slices as u64))
                                     .min(100) as u32;
                                 metrics.memory_util = Some(scaled);
@@ -436,7 +450,9 @@ impl NvmlCollector {
                     let mig_key = mig_handle as usize;
                     let cached_name = {
                         let cache = self.device_cache.borrow();
-                        cache.get(&mig_key).and_then(|info| info.mig_display_name.clone())
+                        cache
+                            .get(&mig_key)
+                            .and_then(|info| info.mig_display_name.clone())
                     };
                     metrics.name = match cached_name {
                         Some(name) => name,
@@ -469,7 +485,11 @@ impl NvmlCollector {
                 let parent_key = parent_handle as usize;
                 let parent_info = self.get_device_info(parent_device, false);
                 let gpm_disabled = self.gpm_disabled_parents.borrow().contains(&parent_key);
-                if parent_info.gpm_supported && !gpm_disabled {
+                // Defense-in-depth: only allow GPM when parent mem samples are available.
+                // If nvmlDeviceGetSamples(MEM_UTIL) fails, the driver's extended API surface
+                // is unreliable — GPM (also extended API) risks corrupting NVML state.
+                let parent_mem_samples_ok = parent_sampled_mem_util.is_some();
+                if parent_info.gpm_supported && !gpm_disabled && parent_mem_samples_ok {
                     // Find a MIG device where memory_info succeeded in Phase 1 — use as probe target
                     let probe_idx = phase1.iter().position(|(_, _, m)| m.memory_used.is_some());
 
@@ -561,21 +581,22 @@ impl NvmlCollector {
                     }
                     let _ = mig_handle; // used only for identity in earlier phases
 
-                    let mut entries: Vec<(u32, Option<u64>)> = if any_gi_available && gi_id.is_some() {
-                        // Normal path: filter by matching gpu_instance_id
-                        parent_procs
-                            .iter()
-                            .filter(|(_, _, proc_gi)| *proc_gi == *gi_id)
-                            .map(|(pid, vram, _)| (*pid, *vram))
-                            .collect()
-                    } else {
-                        // Fallback: driver doesn't provide gpu_instance_id —
-                        // show all parent processes (better than showing nothing)
-                        parent_procs
-                            .iter()
-                            .map(|(pid, vram, _)| (*pid, *vram))
-                            .collect()
-                    };
+                    let mut entries: Vec<(u32, Option<u64>)> =
+                        if any_gi_available && gi_id.is_some() {
+                            // Normal path: filter by matching gpu_instance_id
+                            parent_procs
+                                .iter()
+                                .filter(|(_, _, proc_gi)| *proc_gi == *gi_id)
+                                .map(|(pid, vram, _)| (*pid, *vram))
+                                .collect()
+                        } else {
+                            // Fallback: driver doesn't provide gpu_instance_id —
+                            // show all parent processes (better than showing nothing)
+                            parent_procs
+                                .iter()
+                                .map(|(pid, vram, _)| (*pid, *vram))
+                                .collect()
+                        };
 
                     // Sort: known VRAM descending, Unavailable at end
                     entries.sort_by(|a, b| match (b.1, a.1) {
@@ -872,10 +893,7 @@ impl NvmlCollector {
                 .name()
                 .unwrap_or_else(|_| "Unknown GPU".to_string())
                 .into(),
-            uuid: device
-                .uuid()
-                .unwrap_or_else(|_| "N/A".to_string())
-                .into(),
+            uuid: device.uuid().unwrap_or_else(|_| "N/A".to_string()).into(),
             architecture: device.architecture().ok().map(format_architecture),
             compute_capability: device
                 .cuda_compute_capability()

@@ -275,7 +275,6 @@ fn make_segmented_bar(spans: &mut Vec<Span<'_>>, width: usize, segments: &[(f32,
     }
 }
 
-
 fn draw_gpu_panel(f: &mut Frame, app: &App, area: Rect) {
     if app.metrics.is_empty() {
         let msg = Paragraph::new("No GPU devices detected. Waiting...")
@@ -314,8 +313,12 @@ fn draw_gpu_list(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::White)
             };
-            let gpu_str: Cow<str> = m.gpu_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
-            let mem_str: Cow<str> = m.memory_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
+            let gpu_str: Cow<str> = m
+                .gpu_util
+                .map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
+            let mem_str: Cow<str> = m
+                .memory_util
+                .map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
             ListItem::new(format!(
                 "{} {} {}: {} | GPU:{} Mem:{}",
                 indicator, prefix, m.index, m.name, gpu_str, mem_str
@@ -414,8 +417,12 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Line 5: GPU / Mem / SM util (compact horizontal)
-    let gpu_util_str: Cow<str> = m.gpu_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
-    let mem_util_str: Cow<str> = m.memory_util.map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
+    let gpu_util_str: Cow<str> = m
+        .gpu_util
+        .map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
+    let mem_util_str: Cow<str> = m
+        .memory_util
+        .map_or(Cow::Borrowed("N/A"), |v| format!("{}%", v).into());
     let mut util_spans = vec![
         Span::styled("GPU: ", Style::default().fg(Color::Green)),
         Span::styled(
@@ -676,7 +683,11 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     // GPU Utilization sparkline
     let gpu_title: Cow<str> = match sel.and_then(|m| m.gpu_util) {
         Some(v) => format!(" GPU Util {}% ", v).into(),
-        None => Cow::Borrowed(if sel.is_some() { " GPU Util N/A " } else { " GPU Util " }),
+        None => Cow::Borrowed(if sel.is_some() {
+            " GPU Util N/A "
+        } else {
+            " GPU Util "
+        }),
     };
     with_spark_data_u32(&history.gpu_util, |data| {
         let sparkline = Sparkline::default()
@@ -695,7 +706,11 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     // Memory Controller Utilization sparkline
     let mem_ctrl_title: Cow<str> = match sel.and_then(|m| m.memory_util) {
         Some(v) => format!(" Mem Ctrl {}% ", v).into(),
-        None => Cow::Borrowed(if sel.is_some() { " Mem Ctrl N/A " } else { " Mem Ctrl " }),
+        None => Cow::Borrowed(if sel.is_some() {
+            " Mem Ctrl N/A "
+        } else {
+            " Mem Ctrl "
+        }),
     };
     with_spark_data_u32(&history.memory_util, |data| {
         let sparkline = Sparkline::default()
@@ -791,10 +806,7 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
     });
 
     // Pre-compute RAM breakdown once for both draw_ram_bars and draw_memory_legend
-    let rb = app
-        .system_metrics
-        .as_ref()
-        .map(|s| s.ram_breakdown());
+    let rb = app.system_metrics.as_ref().map(|s| s.ram_breakdown());
 
     // RAM/SWP bars (no text labels)
     draw_ram_bars(f, app, rb, rows[1]);
@@ -884,7 +896,10 @@ fn draw_memory_legend(f: &mut Frame, rb: Option<RamBreakdown>, area: Rect) {
         Span::styled("▮", Style::default().fg(Color::DarkGray)),
         Span::styled(" free  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("RAM {:.1}/{:.1} GiB ({:.0}%)", rb.used_gb, rb.total_gb, rb.used_pct),
+            format!(
+                "RAM {:.1}/{:.1} GiB ({:.0}%)",
+                rb.used_gb, rb.total_gb, rb.used_pct
+            ),
             Style::default().fg(Color::White),
         ),
     ]);
@@ -896,9 +911,15 @@ fn draw_memory_legend(f: &mut Frame, rb: Option<RamBreakdown>, area: Rect) {
             Style::default().fg(used_color),
         ),
         Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.1}G", rb.cached_gb), Style::default().fg(Color::Blue)),
+        Span::styled(
+            format!("{:.1}G", rb.cached_gb),
+            Style::default().fg(Color::Blue),
+        ),
         Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.1}G", rb.free_gb), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:.1}G", rb.free_gb),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(
             format!("  avl:{:.1}G", rb.avail_gb),
             Style::default().fg(Color::White),
@@ -978,12 +999,20 @@ fn draw_ram_segmented_chart(f: &mut Frame, app: &App, area: Rect) {
                 ('█', used_color, Color::Reset)
             } else if bottom_row == used_rows && used_frac > 0.05 {
                 // Transition cell: lower part = used (fg), upper part = cached (bg)
-                let bg = if has_cached { Color::Blue } else { Color::Reset };
+                let bg = if has_cached {
+                    Color::Blue
+                } else {
+                    Color::Reset
+                };
                 (bar_chars[(used_frac * 8.0) as usize % 8], used_color, bg)
             } else if bottom_row < cached_base + cached_rows {
                 ('█', Color::Blue, Color::Reset)
             } else if bottom_row == cached_base + cached_rows && cached_frac > 0.05 {
-                (bar_chars[(cached_frac * 8.0) as usize % 8], Color::Blue, Color::Reset)
+                (
+                    bar_chars[(cached_frac * 8.0) as usize % 8],
+                    Color::Blue,
+                    Color::Reset,
+                )
             } else {
                 continue; // empty cell — skip buffer write
             };
@@ -1074,9 +1103,9 @@ fn draw_vram_top_processes(f: &mut Frame, app: &App, area: Rect) {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     lines.push(Line::from(vec![
-        Span::styled("PID    ", hdr_style),  // 7 chars, matches {:<7}
-        Span::styled("Process        ", hdr_style),  // 15 chars, matches {:<15}
-        Span::styled("      VRAM", hdr_style),  // 10 chars, matches {:>10}
+        Span::styled("PID    ", hdr_style), // 7 chars, matches {:<7}
+        Span::styled("Process        ", hdr_style), // 15 chars, matches {:<15}
+        Span::styled("      VRAM", hdr_style), // 10 chars, matches {:>10}
     ]));
 
     if m.top_processes.is_empty() {

@@ -2086,6 +2086,138 @@ if let Some(pidx) = probe_idx {
 
 v0.3.12는 "GPM 오염 자동 감지 + 영구 비활성화", v0.3.13은 "GPM 지연 오염 무한루프 차단 + 장기 운영 미세 최적화".
 
+---
+
+#### v0.3.14: MIG Mem Ctrl 근본 해결 + Startup GPM Probe + 렌더링 최적화
+
+##### 문제
+
+v0.3.13까지의 GPM 방어 계층(post-probe, 무한루프 차단)은 모두 **GPM 오염 사후 대응**. 근본 원인은 GPM 호출 자체 — Mem Ctrl을 GPM 없이 표시할 수 있으면 GPM 호출이 불필요해져 오염이 원천적으로 사라짐.
+
+##### 수정 내용 (3개 변경)
+
+**변경 1: Parent Memory Samples Mem Ctrl 폴백** (`nvml.rs`)
+
+부모 GPU의 `nvmlDeviceGetSamples(MEMORY_UTILIZATION)` raw 값(/10000)을 MIG 슬라이스 비율로 스케일링 → GPM 없이 Mem Ctrl 표시. Phase 1에서 `memory_util`을 채우므로 Phase 1.5 GPM이 자연스럽게 억제됨.
+
+**변경 2: Startup GPM Safety Probe** (`nvml.rs`)
+
+`NvmlCollector::new()`에서 MIG-enabled 부모 GPU마다 GPM 안전성 1회 검증. `nvmlGpmMigSampleGet()` 호출 후 `memory_info()` 재확인 → 실패 시 `gpm_disabled_parents`에 즉시 등록, 런타임 오염 원천 차단.
+
+**변경 3: 렌더링 최적화** (`dashboard.rs`)
+
+`selected_metrics()` 7회 중복 호출 → 1회 캐싱, Cow::Borrowed 정적 타이틀, Vec::with_capacity Span 벡터.
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/nvml.rs` | `get_mem_util_from_samples()` 추가 + Phase 1 Mem Ctrl 폴백 + Startup GPM Probe |
+| `src/ui/dashboard.rs` | 렌더링 중복 제거 + 정적 타이틀 + Vec 사전 할당 |
+
+---
+
+#### v0.3.15: Mem Ctrl 다중 폴백 + GPM 방어적 차단 강화
+
+##### 문제
+
+v0.3.14의 Mem Ctrl 근본 해결은 `nvmlDeviceGetSamples(type=1 MEM_UTIL)`이 항상 작동한다고 가정. 그러나 일부 드라이버/아키텍처에서 이 sample type을 지원하지 않아 `parent_sampled_mem_util = None` → GPM 억제 체인이 깨짐:
+
+```
+nvmlDeviceGetSamples(type=1) 실패 → parent_sampled_mem_util = None
+  → Phase 1 Mem Ctrl 폴백 스킵 → memory_util = None (Mem Ctrl N/A)
+    → Phase 1.5 GPM 억제 실패 → GPM 실행 → NVML 오염
+      → memory_info() 연쇄 실패 → 10 tick 후 VRAM N/A
+```
+
+##### 근본 원인
+
+두 증상(Mem Ctrl 처음부터 N/A, VRAM 10초 후 N/A)은 하나의 인과 체인:
+1. `nvmlDeviceGetSamples(type=1)` 미지원 → Mem Ctrl에 값 없음
+2. `memory_util`이 None → Phase 1.5 GPM 억제 실패
+3. GPM이 NVML 상태 오염 → `memory_info()` 실패 → carry-forward TTL 만료 → VRAM N/A
+
+##### 수정 내용 (4개 변경)
+
+**변경 1: Parent `utilization_rates().memory` 폴백 추가** (`nvml.rs`)
+
+Phase 1 루프 전에 parent의 표준 `utilization_rates()` API로 memory util 조회. `nvmlDeviceGetSamples(type=1)`보다 드라이버 지원 범위가 넓음.
+
+```rust
+let parent_util_rates_mem: Option<u32> =
+    parent_device.utilization_rates().ok().map(|u| u.memory);
+```
+
+**변경 2: Mem Ctrl 이중 폴백 분기** (`nvml.rs`)
+
+`parent_sampled_mem_util`이 None일 때 `parent_util_rates_mem`으로 스케일링. memory_util이 채워지면 → Phase 1.5 GPM 자동 억제.
+
+```rust
+if metrics.memory_util.is_none() {
+    if let Some(p_mem_util) = parent_sampled_mem_util {
+        // (a) raw samples 스케일링 (기존)
+    } else if let Some(p_rates_mem) = parent_util_rates_mem {
+        // (b) utilization_rates().memory 스케일링 (NEW)
+    }
+}
+```
+
+**변경 3: GPM 방어적 차단 조건** (`nvml.rs`)
+
+`parent_sampled_mem_util`이 None이면 드라이버 확장 API가 불안정하다는 신호 → GPM 진입 자체를 차단 (defense-in-depth).
+
+```rust
+let parent_mem_samples_ok = parent_sampled_mem_util.is_some();
+if parent_info.gpm_supported && !gpm_disabled && parent_mem_samples_ok {
+```
+
+**변경 4: Startup GPM Probe 2회 반복** (`nvml.rs`)
+
+일부 드라이버는 첫 GPM 호출에서는 오염 없이 2회째부터 오염 발생. 2회 프로빙으로 지연 오염 감지.
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/nvml.rs` | `parent_util_rates_mem` 추가 + Mem Ctrl `else if` 폴백 + GPM `parent_mem_samples_ok` 가드 + Startup Probe 2회 |
+| `CLAUDE.md` | 6단계 폴백 체인 문서 업데이트 |
+
+##### 검증 매트릭스
+
+| 검증 항목 | 방법 | 기대 결과 |
+|----------|------|----------|
+| Mem Ctrl 표시 (samples 미지원 드라이버) | MIG 환경에서 실행 | `utilization_rates().memory` 폴백으로 Mem Ctrl 값 표시 |
+| VRAM 장기 안정성 | 10분+ 연속 실행 | VRAM N/A 전환 없음 (GPM 미실행) |
+| GPM 억제 확인 | `parent_sampled_mem_util=None` 시 | Phase 1.5 GPM 진입 차단 |
+| Startup Probe 지연 오염 감지 | 2회째 GPM에서 오염 발생 드라이버 | 2회 프로빙으로 감지 → `gpm_disabled_parents` 등록 |
+| cargo clippy + fmt | 정적 분석 | 신규 경고 없음 ✓ |
+
+##### 자원 누수 감사 결과 (전체 코드베이스)
+
+| 자원 | 상태 | 상한 |
+|------|------|------|
+| `proc_name_cache` | ✓ 매 tick active PID만 retain + shrink | GPU수 × 5 |
+| `device_cache` | ✓ `prune_stale_caches()` 매 tick | active GPU수 |
+| `gpm_prev_samples` | ✓ retain + free + Drop drain | active MIG수 |
+| VecDeque 히스토리 | ✓ 고정 300 ring buffer | 300 × 9 메트릭 |
+| `sample_buf` | ✓ grow-only + >8x시 shrink | ~2KB |
+| `vram_fail_count` | ✓ GPU 제거 시 retain | active GPU수 |
+| Per-frame format!() | ~46회/frame, GPU 수집(100-500ms) 대비 < 0.1% | 최적화 불필요 |
+
+##### v0.3.10 → v0.3.15 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.10: Phase 1.5 GPM 2-phase 분리 | Phase 1 VRAM 수집 후 GPM 호출 → 같은 tick VRAM 보호 | `nvml.rs` MIG 수집 |
+| v0.3.11: VRAM TTL 10초 + memory_total 캐시 | GPM 후유증 장기 실패 시에도 추적 유지 + 스케일 안정 | `app.rs` carry-forward |
+| v0.3.12: post-probe 오염 감지 + GPM 영구 비활성화 | 같은 tick 즉시 발현 오염 → GPM 차단 | `nvml.rs` Phase 1.5 |
+| v0.3.13: probe_idx=None 시 GPM 스킵 | 지연 발현 오염 → 재오염 무한루프 차단 | `nvml.rs` Phase 1.5 |
+| v0.3.14: Parent Memory Samples + Startup Probe | GPM 없이 Mem Ctrl 표시 → GPM 호출 자연 억제 + 시작 시 오염 감지 | `nvml.rs` Phase 1, `new()` |
+| **v0.3.15: utilization_rates() 폴백 + GPM 방어적 차단** | **samples 미지원 시 대체 소스 + GPM 진입 자체 차단 (defense-in-depth)** | `nvml.rs` Phase 1, Phase 1.5 |
+| **v0.3.15: Startup Probe 2회 반복** | **지연 오염 드라이버에서 시작 시 감지 강화** | `nvml.rs` `new()` |
+
+v0.3.14는 "GPM 없는 Mem Ctrl 근본 해결", v0.3.15는 "samples 미지원 드라이버 대응 + GPM 방어적 차단 강화".
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -2325,7 +2457,9 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | proc_name_cache 정리 시 HashSet 재활용 | `nvml.rs` | `proc_seen_pids` RefCell 재활용으로 매 tick 새 HashSet 할당 제거 |
 | none_count TTL 상한 적용 | `metrics.rs` | `push_with_ttl` none_count를 TTL+1에서 cap → 영구 N/A 메트릭에서 의미 없는 u32 증분 방지 |
 | Parent Memory Samples Mem Ctrl 폴백 | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → 부모 GPU 메모리 컨트롤러 util을 MIG 슬라이스 비율로 스케일링, GPM 없이 Ampere/Hopper 모두 Mem Ctrl 표시 가능, Phase 1에서 memory_util 채움 → Phase 1.5 GPM 호출 자연 억제로 NVML 오염 근본 차단 |
-| Startup GPM Safety Probe | `nvml.rs` | `NvmlCollector::new()`에서 MIG 부모 GPU별 GPM 안전성 1회 검증 (memory_info→GPM→memory_info 재확인), 오염 시 시작부터 `gpm_disabled_parents` 등록 → 런타임 VRAM 끊김 원천 차단 |
+| Parent `utilization_rates().memory` 폴백 | `nvml.rs` | `nvmlDeviceGetSamples(type=1)` 미지원 드라이버에서 parent의 표준 `utilization_rates().memory` API로 Mem Ctrl 대체 소스 제공 → GPM 억제 체인 유지 |
+| GPM 방어적 차단 (`parent_mem_samples_ok`) | `nvml.rs` | `parent_sampled_mem_util=None` 시 Phase 1.5 GPM 진입 자체 차단 → 확장 API 불안정 시 GPM 호출 원천 봉쇄 |
+| Startup GPM Safety Probe (2회) | `nvml.rs` | `NvmlCollector::new()`에서 MIG 부모 GPU별 GPM 안전성 2회 검증 (지연 오염 감지), 오염 시 시작부터 `gpm_disabled_parents` 등록 → 런타임 VRAM 끊김 원천 차단 |
 | `selected_metrics()` 캐싱 | `dashboard.rs` | `draw_gpu_charts()`에서 7회 중복 호출 → 1회 캐싱, 프레임당 HashMap lookup 6회 제거 |
 | Cow::Borrowed 정적 타이틀 | `dashboard.rs` | 차트 타이틀 리터럴에 `.into()` (Cow::Owned) → `Cow::Borrowed` 직접 사용, 프레임당 불필요한 String 힙 할당 6~8개 제거 |
 | Vec::with_capacity Span 벡터 | `dashboard.rs` | `Vec::new()` → `Vec::with_capacity(4~6)`, 첫 push 시 realloc 3회 제거 |
@@ -2346,8 +2480,10 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | 드리프트 보정 타이머 | `main.rs` | `Instant` 기반 경과시간 측정 → 작업 시간 빼고 남은 시간만 poll, 누적 밀림 방지 |
 | Option 기반 graceful 실패 | `nvml.rs` | 모든 확장 메트릭 `.ok()` 래핑 → MIG/vGPU 실패 시 `None` ("N/A") 표시, 패닉 없음 |
 | `saturating_sub` 시간 계산 | `main.rs` | 작업 시간 > interval 시에도 음수 없이 즉시 다음 틱 진행 |
-| Startup GPM Safety Probe | `nvml.rs` | 최초 메트릭 수집 전 GPM이 NVML 상태를 오염시키는지 1회 검증 → 위험한 parent는 시작부터 비활성화, 런타임 VRAM 끊김 원천 차단 |
-| Parent Memory Samples 폴백 | `nvml.rs` | GPM 없이 Mem Ctrl 표시 가능 → GPM 호출 자연 억제 → NVML 오염 근본 원인 제거 |
+| Startup GPM Safety Probe (2회) | `nvml.rs` | 최초 메트릭 수집 전 GPM이 NVML 상태를 오염시키는지 2회 검증 (지연 오염 감지) → 위험한 parent는 시작부터 비활성화 |
+| Parent Memory Samples 폴백 | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → MIG 슬라이스 스케일링으로 Mem Ctrl 표시 → GPM 호출 자연 억제 |
+| Parent `utilization_rates().memory` 폴백 | `nvml.rs` | samples 미지원 드라이버에서 표준 API로 Mem Ctrl 대체 소스 제공 → GPM 억제 체인 유지 |
+| GPM 방어적 차단 (`parent_mem_samples_ok`) | `nvml.rs` | `parent_sampled_mem_util=None` 시 GPM 진입 자체 차단 → 드라이버 확장 API 불안정 시 VRAM 보호 |
 
 ## Why Rust
 
