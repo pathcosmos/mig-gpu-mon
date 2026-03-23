@@ -525,12 +525,19 @@ GPM Collection Flow:
 4. nvmlGpmMetricsGet() with previous tick's sample + current sample
 5. metrics[0].value → DRAM BW Util (0.0–100.0%)
 
-collect_mig_instances 2-phase collection (v0.3):
+collect_mig_instances 2-phase collection + corruption detection (v0.3.12):
   Phase 1: Collect VRAM + utilization for all MIG instances (no GPM calls)
            → memory_info(), utilization_rates(), process util, sample scaling
-  Phase 2: GPM fallbacks for memory_util (Mem Ctrl) collection (Hopper+ only)
+  Phase 1.5: GPM fallback for memory_util (Mem Ctrl) collection (Hopper+ only)
            → nvmlGpmMigSampleGet(parent, gi_id, sample)
-  Purpose: Even if GPM calls corrupt NVML state, VRAM is already collected in Phase 1
+           → Skipped if parent is in gpm_disabled_parents
+  Post-probe: Re-try memory_info on a device that succeeded in Phase 1
+           → If fails: GPM confirmed to corrupt NVML state
+           → Parent permanently added to gpm_disabled_parents
+           → All GPM prev samples freed
+           → Subsequent ticks skip GPM → memory_info() recovers
+  Purpose: Auto-detects GPM-induced NVML state corruption and disables GPM,
+           ensuring VRAM stability (Mem Ctrl gracefully degrades to N/A)
 ```
 
 | GPU Architecture | GPM Support | Mem Ctrl Display |
@@ -2115,7 +2122,7 @@ Total RSS ~4-8 MB
 | Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None → `none_counts[9]` per-metric array with 3-tick TTL, stops pushing after expiry (prevents stale sparklines) |
 | `get_process_utilization` Option return | `nvml.rs` | API failure returned `(0, 0)` → returns `Option<(u32, u32)>`, distinguishes idle 0% from failure, prevents false fallback scaling |
 | `collect_all()` per-device error isolation | `nvml.rs` | `device_by_index(i)?` failed entire collection on single GPU error → `match ... continue` skips failed GPU, remaining GPUs collected normally |
-| GPM MIG Phase 2 removal | `nvml.rs` | `nvmlGpmMigSampleGet()` calls in MIG → completely removed, prevents cross-tick NVML state corruption causing VRAM N/A |
+| GPM corruption auto-detect + disable | `nvml.rs` | Post-GPM memory_info() probe after Phase 1.5 → on corruption detect, parent added to `gpm_disabled_parents`, subsequent ticks skip GPM for VRAM stability + Mem Ctrl graceful degradation |
 | MIG display name caching | `nvml.rs` | Per-tick `format!().into()` new `Rc<str>` → `DeviceInfo.mig_display_name` cache, `Rc::clone()` reuse |
 | PID dedup HashSet reuse | `nvml.rs` | Per-tick `HashSet::new()` per device → `proc_seen_pids: RefCell<HashSet<u32>>` reuse (zero alloc per tick) |
 | `make_bar()` lookup table | `dashboard.rs` | Per-core `String` alloc → `BAR_TABLE` thread-local lookup, `&str` reference only (128 cores: 128 alloc → 0/draw) |
@@ -2191,7 +2198,8 @@ Designed for stable 24/7 operation with no memory growth or resource leaks.
 | Sparkline carry-forward TTL | `metrics.rs` | Indefinite last-value repeat on None caused stale sparklines → `none_counts[9]` per-metric array with 10-tick limit, pushes zero after expiry (descent visual instead of freeze) |
 | `get_process_utilization` failure/idle distinction | `nvml.rs` | API failure `(0, 0)` indistinguishable from idle 0% → `Option<(u32, u32)>` return, idle 0% reported normally while failure proceeds to next fallback |
 | `collect_all()` per-device error isolation | `nvml.rs` | Single GPU `device_by_index` error stopped entire metric collection → skips failed GPU only, remaining GPUs collected normally |
-| GPM MIG Phase 2 removal | `nvml.rs` | `nvmlGpmMigSampleGet()` cross-tick corruption caused permanent `memory_info()` failure → eliminated, VRAM stability ensured |
+| GPM corruption auto-detect + permanent disable | `nvml.rs` | Post-probe after Phase 1.5 GPM calls detects NVML state corruption → parent registered in `gpm_disabled_parents` HashSet, subsequent ticks skip GPM → `memory_info()` recovers, VRAM stability ensured |
+| `gpm_disabled_parents` prune | `nvml.rs` | Removed parent GPUs auto-cleaned from disabled set in `prune_stale_caches` → prevents stale entries on GPU hot-remove/MIG reconfig |
 | MIG display name caching | `nvml.rs` | MIG name `Rc<str>` created only on first tick, `Rc::clone()` refcount bump thereafter (eliminates per-tick heap alloc per MIG instance) |
 | PID dedup HashSet reuse | `nvml.rs` | `RefCell<HashSet<u32>>` field reuse, zero allocation after first tick (clear only) |
 | BAR_TABLE lookup table | `dashboard.rs` | `thread_local!` bar string table, rebuilds only on terminal resize, zero bar allocations per draw even on 128 cores |

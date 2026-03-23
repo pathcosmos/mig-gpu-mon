@@ -525,12 +525,19 @@ GPM 수집 흐름:
 4. 이전 tick의 샘플과 현재 샘플로 nvmlGpmMetricsGet() 호출
 5. metrics[0].value → DRAM BW Util (0.0~100.0%)
 
-collect_mig_instances 2-phase 수집 (v0.3 적용):
+collect_mig_instances 2-phase 수집 + 오염 감지 (v0.3.12):
   Phase 1: 모든 MIG 인스턴스의 VRAM + utilization 수집 (GPM 호출 없음)
            → memory_info(), utilization_rates(), process util, sample scaling
-  Phase 2: GPM fallback으로 memory_util(Mem Ctrl) 수집 (Hopper+ only)
+  Phase 1.5: GPM fallback으로 memory_util(Mem Ctrl) 수집 (Hopper+ only)
            → nvmlGpmMigSampleGet(parent, gi_id, sample)
-  목적: GPM 호출이 NVML 상태를 오염시켜도 Phase 1에서 VRAM이 이미 수집 완료
+           → gpm_disabled_parents에 해당 parent 있으면 건너뜀
+  Post-probe: Phase 1에서 memory_info 성공한 디바이스에 재시도
+           → 실패 시: GPM이 NVML 상태 오염 확인
+           → 해당 parent를 gpm_disabled_parents에 영구 등록
+           → GPM prev 샘플 전량 해제
+           → 이후 tick에서 GPM 미호출 → memory_info() 정상 복구
+  목적: GPM 호출이 NVML 상태를 오염시키면 자동 감지 후 GPM 비활성화,
+        VRAM 안정성 확보 (Mem Ctrl은 N/A로 graceful degradation)
 ```
 
 | GPU 아키텍처 | GPM 지원 | Mem Ctrl 표시 |
@@ -2116,7 +2123,7 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복 → `none_counts[9]` 배열로 메트릭별 3틱 TTL 적용, 초과 시 push 중단 (스파크라인 정체 방지) |
 | `get_process_utilization` Option 반환 | `nvml.rs` | API 실패 시 `(0, 0)` 반환 → `Option<(u32, u32)>` 반환, idle 0%와 실패를 구분하여 잘못된 폴백 스케일링 방지 |
 | `collect_all()` 디바이스별 에러 격리 | `nvml.rs` | `device_by_index(i)?`로 1개 GPU 에러 시 전체 수집 실패 → `match ... continue`로 해당 GPU만 건너뛰기 |
-| GPM MIG Phase 2 제거 | `nvml.rs` | MIG에서 `nvmlGpmMigSampleGet()` 호출 → 완전 제거, cross-tick NVML 상태 오염으로 인한 VRAM N/A 방지 |
+| GPM 오염 자동 감지 + 비활성화 | `nvml.rs` | Phase 1.5 GPM 호출 후 memory_info() post-probe → 오염 감지 시 `gpm_disabled_parents`에 parent 등록, 이후 GPM 미호출로 VRAM 안정성 확보 + Mem Ctrl graceful degradation |
 | MIG display name 캐싱 | `nvml.rs` | 매 tick `format!().into()` 새 `Rc<str>` → `DeviceInfo.mig_display_name` 캐시, `Rc::clone()` 재사용 |
 | PID dedup HashSet 재사용 | `nvml.rs` | 매 tick `HashSet::new()` per-device → `proc_seen_pids: RefCell<HashSet<u32>>` 재사용 (tick당 할당 0) |
 | `make_bar()` 룩업 테이블 | `dashboard.rs` | 코어당 `String` 할당 → `BAR_TABLE` thread-local 룩업, `&str` 참조만 (128코어: 128 alloc → 0/draw) |
@@ -2192,7 +2199,8 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Sparkline carry-forward TTL | `metrics.rs` | 메트릭 None 시 마지막 값 무한 반복으로 스파크라인 정체 → `none_counts[9]` 배열로 메트릭별 10틱 제한, 초과 시 0 push (동결 대신 하강 표시) |
 | `get_process_utilization` 실패/idle 구분 | `nvml.rs` | API 실패 `(0, 0)` = idle 0% 구분 불가 → `Option<(u32, u32)>` 반환, idle 0%는 정상 보고·실패는 다음 폴백 진행 |
 | `collect_all()` 디바이스별 에러 격리 | `nvml.rs` | 1개 GPU `device_by_index` 에러 시 전체 메트릭 수집 중단 → 해당 GPU만 skip, 나머지 GPU 정상 수집 유지 |
-| GPM MIG Phase 2 제거 | `nvml.rs` | `nvmlGpmMigSampleGet()` cross-tick 오염으로 인한 `memory_info()` 영구 실패 방지, VRAM 안정성 확보 |
+| GPM 오염 자동 감지 + 영구 비활성화 | `nvml.rs` | Phase 1.5 GPM 호출 후 post-probe로 NVML 상태 오염 감지 → `gpm_disabled_parents` HashSet에 parent 등록, 이후 tick에서 GPM 미호출 → `memory_info()` 정상 복구, VRAM 안정성 확보 |
+| `gpm_disabled_parents` prune | `nvml.rs` | `prune_stale_caches`에서 제거된 parent GPU의 disabled 플래그 자동 정리 → GPU hot-remove/MIG 재구성 시 stale 엔트리 방지 |
 | MIG display name 캐싱 | `nvml.rs` | MIG 이름 `Rc<str>` 첫 tick만 생성, 이후 `Rc::clone()` 포인터 카운트만 (MIG 인스턴스당 tick 힙 할당 제거) |
 | PID dedup HashSet 재사용 | `nvml.rs` | `RefCell<HashSet<u32>>` 필드 재사용, 첫 tick 이후 할당 0 (clear만) |
 | BAR_TABLE 룩업 테이블 | `dashboard.rs` | `thread_local!` bar 문자열 테이블, 터미널 리사이즈 시에만 재빌드, 128코어에서도 draw당 bar 할당 0 |

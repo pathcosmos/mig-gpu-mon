@@ -61,6 +61,11 @@ pub struct NvmlCollector {
     active_handles: RefCell<HashSet<usize>>,
     /// Reusable set for PID deduplication during process collection (avoids per-tick alloc)
     proc_seen_pids: RefCell<HashSet<u32>>,
+    /// Parent GPU handles where GPM MIG sampling corrupted memory_info() — GPM permanently
+    /// disabled for these parents to protect VRAM monitoring stability.
+    /// Detected via post-GPM probe: if memory_info() worked in Phase 1 but fails after
+    /// Phase 1.5 GPM call, the parent is added here.
+    gpm_disabled_parents: RefCell<HashSet<usize>>,
 }
 
 impl NvmlCollector {
@@ -143,6 +148,7 @@ impl NvmlCollector {
             proc_name_cache: RefCell::new(HashMap::new()),
             active_handles: RefCell::new(HashSet::with_capacity(32)),
             proc_seen_pids: RefCell::new(HashSet::with_capacity(16)),
+            gpm_disabled_parents: RefCell::new(HashSet::new()),
         })
     }
 
@@ -337,9 +343,17 @@ impl NvmlCollector {
             // === Phase 1.5: GPM DRAM BW Util for Mem Ctrl (after VRAM is safely collected) ===
             // nvmlGpmMigSampleGet can corrupt NVML state — but memory_info() was already
             // called in Phase 1, so VRAM data is safe. Only attempt on GPM-supported parents.
+            //
+            // SAFETY: Post-GPM probe detects corruption. If memory_info() worked in Phase 1
+            // but fails after GPM, the parent is permanently disabled for GPM to protect VRAM.
             {
+                let parent_key = parent_handle as usize;
                 let parent_info = self.get_device_info(parent_device, false);
-                if parent_info.gpm_supported {
+                let gpm_disabled = self.gpm_disabled_parents.borrow().contains(&parent_key);
+                if parent_info.gpm_supported && !gpm_disabled {
+                    // Find a MIG device where memory_info succeeded in Phase 1 — use as probe target
+                    let probe_idx = phase1.iter().position(|(_, _, m)| m.memory_used.is_some());
+
                     for (mig_handle, gi_id, metrics) in &mut phase1 {
                         if metrics.memory_util.is_some() {
                             continue;
@@ -353,6 +367,27 @@ impl NvmlCollector {
                             );
                             if let Some(val) = gpm_val {
                                 metrics.memory_util = Some(val);
+                            }
+                        }
+                    }
+
+                    // Post-GPM corruption probe: re-try memory_info on a device that
+                    // succeeded in Phase 1. If it fails now, GPM corrupted NVML state.
+                    if let Some(idx) = probe_idx {
+                        let (probe_handle, _, _) = &phase1[idx];
+                        let probe_dev = Device::new(*probe_handle, &self.nvml);
+                        if probe_dev.memory_info().is_err() {
+                            // GPM corrupted memory_info — disable GPM for this parent permanently
+                            self.gpm_disabled_parents.borrow_mut().insert(parent_key);
+                            // Free all GPM prev samples for MIG devices under this parent
+                            // to prevent stale sample accumulation
+                            let mut gpm = self.gpm_prev_samples.borrow_mut();
+                            for (h, _, _) in &phase1 {
+                                if let Some(old) = gpm.remove(&(*h as usize)) {
+                                    if !old.is_null() {
+                                        self.raw_lib.nvmlGpmSampleFree(old);
+                                    }
+                                }
                             }
                         }
                     }
@@ -951,6 +986,10 @@ impl NvmlCollector {
         if gpm.capacity() > gpm.len().max(16) * 4 {
             gpm.shrink_to(gpm_target);
         }
+
+        // Prune gpm_disabled_parents for removed parent GPUs
+        let mut disabled = self.gpm_disabled_parents.borrow_mut();
+        disabled.retain(|k| active_handles.contains(k));
     }
 }
 
