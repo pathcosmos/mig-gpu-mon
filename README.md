@@ -409,7 +409,7 @@ loop {
 
 ## MIG Utilization 수집 메커니즘
 
-### 4단계 폴백 아키텍처
+### 5단계 폴백 아키텍처
 
 MIG 환경에서 GPU/Memory utilization 수집은 계단식 폴백 전략을 사용한다:
 
@@ -427,14 +427,23 @@ nvmlDeviceGetMigDeviceHandleByIndex(parent, idx)
     → max(smUtil), max(memUtil) 집계하여 인스턴스 레벨 값 산출
     → 모든 샘플이 0이거나 fetch 실패 시: 3단계로 진행
 
-3단계: nvmlDeviceGetSamples(parent_handle, GPU_UTILIZATION_SAMPLES)
-    → 부모 GPU에서 raw utilization 샘플 수집 (20ms 간격)
+3단계: nvmlDeviceGetSamples(parent_handle, GPU_UTILIZATION_SAMPLES) — gpu_util 전용
+    → 부모 GPU에서 raw GPU utilization 샘플 수집 (20ms 간격)
     → 최근 5개 샘플 평균, /10000으로 0-100% 스케일 변환
     → MIG 슬라이스 비율로 스케일링: mig_util = parent_util × total_slices / mig_slices
     → 예: parent=29%, MIG 3g.40gb → 29% × 7/3 ≈ 67%
     → 불가능 시: "N/A" 표시
 
-4단계: nvmlGpmMigSampleGet() — memory_util 전용 (Hopper+ only)
+4단계: nvmlDeviceGetSamples(parent_handle, MEMORY_UTILIZATION_SAMPLES) — memory_util 전용
+    → 부모 GPU에서 memory controller utilization 샘플 수집
+    → 3단계와 동일한 /10000 스케일링 + MIG 슬라이스 비율 환산
+    → GPM 없이도 Ampere/Hopper 모든 아키텍처에서 Mem Ctrl 표시 가능
+    → 이 단계에서 memory_util이 채워지면 5단계 GPM 호출이 자연스럽게 억제됨
+      → GPM→NVML 상태 오염의 근본 원인 제거 (VRAM 안정성 확보)
+    → 드라이버 535.x에서는 NotSupported 반환 → 5단계로 진행
+
+5단계: nvmlGpmMigSampleGet() — memory_util 전용 (Hopper+ only)
+    → Startup GPM Safety Probe 통과 시에만 실행
     → DeviceInfo 캐시에서 GPM 지원 여부 확인
     → MIG: nvmlGpmMigSampleGet(parent_handle, gpuInstanceId, sample)
     → 일반 GPU: nvmlGpmSampleGet(device, sample)
@@ -2315,6 +2324,11 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | GPM 지연 오염 시 GPM 스킵 | `nvml.rs` | `probe_idx=None`(전체 MIG memory_info 실패) 시 GPM 실행 자체를 건너뛰어 재오염 무한루프 차단, NVML 자체 복구 후 자동 재개 |
 | proc_name_cache 정리 시 HashSet 재활용 | `nvml.rs` | `proc_seen_pids` RefCell 재활용으로 매 tick 새 HashSet 할당 제거 |
 | none_count TTL 상한 적용 | `metrics.rs` | `push_with_ttl` none_count를 TTL+1에서 cap → 영구 N/A 메트릭에서 의미 없는 u32 증분 방지 |
+| Parent Memory Samples Mem Ctrl 폴백 | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → 부모 GPU 메모리 컨트롤러 util을 MIG 슬라이스 비율로 스케일링, GPM 없이 Ampere/Hopper 모두 Mem Ctrl 표시 가능, Phase 1에서 memory_util 채움 → Phase 1.5 GPM 호출 자연 억제로 NVML 오염 근본 차단 |
+| Startup GPM Safety Probe | `nvml.rs` | `NvmlCollector::new()`에서 MIG 부모 GPU별 GPM 안전성 1회 검증 (memory_info→GPM→memory_info 재확인), 오염 시 시작부터 `gpm_disabled_parents` 등록 → 런타임 VRAM 끊김 원천 차단 |
+| `selected_metrics()` 캐싱 | `dashboard.rs` | `draw_gpu_charts()`에서 7회 중복 호출 → 1회 캐싱, 프레임당 HashMap lookup 6회 제거 |
+| Cow::Borrowed 정적 타이틀 | `dashboard.rs` | 차트 타이틀 리터럴에 `.into()` (Cow::Owned) → `Cow::Borrowed` 직접 사용, 프레임당 불필요한 String 힙 할당 6~8개 제거 |
+| Vec::with_capacity Span 벡터 | `dashboard.rs` | `Vec::new()` → `Vec::with_capacity(4~6)`, 첫 push 시 realloc 3회 제거 |
 
 ### 장시간 메모리 사용량 예측
 
@@ -2332,6 +2346,8 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | 드리프트 보정 타이머 | `main.rs` | `Instant` 기반 경과시간 측정 → 작업 시간 빼고 남은 시간만 poll, 누적 밀림 방지 |
 | Option 기반 graceful 실패 | `nvml.rs` | 모든 확장 메트릭 `.ok()` 래핑 → MIG/vGPU 실패 시 `None` ("N/A") 표시, 패닉 없음 |
 | `saturating_sub` 시간 계산 | `main.rs` | 작업 시간 > interval 시에도 음수 없이 즉시 다음 틱 진행 |
+| Startup GPM Safety Probe | `nvml.rs` | 최초 메트릭 수집 전 GPM이 NVML 상태를 오염시키는지 1회 검증 → 위험한 parent는 시작부터 비활성화, 런타임 VRAM 끊김 원천 차단 |
+| Parent Memory Samples 폴백 | `nvml.rs` | GPM 없이 Mem Ctrl 표시 가능 → GPM 호출 자연 억제 → NVML 오염 근본 원인 제거 |
 
 ## Why Rust
 

@@ -447,7 +447,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
 
     // Line 6: Encoder / Decoder
     if m.encoder_util.is_some() || m.decoder_util.is_some() {
-        let mut enc_spans = Vec::new();
+        let mut enc_spans = Vec::with_capacity(5);
         if let Some(enc) = m.encoder_util {
             enc_spans.push(Span::styled("Enc: ", Style::default().fg(Color::Magenta)));
             enc_spans.push(Span::styled(
@@ -470,7 +470,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
 
     // Line 7: Clock speeds + PState
     if m.clock_graphics_mhz.is_some() || m.performance_state.is_some() {
-        let mut clk_spans = Vec::new();
+        let mut clk_spans = Vec::with_capacity(4);
         if let (Some(gfx), Some(sm), Some(mem)) =
             (m.clock_graphics_mhz, m.clock_sm_mhz, m.clock_memory_mhz)
         {
@@ -500,7 +500,7 @@ fn draw_gpu_detail(f: &mut Frame, app: &App, area: Rect) {
 
     // Line 8: Temp + thresholds + Power
     if m.temperature.is_some() || m.power_usage.is_some() {
-        let mut tp_spans = Vec::new();
+        let mut tp_spans = Vec::with_capacity(6);
         if let Some(temp) = m.temperature {
             let temp_color = temp_color(temp);
             tp_spans.push(Span::styled("Temp: ", Style::default().fg(Color::DarkGray)));
@@ -646,6 +646,9 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
+    // Cache selected metrics once — eliminates 7 redundant HashMap lookups per frame
+    let sel = app.selected_metrics();
+
     // Conditionally add PCIe sparkline if data is available
     let has_pcie = !history.pcie_tx_kbps.is_empty();
 
@@ -671,9 +674,9 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // GPU Utilization sparkline
-    let gpu_title: Cow<str> = match app.selected_metrics().and_then(|m| m.gpu_util) {
+    let gpu_title: Cow<str> = match sel.and_then(|m| m.gpu_util) {
         Some(v) => format!(" GPU Util {}% ", v).into(),
-        None => if app.selected_metrics().is_some() { " GPU Util N/A ".into() } else { " GPU Util ".into() },
+        None => Cow::Borrowed(if sel.is_some() { " GPU Util N/A " } else { " GPU Util " }),
     };
     with_spark_data_u32(&history.gpu_util, |data| {
         let sparkline = Sparkline::default()
@@ -690,9 +693,9 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     });
 
     // Memory Controller Utilization sparkline
-    let mem_ctrl_title: Cow<str> = match app.selected_metrics().and_then(|m| m.memory_util) {
+    let mem_ctrl_title: Cow<str> = match sel.and_then(|m| m.memory_util) {
         Some(v) => format!(" Mem Ctrl {}% ", v).into(),
-        None => if app.selected_metrics().is_some() { " Mem Ctrl N/A ".into() } else { " Mem Ctrl ".into() },
+        None => Cow::Borrowed(if sel.is_some() { " Mem Ctrl N/A " } else { " Mem Ctrl " }),
     };
     with_spark_data_u32(&history.memory_util, |data| {
         let sparkline = Sparkline::default()
@@ -709,19 +712,16 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
     });
 
     // VRAM Usage sparkline
-    let vram_title: Cow<str> = match app.selected_metrics() {
+    let vram_title: Cow<str> = match sel {
         Some(m) => match (m.memory_used_mb(), m.memory_total_mb(), m.memory_percent()) {
             (Some(used), Some(total), Some(pct)) => {
                 format!(" VRAM {}/{} MB ({:.1}%) ", used, total, pct).into()
             }
-            _ => " VRAM N/A ".into(),
+            _ => Cow::Borrowed(" VRAM N/A "),
         },
-        None => " VRAM ".into(),
+        None => Cow::Borrowed(" VRAM "),
     };
-    let vram_max = app
-        .selected_metrics()
-        .and_then(|m| m.memory_total_mb())
-        .unwrap_or(1);
+    let vram_max = sel.and_then(|m| m.memory_total_mb()).unwrap_or(1);
     with_spark_data_u64(&history.memory_used_mb, |data| {
         let sparkline = Sparkline::default()
             .block(
@@ -738,8 +738,7 @@ fn draw_gpu_charts(f: &mut Frame, app: &App, area: Rect) {
 
     // PCIe throughput sparkline (conditional — shows TX; title includes both TX/RX)
     if has_pcie {
-        let pcie_title: Cow<str> = app
-            .selected_metrics()
+        let pcie_title: Cow<str> = sel
             .and_then(|m| {
                 let tx = m.pcie_tx_mbps()?;
                 let rx = m.pcie_rx_mbps()?;
@@ -773,11 +772,10 @@ fn draw_system_charts(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     // CPU total sparkline
-    let cpu_label: Cow<str> = app
-        .system_metrics
-        .as_ref()
-        .map(|s| format!(" CPU Total {:.1}% ", s.cpu_total))
-        .map_or(Cow::Borrowed(" CPU Total "), |s| s.into());
+    let cpu_label: Cow<str> = match app.system_metrics.as_ref() {
+        Some(s) => format!(" CPU Total {:.1}% ", s.cpu_total).into(),
+        None => Cow::Borrowed(" CPU Total "),
+    };
     with_spark_data_f32(&app.system_history.cpu_total, |data| {
         let sparkline = Sparkline::default()
             .block(

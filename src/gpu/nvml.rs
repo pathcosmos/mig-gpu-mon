@@ -138,7 +138,7 @@ impl NvmlCollector {
             lib
         };
 
-        Ok(Self {
+        let collector = Self {
             nvml,
             raw_lib,
             device_cache: RefCell::new(HashMap::new()),
@@ -149,7 +149,11 @@ impl NvmlCollector {
             active_handles: RefCell::new(HashSet::with_capacity(32)),
             proc_seen_pids: RefCell::new(HashSet::with_capacity(16)),
             gpm_disabled_parents: RefCell::new(HashSet::new()),
-        })
+        };
+        // Probe GPM safety before any metrics collection — if GPM corrupts NVML state
+        // on a parent GPU, disable it at startup instead of discovering mid-operation.
+        collector.probe_gpm_safety();
+        Ok(collector)
     }
 
     fn init_nvml(user_path: Option<&str>) -> Result<Nvml, nvml_wrapper::error::NvmlError> {
@@ -177,6 +181,93 @@ impl NvmlCollector {
             }
         }
         NvmlLib::new("libnvidia-ml.so.1").map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// One-time startup probe: test whether GPM corrupts NVML state on each MIG-enabled parent.
+    /// If calling nvmlGpmMigSampleGet causes memory_info() to fail, mark that parent in
+    /// gpm_disabled_parents before any metrics collection begins — prevents runtime corruption
+    /// that was causing VRAM monitoring to cut off after a few seconds.
+    fn probe_gpm_safety(&self) {
+        let count = match self.nvml.device_count() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        for i in 0..count {
+            let device = match self.nvml.device_by_index(i) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            if !self.is_mig_enabled(&device) {
+                continue;
+            }
+
+            let parent_handle = unsafe { device.handle() };
+            let parent_info = self.get_device_info(&device, false);
+
+            if !parent_info.gpm_supported {
+                continue;
+            }
+
+            // Find first valid MIG instance and test GPM safety
+            unsafe {
+                let mut max_count: c_uint = 0;
+                if self
+                    .raw_lib
+                    .nvmlDeviceGetMaxMigDeviceCount(parent_handle, &mut max_count)
+                    != 0
+                {
+                    continue;
+                }
+
+                for mig_idx in 0..max_count {
+                    let mut mig_handle: nvmlDevice_t = std::ptr::null_mut();
+                    if self.raw_lib.nvmlDeviceGetMigDeviceHandleByIndex(
+                        parent_handle,
+                        mig_idx,
+                        &mut mig_handle,
+                    ) != 0
+                        || mig_handle.is_null()
+                    {
+                        continue;
+                    }
+
+                    let mig_device = Device::new(mig_handle, &self.nvml);
+
+                    // Step 1: Verify memory_info works before GPM
+                    if mig_device.memory_info().is_err() {
+                        continue;
+                    }
+
+                    let mig_info = self.get_device_info(&mig_device, true);
+                    let gi_id = match mig_info.gpu_instance_id {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    // Step 2: Take a GPM sample (may corrupt NVML state)
+                    let mut sample: nvmlGpmSample_t = std::ptr::null_mut();
+                    if self.raw_lib.nvmlGpmSampleAlloc(&mut sample) != 0 || sample.is_null() {
+                        continue;
+                    }
+                    let _ret =
+                        self.raw_lib
+                            .nvmlGpmMigSampleGet(parent_handle, gi_id, sample);
+                    self.raw_lib.nvmlGpmSampleFree(sample);
+
+                    // Step 3: Re-check memory_info — if it fails now, GPM corrupts this parent
+                    if mig_device.memory_info().is_err() {
+                        self.gpm_disabled_parents
+                            .borrow_mut()
+                            .insert(parent_handle as usize);
+                    }
+
+                    // One MIG instance per parent is sufficient for the probe
+                    break;
+                }
+            }
+        }
     }
 
     /// Collect metrics from all GPUs and MIG instances
@@ -266,8 +357,9 @@ impl NvmlCollector {
                 return Ok(mig_metrics);
             }
 
-            // Pre-fetch parent-level GPU util via samples (for slice-ratio fallback)
+            // Pre-fetch parent-level utilization via samples (for slice-ratio fallback)
             let parent_sampled_util = self.get_gpu_util_from_samples(parent_handle);
+            let parent_sampled_mem_util = self.get_mem_util_from_samples(parent_handle);
             // MaxMigDeviceCount = total number of GPU instance slices (e.g. 7 for H100)
             let total_slices = max_count;
 
@@ -319,6 +411,23 @@ impl NvmlCollector {
                                     .min(100) as u32;
                                 metrics.gpu_util = Some(scaled);
                                 metrics.sm_util = Some(scaled);
+                            }
+                        }
+                    }
+
+                    // Fallback for Mem Ctrl: scale parent's sampled memory controller util
+                    // by MIG slice ratio. Works on ALL architectures (Ampere, Hopper, etc.)
+                    // without GPM dependency — fundamental fix for "Mem Ctrl N/A" on MIG.
+                    // Also naturally suppresses Phase 1.5 GPM calls (memory_util already set
+                    // → skip), eliminating the root cause of GPM→NVML state corruption that
+                    // was breaking VRAM monitoring.
+                    if metrics.memory_util.is_none() {
+                        if let Some(p_mem_util) = parent_sampled_mem_util {
+                            if let Some(mig_slices) = mig_info.gpu_instance_slice_count {
+                                let scaled = ((p_mem_util as u64) * (total_slices as u64)
+                                    / (mig_slices as u64))
+                                    .min(100) as u32;
+                                metrics.memory_util = Some(scaled);
                             }
                         }
                     }
@@ -613,6 +722,65 @@ impl NvmlCollector {
         let avg = sum / n as u64;
 
         // Driver 535 returns raw values ~290000 range; /10000 gives 0-100%
+        let util = (avg / 10000).min(100) as u32;
+        Some(util)
+    }
+
+    /// Get memory controller utilization from nvmlDeviceGetSamples (parent device only).
+    /// Same approach as get_gpu_util_from_samples but queries memory utilization samples.
+    /// Works on ALL architectures (Ampere, Hopper) without GPM dependency.
+    /// Falls back gracefully on unsupported drivers (returns None).
+    unsafe fn get_mem_util_from_samples(&self, device_handle: nvmlDevice_t) -> Option<u32> {
+        let mut val_type: c_uint = 0;
+        let mut count: c_uint = 0;
+
+        // Size query — sample type 1 = memory controller utilization
+        let ret = self.raw_lib.nvmlDeviceGetSamples(
+            device_handle,
+            1,
+            0,
+            &mut val_type,
+            &mut count,
+            std::ptr::null_mut(),
+        );
+
+        if (ret != 0 && ret != 7) || count == 0 {
+            return None;
+        }
+
+        let mut buf = self.sample_buf.borrow_mut();
+        let needed = count as usize;
+        if buf.len() < needed {
+            buf.resize(needed, std::mem::zeroed());
+        }
+
+        let ret = self.raw_lib.nvmlDeviceGetSamples(
+            device_handle,
+            1,
+            0,
+            &mut val_type,
+            &mut count,
+            buf.as_mut_ptr(),
+        );
+        if ret != 0 || count == 0 {
+            return None;
+        }
+
+        let actual = count as usize;
+        let floor = actual.max(128);
+        if buf.capacity() > floor * 8 {
+            buf.truncate(floor);
+            buf.shrink_to(floor * 2);
+        }
+
+        let n = actual.min(5);
+        let start = actual - n;
+        let sum: u64 = buf[start..actual]
+            .iter()
+            .map(|s| s.sampleValue.uiVal as u64)
+            .sum();
+        let avg = sum / n as u64;
+
         let util = (avg / 10000).min(100) as u32;
         Some(util)
     }

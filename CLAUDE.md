@@ -51,14 +51,16 @@ src/
 ## Key Design Decisions
 
 - MIG 환경에서 `nvidia-smi`가 제공하지 않는 메트릭은 NVML `nvmlDeviceGetMigDeviceHandleByIndex` → `nvmlDeviceGetUtilizationRates` 등으로 직접 수집
-- **3단계 MIG utilization 폴백**: (1) `utilization_rates()` → (2) `nvmlDeviceGetProcessUtilization()` → (3) `nvmlDeviceGetSamples(GPU_UTIL)` + MIG 슬라이스 비율 스케일링
+- **5단계 MIG utilization 폴백**: GPU Util: (1) `utilization_rates()` → (2) `get_process_utilization()` → (3) parent `nvmlDeviceGetSamples(GPU_UTIL)` 슬라이스 비율 스케일링. Mem Ctrl: (1) `utilization_rates()` → (4) parent `nvmlDeviceGetSamples(MEM_UTIL)` 슬라이스 비율 스케일링 → (5) `nvmlGpmMigSampleGet()` GPM (Hopper+, Startup Probe 통과 시만, Phase 1에서 memory_util 설정 시 자동 억제)
 - 드라이버 535.x에서 모든 표준 utilization API가 MIG에서 실패 → 부모 GPU의 `nvmlDeviceGetSamples` raw 값(/10000)을 MIG `gpuInstanceSliceCount` 비율로 환산
 - `gpu_util`, `memory_util`은 `Option<u32>` — API 실패 시 0% 대신 "N/A" 표시로 오해 방지
 - **VRAM carry-forward**: `memory_used`는 TTL 10회 제한 carry-forward, `memory_total`은 정적값이므로 `last_known_vram_total` 캐시로 무제한 복원 → 스파크라인 스케일(vram_max) 안정성 보장
 - **스파크라인 TTL 후 push(0)**: carry-forward TTL 만료 시 push 중단 대신 0을 push → 그래프 동결 방지, 하강으로 데이터 소실 시각 표시
 - **GPM 샘플 수명 관리**: `get_dram_bw_util_gpm`에서 조기 리턴 전 반드시 free, Drop은 `drain()` 패턴으로 double-free 방지
 - **update_metrics O(1) 조회**: `prev_by_uuid` HashMap으로 이전 메트릭 O(1) 인덱스 참조, history는 `entry()` API로 단일 해시
-- **GPM DRAM BW Util 폴백 + 오염 감지**: Hopper+ GPU에서 `nvmlGpmMigSampleGet()` → `NVML_GPM_METRIC_DRAM_BW_UTIL`로 MIG 메모리 컨트롤러 utilization 수집. Ampere에서는 GPM 미지원 → "N/A" 유지. 이전 tick 샘플과 현재 샘플 간 delta 계산 방식 (첫 tick은 None). Phase 1.5 GPM 호출 후 post-probe로 NVML 상태 오염 감지 → `gpm_disabled_parents`에 parent 등록, 이후 GPM 영구 비활성화로 VRAM 안정성 확보
+- **MIG Mem Ctrl 근본 해결**: 부모 GPU의 `nvmlDeviceGetSamples(MEMORY_UTILIZATION)` raw 값을 MIG 슬라이스 비율로 스케일링 → GPM 없이도 모든 아키텍처(Ampere, Hopper)에서 Mem Ctrl 수치 표시. 이 폴백이 Phase 1에서 `memory_util`을 채우므로 Phase 1.5 GPM 호출이 자연스럽게 억제됨 → GPM→NVML 오염의 근본 원인 제거
+- **Startup GPM Safety Probe**: `NvmlCollector::new()`에서 MIG-enabled 부모 GPU마다 GPM 안전성 1회 검증. `nvmlGpmMigSampleGet()` 호출 후 `memory_info()` 재확인 → 실패 시 `gpm_disabled_parents`에 즉시 등록, 런타임 오염 원천 차단
+- **GPM DRAM BW Util (Hopper+ 보조)**: Hopper+ GPU에서 `nvmlGpmMigSampleGet()` → `NVML_GPM_METRIC_DRAM_BW_UTIL`로 per-MIG 메모리 컨트롤러 utilization 수집 (parent 스케일링보다 정확). 이전 tick 샘플과 현재 샘플 간 delta 계산 방식 (첫 tick은 None). Phase 1.5 GPM 호출 후 post-probe로 NVML 상태 오염 감지 → `gpm_disabled_parents`에 parent 등록, 이후 GPM 영구 비활성화로 VRAM 안정성 확보
 - 모든 확장 메트릭(clock, PCIe, ECC, throttle 등)은 `.ok()`로 래핑 → MIG/vGPU에서 실패 시 `None`으로 graceful 처리
 - 정적 메트릭(architecture, CC, temp thresholds, MIG slice count 등)은 `DeviceInfo` 캐시에 1회만 수집
 - NVML 샘플 버퍼는 `RefCell<Vec<nvmlSample_t>>`로 grow-only 재사용 (tick당 할당 없음, ~2KB)
