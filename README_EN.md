@@ -442,15 +442,13 @@ Tier 4: nvmlDeviceGetSamples(parent_handle, MEMORY_UTILIZATION_SAMPLES) — memo
       → Eliminates root cause of GPM→NVML state corruption (VRAM stability)
     → On Driver 535.x: returns NotSupported → proceeds to Tier 5
 
-Tier 5: nvmlGpmMigSampleGet() — memory_util only (Hopper+ only)
-    → Only executes if Startup GPM Safety Probe passed
-    → Check GPM support from DeviceInfo cache
-    → MIG: nvmlGpmMigSampleGet(parent_handle, gpuInstanceId, sample)
-    → Regular GPU: nvmlGpmSampleGet(device, sample)
-    → Compute nvmlGpmMetricsGet() with previous tick's sample + current sample
-    → NVML_GPM_METRIC_DRAM_BW_UTIL (ID 10) → 0-100%
-    → Ampere and older: GPM not supported → "N/A" maintained
+Tier 4 fallback: parent utilization_rates().memory scaling
+    → For drivers where nvmlDeviceGetSamples(type=1) is unsupported
+    → parent's standard utilization_rates().memory × total_slices / mig_slices
+    → If all fail: display "N/A"
 ```
+
+> **v0.3.16 change:** GPM (`nvmlGpmMigSampleGet`) code was entirely removed. On driver 535.129.03 + H100 MIG, GPM calls permanently corrupted NVML driver internal state at the session level, causing `memory_info()` to return `InUse` errors. Despite multi-layered defenses (Startup Probe, Phase 1.5, Post-probe), the corruption was session-level — a single GPM call was irrecoverable. Complete removal was the only solution. Mem Ctrl is available via `nvmlDeviceGetSamples(MEM_UTIL)` or `utilization_rates()` on driver 550+.
 
 ### Driver 535.x MIG Limitations (Deep Investigation)
 
@@ -2217,6 +2215,76 @@ Some drivers corrupt NVML state only on the 2nd+ GPM call, not the first. Two-ro
 
 v0.3.14 provides "Mem Ctrl fundamental fix without GPM"; v0.3.15 provides "samples-unsupported driver coverage + GPM defense-in-depth hardening".
 
+---
+
+#### v0.3.16: Complete GPM Removal + --debug Diagnostic Flag
+
+##### Problem
+
+All GPM defenses from v0.3.10~v0.3.15 (post-probe, corruption detection, infinite loop fix, defense-in-depth) were **post-hoc responses after GPM calls**. On driver 535.129.03, `nvmlGpmMigSampleGet()` itself **permanently corrupts NVML driver internal state at the session level**, causing `memory_info()` to return `InUse` errors. Even with Startup Probe, Phase 1.5, and Post-probe defenses, the corruption is session-level — once called, recovery is impossible.
+
+##### Changes (2 modifications)
+
+**Change 1: Complete GPM code removal** (`nvml.rs`)
+
+Removed all GPM-related code: `nvmlGpmMigSampleGet`, `nvmlGpmSampleGet`, `nvmlGpmMetricsGet`, `nvmlGpmSampleAlloc`, `nvmlGpmSampleFree`, `gpm_disabled_parents`, `gpm_prev_samples`, Phase 1.5 GPM branches, Startup Probe GPM verification. Mem Ctrl available via `nvmlDeviceGetSamples(MEM_UTIL)` or `utilization_rates()` on driver 550+.
+
+**Change 2: `--debug` diagnostic flag** (`main.rs`, `nvml.rs`)
+
+Added `--debug` option that logs all NVML API call return codes, errors, and values to `/tmp/mig-gpu-mon-debug.log` in real-time. Introduced `dbg_log!` macro for runtime diagnostics during long-running operation. File opened in append mode with per-line writes (no buffering).
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/gpu/nvml.rs` | Complete GPM code removal (gpm_disabled_parents, gpm_prev_samples, Phase 1.5, Startup Probe etc.) + `dbg_log!` macro |
+| `src/main.rs` | `--debug` CLI flag + `DEBUG_MODE` global AtomicBool |
+
+##### v0.3.10 → v0.3.16 Defense Layer Relationship
+
+| Defense Layer | Protection Scope | Applied At |
+|--------------|-----------------|-----------|
+| v0.3.10~v0.3.15 GPM defenses | Post-hoc corruption response after GPM calls | `nvml.rs` Phase 1.5 etc. |
+| **v0.3.16: Complete GPM removal** | **Eliminates corruption root cause by removing GPM calls entirely** | `nvml.rs` all |
+| **v0.3.16: `--debug` diagnostic flag** | **Real-time NVML API call result file logging for long-running diagnostics** | `main.rs`, `nvml.rs` |
+
+v0.3.16 provides "VRAM stability via GPM root cause elimination + diagnostic tooling".
+
+---
+
+#### v0.3.17: RAM htop-style Precise Decomposition + Long-Running Code Audit
+
+##### Problem
+
+1. RAM decomposition used `used = total - available`, `cached = available - free`, which slightly mismatches htop. htop directly parses `/proc/meminfo` fields (`Buffers + Cached + SReclaimable - Shmem`) for accurate cache/buffer values.
+2. No systematic audit had been performed for resource leaks or excessive resource usage during long-running operation.
+
+##### Changes (2 modifications)
+
+**Change 1: Direct `/proc/meminfo` parsing** (`main.rs`, `metrics.rs`)
+
+Added `parse_proc_meminfo_buffers_cache()`: parses `Buffers`, `Cached`, `SReclaimable`, `Shmem` from `/proc/meminfo` using htop formula (`Cached + SReclaimable - Shmem + Buffers`). Added `ram_buffers_cache` field to `SystemMetrics`, updated `ram_breakdown()` and `SystemHistory::push()` to use `total - free - buffers_cache` (htop-style).
+
+**Change 2: Long-running code audit** (all files)
+
+Comprehensive codebase audit for resource stability:
+
+| Item | Verdict | Evidence |
+|------|---------|----------|
+| Memory leaks | None | All collections bounded (VecDeque 300, HashMap retain+shrink) |
+| File handle leaks | None | dbg_log! block-scoped File drop, /proc reads complete in block |
+| CPU overhead | Minimal | Single thread, 1s polling, ~7-20ms active per tick |
+| Allocation optimization | High | Rc\<str\>, VecDeque ring, thread_local reuse, BAR_TABLE cache |
+| Only risk | `--debug` log unbounded growth | ~250MB/day for 8 MIG GPUs, no rotation implemented |
+
+##### Modified Files
+
+| File | Changes |
+|------|---------|
+| `src/main.rs` | Added `parse_proc_meminfo_buffers_cache()`, passes `ram_buffers_cache` to SystemMetrics |
+| `src/gpu/metrics.rs` | Added `ram_buffers_cache` field, htop-style `ram_breakdown()` calculation, matching `SystemHistory::push()` |
+| `Cargo.toml` | Version v0.3.17 |
+
 ### NVML API Latency Benchmark
 
 Measured on H100 PCIe, 1000 iterations per API call:
@@ -2377,6 +2445,8 @@ Total RSS ~4-8 MB
 | Time string zero-alloc | `dashboard.rs` | `clone()` + `format!()` 2 alloc/draw → `write!` buffer reuse + `as_str()` reference (0 alloc/draw) |
 | `phase1` Vec pre-allocation | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(max_count)`, eliminates realloc during MIG collection |
 | entries/parent_procs pre-allocation | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(16)`, eliminates first-push alloc during process collection |
+| Complete GPM code removal | `nvml.rs` | All GPM code deleted → eliminates NVML session corruption root cause, reduces code complexity |
+| RAM htop-style precise decomposition | `main.rs`, `metrics.rs` | Direct `/proc/meminfo` parsing (Buffers+Cached+SReclaimable-Shmem) → identical RAM decomposition accuracy as htop |
 
 ### Optimization Details: CPU (Minimize System Calls)
 
@@ -2479,10 +2549,15 @@ After 5 min:    No change (ring buffer → steady state maintained)
 | Drift-corrected timer | `main.rs` | `Instant`-based elapsed measurement → subtracts work time from interval, prevents cumulative drift |
 | Option-based graceful failure | `nvml.rs` | All extended metrics wrapped with `.ok()` → `None` ("N/A") on MIG/vGPU failure, no panics |
 | `saturating_sub` time calc | `main.rs` | Even if work_time > interval, no negative values — immediately proceeds to next tick |
-| Startup GPM Safety Probe (2-round) | `nvml.rs` | Two-round GPM safety test before first metrics collection (catches delayed corruption) → disables corrupting parents at startup |
-| Parent Memory Samples fallback | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → MIG slice scaling for Mem Ctrl without GPM → GPM calls naturally suppressed |
-| Parent `utilization_rates().memory` fallback | `nvml.rs` | Alternative Mem Ctrl source for drivers not supporting `nvmlDeviceGetSamples(type=1)` → maintains GPM suppression chain |
-| GPM defense-in-depth (`parent_mem_samples_ok`) | `nvml.rs` | Blocks Phase 1.5 GPM entry when `parent_sampled_mem_util=None` → protects VRAM when extended APIs are unreliable |
+| Parent Memory Samples fallback | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → MIG slice scaling for Mem Ctrl without GPM |
+| Parent `utilization_rates().memory` fallback | `nvml.rs` | Alternative Mem Ctrl source for drivers not supporting `nvmlDeviceGetSamples(type=1)` |
+| `--debug` diagnostic mode | `main.rs`, `nvml.rs` | `--debug` flag logs all NVML API return codes, errors, and values to file → enables long-running problem diagnostics |
+| Complete GPM removal | `nvml.rs` | All GPM code deleted → eliminates NVML session corruption root cause, ensures VRAM stability during long-running operation |
+| RAM htop-style precise decomposition | `main.rs`, `metrics.rs` | Direct `/proc/meminfo` parsing for htop-identical RAM used/cached/free calculation |
+
+### `--debug` Log Unbounded Growth Warning
+
+In `--debug` mode, `/tmp/mig-gpu-mon-debug.log` grows without rotation. For 8 MIG GPUs, ~30 lines/tick × 1s interval = ~250MB/day, ~7.5GB/month. `--debug` is recommended for temporary diagnostic use only; monitor disk space during extended runs.
 
 ## Why Rust
 

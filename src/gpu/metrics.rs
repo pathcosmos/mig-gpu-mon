@@ -262,6 +262,8 @@ pub struct SystemMetrics {
     pub ram_available: u64,
     /// RAM free in bytes (not used at all, excludes cache/buffers)
     pub ram_free: u64,
+    /// Buffers + Cached + SReclaimable - Shmem (htop-style, from /proc/meminfo)
+    pub ram_buffers_cache: u64,
     /// Swap used in bytes
     pub swap_used: u64,
     /// Swap total in bytes
@@ -287,24 +289,28 @@ impl SystemMetrics {
         self.ram_total as f64 / GIB_F64
     }
 
-    /// Decompose RAM into (used_pure_bytes, cached_bytes, free_bytes) and percentages.
-    /// Returns (used_pure, cached, free, used_pct, cached_pct, free_pct, avail_gb, total_gb).
+    /// Decompose RAM into htop-style (used, buffers+cache, free) and percentages.
+    /// used = total - free - buffers_cache (actual process memory, excludes reclaimable)
+    /// cached = buffers + cached + SReclaimable - Shmem (reclaimable by kernel)
+    /// free = MemFree (truly unused pages)
     pub fn ram_breakdown(&self) -> RamBreakdown {
         let total = self.ram_total as f64;
-        let used_pure = self.ram_total.saturating_sub(self.ram_available);
-        let cached_bytes = self.ram_available.saturating_sub(self.ram_free);
+        let used_htop = self
+            .ram_total
+            .saturating_sub(self.ram_free)
+            .saturating_sub(self.ram_buffers_cache);
         let (used_pct, cached_pct, free_pct) = if total > 0.0 {
             (
-                (used_pure as f64 / total * 100.0) as f32,
-                (cached_bytes as f64 / total * 100.0) as f32,
+                (used_htop as f64 / total * 100.0) as f32,
+                (self.ram_buffers_cache as f64 / total * 100.0) as f32,
                 (self.ram_free as f64 / total * 100.0) as f32,
             )
         } else {
             (0.0, 0.0, 0.0)
         };
         RamBreakdown {
-            used_gb: used_pure as f64 / GIB_F64,
-            cached_gb: cached_bytes as f64 / GIB_F64,
+            used_gb: used_htop as f64 / GIB_F64,
+            cached_gb: self.ram_buffers_cache as f64 / GIB_F64,
             free_gb: self.ram_free as f64 / GIB_F64,
             avail_gb: self.ram_available as f64 / GIB_F64,
             total_gb: self.ram_total_gb(),
@@ -333,9 +339,9 @@ pub struct RamBreakdown {
 pub struct SystemHistory {
     pub cpu_total: VecDeque<f32>,
     pub ram_percent: VecDeque<f64>,
-    /// Non-reclaimable used % (total - available) / total * 100
+    /// htop-style used % (total - free - buffers_cache) / total * 100
     pub ram_used_pct: VecDeque<f32>,
-    /// Reclaimable cache/buffers % (available - free) / total * 100
+    /// Buffers+cache % (buffers_cache) / total * 100
     pub ram_cached_pct: VecDeque<f32>,
     max_entries: usize,
 }
@@ -364,11 +370,13 @@ impl SystemHistory {
 
         let total = metrics.ram_total as f64;
         let (used_pct, cached_pct) = if total > 0.0 {
-            let used = metrics.ram_total.saturating_sub(metrics.ram_available) as f64;
-            let cached = metrics.ram_available.saturating_sub(metrics.ram_free) as f64;
+            let used_htop = metrics
+                .ram_total
+                .saturating_sub(metrics.ram_free)
+                .saturating_sub(metrics.ram_buffers_cache) as f64;
             (
-                (used / total * 100.0) as f32,
-                (cached / total * 100.0) as f32,
+                (used_htop / total * 100.0) as f32,
+                (metrics.ram_buffers_cache as f64 / total * 100.0) as f32,
             )
         } else {
             (0.0, 0.0)

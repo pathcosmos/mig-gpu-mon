@@ -2194,6 +2194,76 @@ if parent_info.gpm_supported && !gpm_disabled && parent_mem_samples_ok {
 
 v0.3.14는 "GPM 없는 Mem Ctrl 근본 해결", v0.3.15는 "samples 미지원 드라이버 대응 + GPM 방어적 차단 강화".
 
+---
+
+#### v0.3.16: GPM 전면 제거 + --debug 진단 플래그
+
+##### 문제
+
+v0.3.10~v0.3.15의 GPM 방어 계층(post-probe, 오염 감지, 무한루프 차단, defense-in-depth)은 모두 **GPM 호출 후 사후 대응**. 드라이버 535.129.03에서 `nvmlGpmMigSampleGet()` 호출 자체가 NVML 드라이버 내부 상태를 **세션 수준으로 영구 오염**시켜 `memory_info()`가 `InUse` 에러를 반환하는 현상 확인. Startup Probe·Phase 1.5·Post-probe 등 다중 방어에도 오염이 세션 수준이라 한 번이라도 호출되면 복구 불가능.
+
+##### 수정 내용 (2개 변경)
+
+**변경 1: GPM 코드 전면 제거** (`nvml.rs`)
+
+`nvmlGpmMigSampleGet`, `nvmlGpmSampleGet`, `nvmlGpmMetricsGet`, `nvmlGpmSampleAlloc`, `nvmlGpmSampleFree` 등 모든 GPM 관련 코드를 완전 제거. `gpm_disabled_parents`, `gpm_prev_samples`, Phase 1.5 GPM 분기, Startup Probe GPM 검증 등 방어 코드 전부 삭제. Mem Ctrl은 드라이버 550+에서 `nvmlDeviceGetSamples(MEM_UTIL)` 또는 `utilization_rates()` 정상 동작으로 해결 가능.
+
+**변경 2: `--debug` 진단 플래그** (`main.rs`, `nvml.rs`)
+
+`--debug` 옵션으로 모든 NVML API 호출의 ret 코드·에러·값을 `/tmp/mig-gpu-mon-debug.log`에 실시간 기록. `dbg_log!` 매크로 도입으로 장기 운영 중 문제 진단 가능. 파일 append 모드로 per-line write (버퍼링 없음).
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/gpu/nvml.rs` | GPM 관련 코드 전면 제거 (gpm_disabled_parents, gpm_prev_samples, Phase 1.5, Startup Probe 등) + `dbg_log!` 매크로 도입 |
+| `src/main.rs` | `--debug` CLI 플래그 추가 + `DEBUG_MODE` 전역 AtomicBool |
+
+##### v0.3.10 → v0.3.16 방어 계층 관계
+
+| 방어 계층 | 보호 범위 | 적용 시점 |
+|----------|----------|----------|
+| v0.3.10~v0.3.15 GPM 방어 계층 | GPM 호출 사후 오염 대응 | `nvml.rs` Phase 1.5 등 |
+| **v0.3.16: GPM 전면 제거** | **GPM 호출 자체를 제거하여 오염 원인 원천 차단** | `nvml.rs` 전체 |
+| **v0.3.16: `--debug` 진단 플래그** | **NVML API 호출 결과 실시간 파일 로깅으로 장기 운영 문제 진단** | `main.rs`, `nvml.rs` |
+
+v0.3.16은 "GPM 근본 제거로 VRAM 안정성 확보 + 진단 도구 추가".
+
+---
+
+#### v0.3.17: RAM htop-style 정밀 분해 + 장기 운영 코드 감사
+
+##### 문제
+
+1. RAM 분해 계산이 `used = total - available`, `cached = available - free`로 되어 있어 htop과 수치가 미세하게 불일치. htop은 `/proc/meminfo`의 `Buffers + Cached + SReclaimable - Shmem`을 직접 파싱하여 정확한 cache/buffer 값을 산출.
+2. 장기 운영 시 자원 누수·과다 점유 여부에 대한 체계적 감사 미실시.
+
+##### 수정 내용 (2개 변경)
+
+**변경 1: `/proc/meminfo` 직접 파싱** (`main.rs`, `metrics.rs`)
+
+`parse_proc_meminfo_buffers_cache()` 함수 추가: `/proc/meminfo`에서 `Buffers`, `Cached`, `SReclaimable`, `Shmem` 4개 필드를 직접 파싱하여 htop 공식 (`Cached + SReclaimable - Shmem + Buffers`)으로 정확한 buffer/cache 값 산출. `SystemMetrics`에 `ram_buffers_cache` 필드 추가, `ram_breakdown()`과 `SystemHistory::push()` 계산을 `total - free - buffers_cache`(htop-style)로 수정.
+
+**변경 2: 장기 운영 코드 감사** (전체)
+
+전체 코드베이스 상세 감사 실시. 결과:
+
+| 항목 | 판정 | 근거 |
+|------|------|------|
+| 메모리 누수 | 없음 | 모든 컬렉션 bounded (VecDeque 300, HashMap retain+shrink) |
+| 파일 핸들 누수 | 없음 | dbg_log! 블록 스코프 File drop, /proc 읽기 블록 내 완료 |
+| CPU 오버헤드 | 극소 | 단일 스레드, 1초 폴링, tick당 ~7-20ms 활성 |
+| 할당 최적화 | 고수준 | Rc\<str\>, VecDeque ring, thread_local 재사용, BAR_TABLE 캐시 |
+| 유일한 위험 | `--debug` 로그 무한 성장 | MIG 8 GPU 기준 하루 ~250MB, rotation 미구현 |
+
+##### 수정 파일 목록
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `src/main.rs` | `parse_proc_meminfo_buffers_cache()` 함수 추가, `SystemMetrics`에 `ram_buffers_cache` 전달 |
+| `src/gpu/metrics.rs` | `ram_buffers_cache` 필드 추가, `ram_breakdown()` htop-style 계산 수정, `SystemHistory::push()` 동일 수정 |
+| `Cargo.toml` | 버전 v0.3.17 |
+
 ### NVML API 지연시간 벤치마크
 
 H100 PCIe에서 API 호출당 1000회 반복 측정:
@@ -2351,6 +2421,8 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | 시간 문자열 zero-alloc | `dashboard.rs` | `clone()` + `format!()` 2 alloc/draw → `write!` 버퍼 재사용 + `as_str()` 참조 (0 alloc/draw) |
 | `phase1` Vec 사전 할당 | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(max_count)`, MIG 수집 시 realloc 제거 |
 | entries/parent_procs 사전 할당 | `nvml.rs` | `Vec::new()` → `Vec::with_capacity(16)`, 프로세스 수집 시 첫 push 시 alloc 제거 |
+| GPM 코드 전면 제거 | `nvml.rs` | GPM 관련 모든 코드 삭제 → NVML 세션 오염 원인 원천 차단, 코드 복잡도 감소 |
+| RAM htop-style 정밀 분해 | `main.rs`, `metrics.rs` | `/proc/meminfo` 직접 파싱 (Buffers+Cached+SReclaimable-Shmem) → htop과 동일한 RAM 분해 정확도 |
 
 ### 최적화 상세: CPU (시스템 호출 최소화)
 
@@ -2448,6 +2520,12 @@ H100 PCIe에서 API 호출당 1000회 반복 측정:
 | Parent Memory Samples 폴백 | `nvml.rs` | `nvmlDeviceGetSamples(MEM_UTIL)` → MIG 슬라이스 스케일링으로 Mem Ctrl 표시 |
 | Parent `utilization_rates().memory` 폴백 | `nvml.rs` | samples 미지원 드라이버에서 표준 API로 Mem Ctrl 대체 소스 제공 |
 | `--debug` 진단 모드 | `main.rs`, `nvml.rs` | `--debug` 플래그로 NVML API 호출별 ret 코드·에러 상세를 파일 로깅 → 장기 운영 중 문제 원인 추적 |
+| GPM 전면 제거 | `nvml.rs` | GPM 코드 완전 삭제 → NVML 세션 오염 원인 원천 차단, 장기 운영 시 VRAM 안정성 확보 |
+| RAM htop-style 정밀 분해 | `main.rs`, `metrics.rs` | `/proc/meminfo` 직접 파싱으로 htop과 동일한 RAM used/cached/free 산출 |
+
+### `--debug` 로그 무한 성장 주의
+
+`--debug` 모드에서 `/tmp/mig-gpu-mon-debug.log`는 로그 rotation 없이 무한 성장한다. MIG 8 GPU 기준 tick당 ~30줄 × 1초 간격 = 하루 ~250MB, 한 달 ~7.5GB. `--debug`는 진단 목적 한시 사용을 권장하며, 장기 실행 시 디스크 용량 모니터링 필요.
 
 ## Why Rust
 

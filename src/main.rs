@@ -16,6 +16,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
+/// Parse /proc/meminfo to extract Buffers + Cached + SReclaimable - Shmem (htop-style).
+/// Returns the combined value in bytes, or 0 on failure.
+fn parse_proc_meminfo_buffers_cache() -> u64 {
+    let content = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let mut buffers: u64 = 0;
+    let mut cached: u64 = 0;
+    let mut s_reclaimable: u64 = 0;
+    let mut shmem: u64 = 0;
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let key = match parts.next() {
+            Some(k) => k,
+            None => continue,
+        };
+        let val: u64 = match parts.next().and_then(|v| v.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        // /proc/meminfo values are in kB
+        match key {
+            "Buffers:" => buffers = val * 1024,
+            "Cached:" => cached = val * 1024,
+            "SReclaimable:" => s_reclaimable = val * 1024,
+            "Shmem:" => shmem = val * 1024,
+            _ => {}
+        }
+    }
+    // htop formula: Cached + SReclaimable - Shmem + Buffers
+    (cached + s_reclaimable).saturating_sub(shmem) + buffers
+}
+
 use app::App;
 use event::{AppEvent, EventHandler};
 use gpu::metrics::SystemMetrics;
@@ -162,6 +196,7 @@ fn main() -> Result<()> {
             ram_total: sys.total_memory(),
             ram_available: sys.available_memory(),
             ram_free: sys.free_memory(),
+            ram_buffers_cache: parse_proc_meminfo_buffers_cache(),
             swap_used: sys.used_swap(),
             swap_total: sys.total_swap(),
         });
